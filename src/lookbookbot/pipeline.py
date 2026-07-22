@@ -172,12 +172,15 @@ class PipelineEngine:
         if not caption_map.is_file():
             self.controller.script("prepare_caption_mapping.py", root, "--workbook", workbook, timeout=1800)
         self.controller.script("auto_caption_map.py", root, "--mode", "seed", timeout=1800)
-        self._apply_credit_overrides(project)
+        manual_assignments = self._apply_credit_overrides(project)
         self.controller.script("render_caption_mapping_evidence.py", root, "--map", "control/work/caption-map.tsv", "--hires", "control/work/_mat/hires", timeout=1800)
 
         if isinstance(provider, CodexProvider):
             self._delegate_codex(project, provider, "credits_map")
         else:
+            self._select_local_credit_overrides(project, provider, manual_assignments)
+            if manual_assignments:
+                self.controller.script("render_caption_mapping_evidence.py", root, "--map", "control/work/caption-map.tsv", "--hires", "control/work/_mat/hires", timeout=1800)
             self._confirm_local_credit_proofs(project, provider)
 
         rows = _read_tsv(caption_map)
@@ -264,7 +267,7 @@ class PipelineEngine:
 
     def _delegate_codex(self, project: ProjectRecord, provider: CodexProvider, stage: str) -> None:
         prompts = {
-            "credits_map": """Заверши только визуальное сопоставление кредитов текущего проекта. Используй lookbook-layout skill. PDF-порядок уже находится в control/work/look-register.tsv. Проверь точные трехпанельные proof cards партиями не более пяти, исправь только несовпадающие PENDING через штатные alternative-proofs/select-alternatives, подтверди только реально просмотренные совпадения и закончи с нулём PENDING. Не переходи к init или InDesign.""",
+            "credits_map": """Заверши только визуальное сопоставление кредитов текущего проекта. Используй lookbook-layout skill. PDF-порядок уже находится в control/work/look-register.tsv. Если существует control/work/ui-overrides/caption-overrides.json, это вручную подтверждённые оператором выборы Excel: каждый такой LOOK_### обязан получить exact alternative proof, быть реально просмотрен на нём, затем выбран только через штатный select-alternatives в безопасной группе не более пяти связанных LOOK_###. Никогда не заменяй этот выбор автоматическим seed. После выбора перерисуй обычные трёхпанельные proof cards, просмотри их партиями не более пяти и подтверди только реально просмотренные совпадения. Закончи с нулём PENDING. Не переходи к init или InDesign.""",
             "map": """Заверши только текущий gate map этого проекта по lookbook-layout skill. Просмотри все reference-order cards партиями не более пяти, в той же итерации запиши immutable confirm-reference-look для просмотренных LOOK_### и доведи счётчик до N/N, затем выполни validate-map. Не начинай structure.""",
             "visual": """Заверши только gate visual текущего проекта по lookbook-layout skill. Не меняй страницы и фреймы. Проверь full-left/close-right, ссылки, CREDiTs, overflow, safe area с внутренним отступом 12 pt и caption clearance. Разрешены только горизонтальный сдвиг изображения и, если он не помогает, перенос того же кредитного фрейма вниз/вправо/вниз-вправо. Для единичной проблемы используй targeted calibration. Подтверди каждый реально просмотренный current-master proof и запиши PASS visual; не экспортируй review PDF.""",
         }
@@ -365,24 +368,78 @@ class PipelineEngine:
             self.controller.gate("confirm-visual-look", root, "--look", proof.stem, "--note", decision.note, timeout=120)
         self.controller.gate("record-visual", root, "--notes", "Проверены все current-master proofs и компьютерный caption clearance.", timeout=300)
 
-    def _apply_credit_overrides(self, project: ProjectRecord) -> None:
+    def _apply_credit_overrides(self, project: ProjectRecord) -> list[tuple[str, str, str]]:
         root = project.project_dir
         caption_map = root / "control" / "work" / "caption-map.tsv"
         if not caption_map.is_file():
-            return
+            return []
+        duplicates = self.store.duplicate_credit_pairs(project.id)
+        if duplicates:
+            rendered = "; ".join(
+                f"{sheet}/{number}: {', '.join(looks)}" for (sheet, number), looks in duplicates.items()
+            )
+            raise ReviewRequired(f"В списке кредитов есть повторяющиеся карточки Excel: {rendered}. Исправьте красные строки до запуска.")
         current = {row["look_id"]: row for row in _read_tsv(caption_map)}
-        assignments: list[str] = []
+        assignments: list[tuple[str, str, str]] = []
+        manual_rows: list[dict[str, str]] = []
         for row in self.store.credits(project.id):
             existing = current.get(row["look_id"])
             if not existing:
                 continue
+            if not row.get("manual_override"):
+                continue
+            manual_rows.append({
+                "look_id": row["look_id"],
+                "excel_sheet": row["excel_sheet"],
+                "excel_look_number": row["excel_look_number"],
+                "note": row.get("note", ""),
+            })
             if row["excel_sheet"] and row["excel_look_number"] and (
                 row["excel_sheet"] != existing["excel_sheet"] or row["excel_look_number"] != existing["excel_look_number"]
             ):
-                assignments.append(f"{row['look_id']}={row['excel_sheet']}:{row['excel_look_number']}")
+                assignments.append((row["look_id"], row["excel_sheet"], row["excel_look_number"]))
+        manifest = root / "control" / "work" / "ui-overrides" / "caption-overrides.json"
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text(
+            json.dumps({"schema": 1, "human_confirmed": manual_rows}, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
         if assignments:
-            value = ",".join(assignments)
-            self.controller.script("auto_caption_map.py", root, "--mode", "alternative-proofs", "--looks", ",".join(a.split("=")[0] for a in assignments), "--assignments", value, timeout=900)
+            # A card exchange must be checked as one atomic connected group.
+            # Calculating the groups before producing any proof avoids a
+            # half-applied swap and also keeps every controller call within
+            # the hard five-look boundary.
+            for batch in _credit_override_batches(assignments, current):
+                looks = ",".join(look_id for look_id, _sheet, _number in batch)
+                value = ",".join(f"{look_id}={sheet}:{number}" for look_id, sheet, number in batch)
+                self.controller.script(
+                    "auto_caption_map.py", root, "--mode", "alternative-proofs",
+                    "--looks", looks, "--assignments", value, timeout=900,
+                )
+        return assignments
+
+    def _select_local_credit_overrides(
+        self,
+        project: ProjectRecord,
+        provider: ModelProvider,
+        assignments: list[tuple[str, str, str]],
+    ) -> None:
+        if not assignments:
+            return
+        root = project.project_dir
+        current = {row["look_id"]: row for row in _read_tsv(root / "control" / "work" / "caption-map.tsv")}
+        for batch in _credit_override_batches(assignments, current):
+            for look_id, sheet, number in batch:
+                proof = root / "control" / "work" / "caption-map-alternatives" / look_id / f"{sheet}_{int(number):03}.jpg"
+                decision = provider.inspect_proof(
+                    "На карточке слева выбранная оператором Excel-карточка, далее две фотографии PDF-лука. "
+                    "Ответь JSON {\"match\":true/false,\"note\":\"минимум два конкретных признака\"}. "
+                    "Проверь одежду, цвет, аксессуары, обувь, сумку или позу; номер и фон не являются доказательством.",
+                    [proof],
+                )
+                if not decision.accepted:
+                    raise ReviewRequired(f"{look_id}: локальная модель не подтвердила вручную выбранную Excel-карточку.")
+            value = ",".join(f"{look_id}={sheet}:{number}" for look_id, sheet, number in batch)
             self.controller.script("auto_caption_map.py", root, "--mode", "select-alternatives", "--assignments", value, timeout=900)
 
     def _require_prepared(self, project: ProjectRecord) -> None:
@@ -426,3 +483,48 @@ def _latest_cards(root: Path) -> list[Path]:
         by_parent.setdefault(path.parent, []).append(path)
     parent = max(by_parent, key=lambda path: max(item.stat().st_mtime_ns for item in by_parent[path]))
     return sorted(by_parent[parent], key=lambda path: path.stem)
+
+
+def _credit_override_batches(
+    assignments: list[tuple[str, str, str]], current: dict[str, dict[str, str]],
+) -> list[list[tuple[str, str, str]]]:
+    """Keep an Excel-card swap atomic while respecting the five-look limit."""
+    desired = {look_id: (sheet.casefold(), number) for look_id, sheet, number in assignments}
+    if len(desired) != len(assignments):
+        raise ReviewRequired("Один LOOK_### указан в ручных правках кредитов больше одного раза.")
+    owners = {
+        (row.get("excel_sheet", "").casefold(), row.get("excel_look_number", "")): look_id
+        for look_id, row in current.items()
+    }
+    graph: dict[str, set[str]] = {look_id: set() for look_id in desired}
+    for look_id, pair in desired.items():
+        owner = owners.get(pair)
+        if owner and owner != look_id:
+            if owner not in desired:
+                raise ReviewRequired(
+                    f"{look_id}: карточка Excel уже принадлежит {owner}. Добавьте полную взаимную замену, а не копию карточки."
+                )
+            graph[look_id].add(owner)
+            graph[owner].add(look_id)
+    assignment_by_look = {look_id: (look_id, sheet, number) for look_id, sheet, number in assignments}
+    seen: set[str] = set()
+    batches: list[list[tuple[str, str, str]]] = []
+    for start in graph:
+        if start in seen:
+            continue
+        stack = [start]
+        component: list[str] = []
+        while stack:
+            look_id = stack.pop()
+            if look_id in seen:
+                continue
+            seen.add(look_id)
+            component.append(look_id)
+            stack.extend(graph[look_id] - seen)
+        if len(component) > 5:
+            raise ReviewRequired(
+                "Ручная перестановка затрагивает больше пяти связанных луков. Разбейте её на независимые правки или "
+                "выполните один контролируемый цикл в интерфейсе после следующего обновления."
+            )
+        batches.append([assignment_by_look[look_id] for look_id in sorted(component)])
+    return batches

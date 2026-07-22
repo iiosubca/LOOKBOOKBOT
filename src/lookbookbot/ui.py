@@ -38,6 +38,7 @@ from .config import ToolPaths
 from .discovery import discover_sources, infer_output_root
 from .domain import ProviderKind, STAGES, StageStatus, project_code
 from .pipeline import PipelineEngine
+from .project_import import ExistingProjectError, open_existing_project
 from .providers import ProviderError, make_provider
 from .state import StateStore
 
@@ -126,6 +127,7 @@ class MainWindow(QMainWindow):
         self.worker_thread: QThread | None = None
         self.worker: PipelineWorker | None = None
         self.stage_items: dict[str, QListWidgetItem] = {}
+        self._loading_credits = False
         self.setWindowTitle("LOOKBOOKBOT")
         self.resize(1500, 940)
         self.setMinimumSize(1180, 760)
@@ -182,6 +184,8 @@ class MainWindow(QMainWindow):
         create = QPushButton("Создать / открыть проект")
         create.setObjectName("Primary")
         create.clicked.connect(self._save_project)
+        existing = QPushButton("Открыть готовый проект")
+        existing.clicked.connect(self._open_existing_project)
         setup_layout.addWidget(QLabel("Исходники"))
         setup_layout.addWidget(self.source_edit, 1)
         setup_layout.addWidget(browse)
@@ -192,6 +196,7 @@ class MainWindow(QMainWindow):
         setup_layout.addWidget(self.model_combo)
         setup_layout.addWidget(test_provider)
         setup_layout.addWidget(create)
+        setup_layout.addWidget(existing)
         outer.addWidget(setup)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -216,9 +221,9 @@ class MainWindow(QMainWindow):
             self.stage_list.addItem(item)
             self.stage_items[stage.key] = item
         side_layout.addWidget(self.stage_list, 1)
-        clear_selection = QPushButton("Продолжить с места остановки")
-        clear_selection.clicked.connect(self.stage_list.clearSelection)
-        side_layout.addWidget(clear_selection)
+        continue_button = QPushButton("▶ Продолжить с места остановки")
+        continue_button.clicked.connect(self._continue_from_checkpoint)
+        side_layout.addWidget(continue_button)
         self.approved = QCheckBox("Согласовано — разрешить финальные PDF")
         self.approved.toggled.connect(self._approval_changed)
         side_layout.addWidget(self.approved)
@@ -319,6 +324,7 @@ class MainWindow(QMainWindow):
         self.credits_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.credits_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         self.credits_table.itemSelectionChanged.connect(self._preview_selected_credit)
+        self.credits_table.itemChanged.connect(self._highlight_credit_duplicates_from_table)
         content.addWidget(self.credits_table)
         self.credit_preview = ImagePreview("Трёхпанельная проверка")
         content.addWidget(self.credit_preview)
@@ -428,6 +434,22 @@ class MainWindow(QMainWindow):
         self._append_log(f"Проект открыт: {project_dir}")
         self._load_project()
 
+    def _open_existing_project(self) -> None:
+        initial = str(self.project.project_dir.parent) if self.project else self.source_edit.text() or str(Path.home())
+        selected = QFileDialog.getExistingDirectory(self, "Выберите папку готового проекта", initial)
+        if not selected:
+            return
+        provider = ProviderKind(str(self.provider_combo.currentData()))
+        try:
+            self.project = open_existing_project(
+                self.store, Path(selected), provider=provider, model=self.model_combo.currentText().strip()
+            )
+        except ExistingProjectError as error:
+            QMessageBox.warning(self, "Не удалось открыть проект", str(error))
+            return
+        self._append_log(f"Восстановлено из evidence: {self.project.project_dir}")
+        self._load_project()
+
     def _provider_changed(self) -> None:
         kind = ProviderKind(str(self.provider_combo.currentData()))
         saved = self.store.get_setting(f"model_{kind.value}", "")
@@ -470,6 +492,13 @@ class MainWindow(QMainWindow):
             return
         selected = self.stage_list.selectedItems()
         start_key = str(selected[0].data(Qt.ItemDataRole.UserRole)) if selected else None
+        # A deliberately selected stage is an explicit request to rebuild it
+        # (for example, after a human correction or to export the review PDF
+        # again). Continuing with no selection keeps completed stages intact
+        # and starts at the first incomplete one.
+        if start_key:
+            self.store.reset_from(self.project.id, start_key)
+            self._refresh_stages()
         self.run_button.setEnabled(False)
         self.run_button.setText("ВЫПОЛНЯЕТСЯ…")
         self.worker_thread = QThread(self)
@@ -486,6 +515,11 @@ class MainWindow(QMainWindow):
         self.worker_thread.finished.connect(self.worker_thread.deleteLater)
         self.tabs.setCurrentIndex(3)
         self.worker_thread.start()
+
+    def _continue_from_checkpoint(self) -> None:
+        self.stage_list.clearSelection()
+        self.run_one.setChecked(False)
+        self._run_pipeline()
 
     def _worker_stage(self, key: str, status: str, message: str) -> None:
         self._append_log(f"[{key}] {message}")
@@ -594,40 +628,84 @@ class MainWindow(QMainWindow):
 
     def _load_credits(self) -> None:
         rows = self.store.credits(self.project.id) if self.project else []
-        self.credits_table.setRowCount(len(rows))
-        for index, row in enumerate(rows):
-            values = [row["look_id"], row["excel_sheet"], row["excel_look_number"], row["visual_status"], row["note"], row["evidence_file"]]
-            for column, value in enumerate(values):
-                item = QTableWidgetItem(str(value or ""))
-                if column in (0, 5):
-                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                self.credits_table.setItem(index, column, item)
+        self._loading_credits = True
+        try:
+            self.credits_table.setRowCount(len(rows))
+            for index, row in enumerate(rows):
+                values = [row["look_id"], row["excel_sheet"], row["excel_look_number"], row["visual_status"], row["note"], row["evidence_file"]]
+                for column, value in enumerate(values):
+                    item = QTableWidgetItem(str(value or ""))
+                    if column in (0, 3, 5):
+                        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                    self.credits_table.setItem(index, column, item)
+        finally:
+            self._loading_credits = False
+        self._highlight_credit_duplicates_from_table()
+        self._style_credit_statuses(rows)
 
     def _save_credit_edits(self) -> None:
         if not self.project:
             return
-        current = {row["look_id"]: row for row in self.store.credits(self.project.id)}
-        changed = 0
+        duplicates = self._credit_table_duplicates()
+        self._highlight_credit_duplicates_from_table()
+        if duplicates:
+            detail = "; ".join(f"{sheet} / {number}: {', '.join(looks)}" for (sheet, number), looks in duplicates.items())
+            QMessageBox.warning(self, "Повтор карточки Excel", f"Исправьте красные строки. Одна карточка Excel не может быть назначена двум лукам:\n{detail}")
+            return
+        edits: list[dict[str, str]] = []
         for row in range(self.credits_table.rowCount()):
             look_id = self.credits_table.item(row, 0).text()
-            before = current.get(look_id, {})
-            sheet = self.credits_table.item(row, 1).text().strip()
-            number = self.credits_table.item(row, 2).text().strip()
-            note = self.credits_table.item(row, 4).text().strip()
-            if sheet == before.get("excel_sheet") and number == before.get("excel_look_number") and note == before.get("note", ""):
-                continue
-            self.store.update_credit(
-                self.project.id, look_id,
-                excel_sheet=sheet,
-                excel_look_number=number,
-                visual_status="PENDING",
-                note=note,
-            )
-            changed += 1
+            edits.append({
+                "look_id": look_id,
+                "excel_sheet": self.credits_table.item(row, 1).text().strip(),
+                "excel_look_number": self.credits_table.item(row, 2).text().strip(),
+                "note": self.credits_table.item(row, 4).text().strip(),
+            })
+        try:
+            changed = self.store.save_credit_overrides(self.project.id, edits)
+        except ValueError as error:
+            QMessageBox.warning(self, "Неполная правка", str(error))
+            return
         if changed:
             self.store.reset_from(self.project.id, "credits_map")
             self._refresh_stages()
-            self._append_log(f"Ручные правки кредитов сохранены: {changed}. Они будут проверены отдельными proof cards без пересчёта подтверждённых строк.")
+            self._load_credits()
+            self._append_log(
+                f"Ручные правки кредитов сохранены: {changed}. В списке они отмечены CONFIRMED как решение оператора; "
+                "перед вёрсткой программа создаст для них новые proof cards и перепроверит их без пересчёта остальных строк."
+            )
+
+    def _credit_table_duplicates(self) -> dict[tuple[str, str], list[str]]:
+        pairs: dict[tuple[str, str], list[str]] = {}
+        for row in range(self.credits_table.rowCount()):
+            sheet = self.credits_table.item(row, 1).text().strip()
+            number = self.credits_table.item(row, 2).text().strip()
+            if not sheet or not number:
+                continue
+            pairs.setdefault((sheet.casefold(), number), []).append(self.credits_table.item(row, 0).text())
+        return {pair: looks for pair, looks in pairs.items() if len(looks) > 1}
+
+    def _highlight_credit_duplicates_from_table(self, *_args) -> None:
+        if self._loading_credits:
+            return
+        duplicates = self._credit_table_duplicates()
+        duplicate_looks = {look_id for looks in duplicates.values() for look_id in looks}
+        for row in range(self.credits_table.rowCount()):
+            look_id = self.credits_table.item(row, 0).text()
+            is_duplicate = look_id in duplicate_looks
+            for column in (1, 2):
+                item = self.credits_table.item(row, column)
+                item.setBackground(QColor("#7f1d1d") if is_duplicate else QColor("#0c121d"))
+                item.setForeground(QColor("#fecaca") if is_duplicate else QColor("#e8edf5"))
+                item.setToolTip("Эта пара «лист Excel + № карточки» уже назначена другому луку." if is_duplicate else "")
+
+    def _style_credit_statuses(self, rows: list[dict]) -> None:
+        for index, row in enumerate(rows):
+            item = self.credits_table.item(index, 3)
+            confirmed = str(row.get("visual_status", "")).upper() == "CONFIRMED"
+            item.setForeground(QColor("#34d399") if confirmed else QColor("#fbbf24"))
+            if row.get("manual_override"):
+                item.setToolTip("Подтверждено вручную оператором; контроллер создаст новую proof-card перед применением в InDesign.")
 
     def _preview_selected_credit(self) -> None:
         if not self.project or self.credits_table.currentRow() < 0:

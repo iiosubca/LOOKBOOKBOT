@@ -16,6 +16,5 @@ call .venv\Scripts\python.exe -m pip install -e ".[dev]"
 if errorlevel 1 exit /b 1
 
 echo.
-echo LOOKBOOKBOT установлен. Запускайте run.bat
+echo LOOKBOOKBOT installed. Run run.bat
 pause
-

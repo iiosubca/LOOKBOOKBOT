@@ -86,6 +86,8 @@ class StateStore:
                     evidence_file TEXT NOT NULL DEFAULT '',
                     visual_status TEXT NOT NULL DEFAULT 'PENDING',
                     note TEXT NOT NULL DEFAULT '',
+                    manual_override INTEGER NOT NULL DEFAULT 0,
+                    manual_confirmed_at TEXT,
                     PRIMARY KEY (project_id, look_id),
                     FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
                 );
@@ -106,6 +108,11 @@ class StateStore:
                 );
                 """
             )
+            credit_columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(credits)").fetchall()}
+            if "manual_override" not in credit_columns:
+                db.execute("ALTER TABLE credits ADD COLUMN manual_override INTEGER NOT NULL DEFAULT 0")
+            if "manual_confirmed_at" not in credit_columns:
+                db.execute("ALTER TABLE credits ADD COLUMN manual_confirmed_at TEXT")
 
     def save_project(
         self,
@@ -122,6 +129,12 @@ class StateStore:
         with self.connect() as db:
             existing = db.execute("SELECT id FROM projects WHERE project_dir = ?", (str(project_dir),)).fetchone()
             project_id = str(existing["id"]) if existing else str(uuid.uuid4())
+            # A deleted delivery folder is a new attempt, even when its date
+            # happens to reproduce a previous database path. Never resurrect
+            # stale cards, stages, or manual decisions into that new project.
+            if existing and not project_dir.exists():
+                for table in ("stages", "looks", "credits", "runs"):
+                    db.execute(f"DELETE FROM {table} WHERE project_id = ?", (project_id,))
             db.execute("UPDATE projects SET active = 0")
             db.execute(
                 """
@@ -263,17 +276,50 @@ class StateStore:
             db.execute(f"UPDATE looks SET {columns} WHERE project_id = ? AND look_id = ?", (*changes.values(), project_id, look_id))
 
     def replace_credits(self, project_id: str, rows: list[dict[str, str]]) -> None:
+        """Refresh controller data without erasing an unconsumed human override.
+
+        A manual Excel card choice is durable UI state. It is cleared only
+        when the controller map returns the same pair, which means the
+        controlled selection was successfully incorporated and re-checked.
+        """
         with self.connect() as db:
-            db.execute("DELETE FROM credits WHERE project_id = ?", (project_id,))
+            existing = {
+                str(row["look_id"]): dict(row)
+                for row in db.execute("SELECT * FROM credits WHERE project_id = ?", (project_id,)).fetchall()
+            }
+            incoming_ids = {str(row["look_id"]) for row in rows}
             for row in rows:
+                look_id = row["look_id"]
+                previous = existing.get(look_id)
+                pair_matches = previous and _same_credit_pair(previous, row)
+                if previous and previous.get("manual_override") and not pair_matches:
+                    # Keep the human decision visible after a failed or
+                    # incomplete pipeline pass. The new map is not allowed to
+                    # silently replace it.
+                    continue
                 db.execute(
-                    """INSERT INTO credits(project_id,look_id,excel_sheet,excel_look_number,excel_image,evidence_file,visual_status,note)
-                    VALUES(?,?,?,?,?,?,?,?)""",
+                    """
+                    INSERT INTO credits(project_id,look_id,excel_sheet,excel_look_number,excel_image,evidence_file,visual_status,note,manual_override,manual_confirmed_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(project_id,look_id) DO UPDATE SET
+                        excel_sheet=excluded.excel_sheet,
+                        excel_look_number=excluded.excel_look_number,
+                        excel_image=excluded.excel_image,
+                        evidence_file=excluded.evidence_file,
+                        visual_status=excluded.visual_status,
+                        note=CASE WHEN credits.note <> '' THEN credits.note ELSE excluded.note END,
+                        manual_override=excluded.manual_override,
+                        manual_confirmed_at=excluded.manual_confirmed_at
+                    """,
                     (
-                        project_id, row["look_id"], row.get("excel_sheet", ""), row.get("excel_look_number", ""),
-                        row.get("excel_image", ""), row.get("evidence_file", ""), row.get("visual_status", "PENDING"), row.get("note", ""),
+                        project_id, look_id, row.get("excel_sheet", ""), row.get("excel_look_number", ""),
+                        row.get("excel_image", ""), row.get("evidence_file", ""), row.get("visual_status", "PENDING"),
+                        row.get("note", ""), 0, None,
                     ),
                 )
+            for look_id, previous in existing.items():
+                if look_id not in incoming_ids and not previous.get("manual_override"):
+                    db.execute("DELETE FROM credits WHERE project_id = ? AND look_id = ?", (project_id, look_id))
 
     def credits(self, project_id: str) -> list[dict[str, Any]]:
         with self.connect() as db:
@@ -281,13 +327,61 @@ class StateStore:
         return [dict(row) for row in rows]
 
     def update_credit(self, project_id: str, look_id: str, **changes: Any) -> None:
-        allowed = {"excel_sheet", "excel_look_number", "visual_status", "note"}
+        allowed = {"excel_sheet", "excel_look_number", "visual_status", "note", "manual_override", "manual_confirmed_at"}
         changes = {key: value for key, value in changes.items() if key in allowed}
         if not changes:
             return
         columns = ", ".join(f"{key} = ?" for key in changes)
         with self.connect() as db:
             db.execute(f"UPDATE credits SET {columns} WHERE project_id = ? AND look_id = ?", (*changes.values(), project_id, look_id))
+
+    def save_credit_overrides(self, project_id: str, edits: list[dict[str, str]]) -> int:
+        """Commit valid human corrections as one durable transaction."""
+        changed = 0
+        now = utc_now()
+        with self.connect() as db:
+            current = {
+                str(row["look_id"]): dict(row)
+                for row in db.execute("SELECT * FROM credits WHERE project_id = ?", (project_id,)).fetchall()
+            }
+            for edit in edits:
+                look_id = str(edit["look_id"])
+                previous = current.get(look_id)
+                if previous is None:
+                    continue
+                sheet = str(edit.get("excel_sheet", "")).strip()
+                number = str(edit.get("excel_look_number", "")).strip()
+                note = str(edit.get("note", "")).strip()
+                if not sheet or not number:
+                    raise ValueError(f"{look_id}: укажите и лист Excel, и номер карточки.")
+                if not number.isdigit():
+                    raise ValueError(f"{look_id}: номер карточки Excel должен состоять только из цифр.")
+                if (sheet, number, note) == (previous["excel_sheet"], previous["excel_look_number"], previous["note"]):
+                    continue
+                db.execute(
+                    """
+                    UPDATE credits
+                    SET excel_sheet=?, excel_look_number=?, note=?, visual_status='CONFIRMED',
+                        manual_override=1, manual_confirmed_at=?
+                    WHERE project_id=? AND look_id=?
+                    """,
+                    (sheet, number, note, now, project_id, look_id),
+                )
+                changed += 1
+            if changed:
+                db.execute("UPDATE projects SET updated_at = ? WHERE id = ?", (now, project_id))
+        return changed
+
+    def duplicate_credit_pairs(self, project_id: str) -> dict[tuple[str, str], list[str]]:
+        pairs: dict[tuple[str, str], list[str]] = {}
+        for row in self.credits(project_id):
+            sheet = str(row["excel_sheet"] or "").strip()
+            number = str(row["excel_look_number"] or "").strip()
+            if not sheet or not number:
+                continue
+            key = (sheet.casefold(), number)
+            pairs.setdefault(key, []).append(str(row["look_id"]))
+        return {key: looks for key, looks in pairs.items() if len(looks) > 1}
 
     def start_run(self, project_id: str, stage_key: str, command: str = "") -> int:
         with self.connect() as db:
@@ -328,3 +422,12 @@ def _int_or_none(value: Any) -> int | None:
     text = str(value or "").strip()
     return int(text) if text.isdigit() else None
 
+
+def _same_credit_pair(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    return (
+        str(left.get("excel_sheet", "")).strip().casefold(),
+        str(left.get("excel_look_number", "")).strip(),
+    ) == (
+        str(right.get("excel_sheet", "")).strip().casefold(),
+        str(right.get("excel_look_number", "")).strip(),
+    )
