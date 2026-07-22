@@ -20,6 +20,7 @@ from .domain import (
     visible_date_text,
 )
 from .providers import CodexProvider, ModelProvider, ProviderError, make_provider
+from .secrets import get_google_api_key
 from .state import StateStore
 
 
@@ -90,6 +91,8 @@ class PipelineEngine:
             project.model,
             ollama_endpoint=self.store.get_setting("ollama_endpoint", "http://127.0.0.1:11434"),
             llama_endpoint=self.store.get_setting("llama_endpoint", "http://127.0.0.1:8080"),
+            google_api_key=get_google_api_key(),
+            usage_store=self.store,
         )
 
     def _run_stage(self, project: ProjectRecord, key: str, provider: ModelProvider) -> str:
@@ -285,6 +288,11 @@ class PipelineEngine:
 
     def _map_gate(self, project: ProjectRecord, provider: ModelProvider) -> str:
         root = project.project_dir
+        # A targeted credit review can finish with the same approved mapping.
+        # In that case the controller still legitimately points to structure;
+        # trying to accept the identical map again produces a false block.
+        if evidence_passed(root, "map"):
+            return "Карта не изменилась после точечной сверки и уже подтверждена контроллером; продолжаем с этапа «Структура разворотов»."
         state = root / "control" / "lookbook-state.json"
         rows = self.store.looks(project.id)
         if not rows:

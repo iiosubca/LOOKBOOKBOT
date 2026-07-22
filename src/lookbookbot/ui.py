@@ -40,6 +40,7 @@ from .domain import ProviderKind, STAGES, StageStatus, project_code
 from .pipeline import PipelineEngine
 from .project_import import ExistingProjectError, open_existing_project
 from .providers import ProviderError, make_provider
+from .secrets import get_google_api_key, save_google_api_key
 from .state import StateStore
 
 
@@ -173,12 +174,20 @@ class MainWindow(QMainWindow):
         self.date_edit.setDisplayFormat("dd.MM.yyyy")
         self.provider_combo = QComboBox()
         self.provider_combo.addItem("Codex", ProviderKind.CODEX.value)
+        self.provider_combo.addItem("Google AI Studio", ProviderKind.GOOGLE.value)
         self.provider_combo.addItem("Ollama", ProviderKind.OLLAMA.value)
         self.provider_combo.addItem("llama.cpp", ProviderKind.LLAMACPP.value)
         self.provider_combo.currentIndexChanged.connect(self._provider_changed)
         self.model_combo = QComboBox()
         self.model_combo.setEditable(True)
         self.model_combo.setMinimumWidth(180)
+        self.google_key_label = QLabel("Google API key")
+        self.google_key_edit = QLineEdit()
+        self.google_key_edit.setPlaceholderText("Ключ AI Studio")
+        self.google_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.google_key_edit.setMinimumWidth(170)
+        self.google_quota = QLabel()
+        self.google_quota.setObjectName("Muted")
         test_provider = QPushButton("Проверить модель")
         test_provider.clicked.connect(self._test_provider)
         create = QPushButton("Создать / открыть проект")
@@ -194,6 +203,9 @@ class MainWindow(QMainWindow):
         setup_layout.addWidget(QLabel("ИИ"))
         setup_layout.addWidget(self.provider_combo)
         setup_layout.addWidget(self.model_combo)
+        setup_layout.addWidget(self.google_key_label)
+        setup_layout.addWidget(self.google_key_edit)
+        setup_layout.addWidget(self.google_quota)
         setup_layout.addWidget(test_provider)
         setup_layout.addWidget(create)
         setup_layout.addWidget(existing)
@@ -383,6 +395,8 @@ class MainWindow(QMainWindow):
         if index >= 0:
             self.provider_combo.setCurrentIndex(index)
         self.model_combo.setCurrentText(self.store.get_setting(f"model_{provider}", ""))
+        self.google_key_edit.setText(get_google_api_key())
+        self._provider_changed()
 
     def _load_project(self) -> None:
         self.project = self.store.active_project()
@@ -404,6 +418,7 @@ class MainWindow(QMainWindow):
         self._load_looks()
         self._load_credits()
         self._load_runs()
+        self._refresh_google_quota()
 
     def _browse_sources(self) -> None:
         selected = QFileDialog.getExistingDirectory(self, "Выберите папку исходников", self.source_edit.text() or str(Path.home()))
@@ -428,6 +443,7 @@ class MainWindow(QMainWindow):
         project_dir = output_root / project_code(show_date)
         provider = ProviderKind(str(self.provider_combo.currentData()))
         model = self.model_combo.currentText().strip()
+        self._save_google_key_if_supplied(provider)
         self.project = self.store.save_project(
             name=project_code(show_date), source_dir=source.resolve(), output_root=output_root,
             project_dir=project_dir, show_date=show_date, provider=provider, model=model,
@@ -460,18 +476,41 @@ class MainWindow(QMainWindow):
         self.model_combo.clear()
         defaults = {
             ProviderKind.CODEX: ["", "gpt-5.6-sol", "gpt-5.5"],
+            ProviderKind.GOOGLE: ["gemini-3.5-flash-lite"],
             ProviderKind.OLLAMA: [saved] if saved else [],
             ProviderKind.LLAMACPP: [saved or "local"],
         }
         self.model_combo.addItems([item for item in defaults[kind] if item or kind == ProviderKind.CODEX])
-        self.model_combo.setCurrentText(saved)
+        self.model_combo.setCurrentText(saved or defaults[kind][0])
+        is_google = kind == ProviderKind.GOOGLE
+        self.google_key_label.setVisible(is_google)
+        self.google_key_edit.setVisible(is_google)
+        self.google_quota.setVisible(is_google)
+        if is_google:
+            self._refresh_google_quota()
+
+    def _save_google_key_if_supplied(self, provider: ProviderKind) -> None:
+        if provider == ProviderKind.GOOGLE and self.google_key_edit.text().strip():
+            save_google_api_key(self.google_key_edit.text())
+
+    def _refresh_google_quota(self) -> None:
+        usage = self.store.google_usage_status()
+        tpm = usage["tpm_used"]
+        tpm_text = f"{tpm / 1000:.1f}K" if tpm >= 1000 else str(tpm)
+        self.google_quota.setText(
+            f"RPM {usage['rpm_used']} / {usage['rpm_limit']}   "
+            f"TPM {tpm_text} / 250K   RPD {usage['rpd_used']} / {usage['rpd_limit']}"
+        )
 
     def _test_provider(self) -> None:
         kind = ProviderKind(str(self.provider_combo.currentData()))
+        self._save_google_key_if_supplied(kind)
         provider = make_provider(
             kind, self.model_combo.currentText().strip(),
             ollama_endpoint=self.store.get_setting("ollama_endpoint", "http://127.0.0.1:11434"),
             llama_endpoint=self.store.get_setting("llama_endpoint", "http://127.0.0.1:8080"),
+            google_api_key=get_google_api_key(),
+            usage_store=self.store,
         )
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
@@ -489,11 +528,13 @@ class MainWindow(QMainWindow):
             if current:
                 self.model_combo.setCurrentText(current)
         QMessageBox.information(self, "Подключение работает", message)
+        self._refresh_google_quota()
 
     def _run_pipeline(self) -> None:
         if self.project is None:
             QMessageBox.information(self, "Сначала создайте проект", "Выберите исходники, дату и нажмите «Создать / открыть проект».")
             return
+        self._save_google_key_if_supplied(ProviderKind(str(self.provider_combo.currentData())))
         selected = self.stage_list.selectedItems()
         start_key = str(selected[0].data(Qt.ItemDataRole.UserRole)) if selected else None
         # A deliberately selected stage is an explicit request to rebuild it

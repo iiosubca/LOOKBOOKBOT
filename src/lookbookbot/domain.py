@@ -17,6 +17,7 @@ class StageStatus(StrEnum):
 
 class ProviderKind(StrEnum):
     CODEX = "codex"
+    GOOGLE = "google"
     OLLAMA = "ollama"
     LLAMACPP = "llamacpp"
 
@@ -101,4 +102,3 @@ class ProjectRecord:
     show_date: date
     provider: ProviderKind
     model: str
-

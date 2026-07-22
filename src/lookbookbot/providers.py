@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import subprocess
 import urllib.error
+import urllib.parse
 import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -102,6 +104,96 @@ class CodexProvider(ModelProvider):
             detail = (result.stderr or result.stdout or "Codex error").strip()
             raise ProviderError(detail[-4000:])
         return final or result.stdout.strip()
+
+
+class GoogleAiStudioProvider(ModelProvider):
+    """Gemini 3.5 Flash-Lite through Google AI Studio's OpenAI-compatible API."""
+
+    kind = ProviderKind.GOOGLE
+    endpoint = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+
+    def __init__(self, model: str, api_key: str = "", usage_store: Any | None = None) -> None:
+        super().__init__(model or "gemini-3.5-flash-lite")
+        self.api_key = api_key.strip() or os.environ.get("GOOGLE_API_KEY", "").strip()
+        self.usage_store = usage_store
+
+    def _require_key(self) -> str:
+        if not self.api_key:
+            raise ProviderError("Введите ключ Google AI Studio или задайте переменную окружения GOOGLE_API_KEY.")
+        return self.api_key
+
+    def health(self) -> str:
+        key = self._require_key()
+        url = "https://generativelanguage.googleapis.com/v1beta/models/" + urllib.parse.quote(self.model, safe=".-_")
+        request = urllib.request.Request(url, method="GET", headers={"x-goog-api-key": key})
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as error:
+            raise ProviderError(f"Google AI Studio недоступен для {self.model}: {error}") from error
+        if not data.get("name"):
+            raise ProviderError(f"Google AI Studio не подтвердил модель {self.model}.")
+        return f"Google AI Studio: {self.model}"
+
+    def list_models(self) -> list[str]:
+        return [self.model]
+
+    def _chat(self, messages: list[dict[str, Any]], *, estimated_input_tokens: int, timeout: int) -> str:
+        key = self._require_key()
+        reservation_id: int | None = None
+        if self.usage_store is not None:
+            try:
+                reservation_id = self.usage_store.reserve_google_request(estimated_input_tokens)
+            except ValueError as error:
+                raise ProviderError(str(error)) from error
+        payload = {"model": self.model, "messages": messages}
+        request = urllib.request.Request(
+            self.endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8", errors="replace")
+            raise ProviderError(f"Google AI Studio {error.code}: {detail[-1200:]}") from error
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+            raise ProviderError(f"Google AI Studio: {error}") from error
+        finally:
+            # API errors may still consume a request; the conservative
+            # reservation intentionally remains in the local quota ledger.
+            pass
+        if reservation_id is not None:
+            prompt_tokens, completion_tokens = _google_usage_tokens(data)
+            self.usage_store.settle_google_request(reservation_id, prompt_tokens, completion_tokens)
+        choices = data.get("choices") or []
+        if not choices:
+            raise ProviderError(f"Google AI Studio вернул ответ без choices: {str(data)[:800]}")
+        content = choices[0].get("message", {}).get("content", "")
+        if isinstance(content, list):
+            content = "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+        return str(content).strip()
+
+    def run_agent(self, prompt: str, workspace: Path, timeout: int = 7200) -> str:
+        del workspace
+        return self._chat(
+            [{"role": "user", "content": prompt}],
+            estimated_input_tokens=_estimate_google_tokens(prompt), timeout=timeout,
+        )
+
+    def inspect_proof(self, prompt: str, images: list[Path]) -> VisionDecision:
+        content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+        for path in images:
+            mime = "image/png" if path.suffix.casefold() == ".png" else "image/jpeg"
+            encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+            content.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}})
+        result = self._chat(
+            [{"role": "user", "content": content}],
+            estimated_input_tokens=_estimate_google_tokens(prompt, image_count=len(images)), timeout=600,
+        )
+        return self._decision(result)
 
 
 class HttpVisionProvider(ModelProvider):
@@ -214,9 +306,39 @@ class LlamaCppProvider(HttpVisionProvider):
         return self._decision(self._chat([{"role": "user", "content": content}], 600))
 
 
-def make_provider(kind: ProviderKind, model: str, *, ollama_endpoint: str = "http://127.0.0.1:11434", llama_endpoint: str = "http://127.0.0.1:8080") -> ModelProvider:
+def _estimate_google_tokens(text: str, image_count: int = 0) -> int:
+    return max(1, len(text.encode("utf-8")) // 4) + image_count * 4096
+
+
+def _google_usage_tokens(payload: dict[str, Any]) -> tuple[int | None, int | None]:
+    usage = payload.get("usage") or payload.get("usageMetadata") or {}
+    if not isinstance(usage, dict):
+        return None, None
+    prompt = usage.get("prompt_tokens", usage.get("promptTokenCount", usage.get("input_tokens")))
+    completion = usage.get("completion_tokens", usage.get("candidatesTokenCount", usage.get("output_tokens")))
+    return _optional_int(prompt), _optional_int(completion)
+
+
+def _optional_int(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def make_provider(
+    kind: ProviderKind,
+    model: str,
+    *,
+    ollama_endpoint: str = "http://127.0.0.1:11434",
+    llama_endpoint: str = "http://127.0.0.1:8080",
+    google_api_key: str = "",
+    usage_store: Any | None = None,
+) -> ModelProvider:
     if kind == ProviderKind.CODEX:
         return CodexProvider(model)
     if kind == ProviderKind.OLLAMA:
         return OllamaProvider(model, ollama_endpoint)
+    if kind == ProviderKind.GOOGLE:
+        return GoogleAiStudioProvider(model, google_api_key, usage_store)
     return LlamaCppProvider(model, llama_endpoint)

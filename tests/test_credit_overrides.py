@@ -169,3 +169,18 @@ def test_targeted_rematch_restores_every_unmarked_map_row(tmp_path: Path, monkey
     assert after["LOOK_002"]["excel_sheet"] == "W"
     assert after["LOOK_002"]["excel_look_number"] == "2"
     assert store.requested_credit_rematches(project.id) == []
+
+
+def test_map_gate_skips_reaccepting_an_unchanged_confirmed_map(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = StateStore(tmp_path / "state.db")
+    project = _project(store, tmp_path)
+    engine = PipelineEngine(store)
+    calls: list[str] = []
+
+    monkeypatch.setattr("lookbookbot.pipeline.evidence_passed", lambda _root, gate: gate == "map")
+    monkeypatch.setattr(engine.controller, "gate", lambda *args, **kwargs: calls.append(str(args[0])))
+
+    result = engine._map_gate(project, CodexProvider())
+
+    assert "уже подтверждена" in result
+    assert calls == []

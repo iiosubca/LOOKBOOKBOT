@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
+from zoneinfo import ZoneInfo
 
 from .config import app_data_dir
 from .domain import ProjectRecord, ProviderKind, STAGES, StageStatus
@@ -108,6 +109,15 @@ class StateStore:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS google_usage (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at_epoch INTEGER NOT NULL,
+                    pacific_day TEXT NOT NULL,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_google_usage_time ON google_usage(created_at_epoch);
+                CREATE INDEX IF NOT EXISTS idx_google_usage_day ON google_usage(pacific_day);
                 """
             )
             credit_columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(credits)").fetchall()}
@@ -420,6 +430,69 @@ class StateStore:
                 f"UPDATE credits SET needs_rematch = 0, rematch_requested_at = NULL "
                 f"WHERE project_id = ? AND look_id IN ({placeholders})",
                 (project_id, *look_ids),
+            )
+
+    def google_usage_status(self, *, now_epoch: int | None = None) -> dict[str, int]:
+        """Return local accounting for the Google AI Studio project limits."""
+        now = now_epoch if now_epoch is not None else int(datetime.now(timezone.utc).timestamp())
+        day = datetime.fromtimestamp(now, ZoneInfo("America/Los_Angeles")).date().isoformat()
+        with self.connect() as db:
+            minute = db.execute(
+                "SELECT COUNT(*) AS requests, COALESCE(SUM(input_tokens + output_tokens), 0) AS tokens "
+                "FROM google_usage WHERE created_at_epoch > ?", (now - 60,)
+            ).fetchone()
+            daily = db.execute(
+                "SELECT COUNT(*) AS requests FROM google_usage WHERE pacific_day = ?", (day,)
+            ).fetchone()
+        return {
+            "rpm_used": int(minute["requests"]), "rpm_limit": 15,
+            "tpm_used": int(minute["tokens"]), "tpm_limit": 250_000,
+            "rpd_used": int(daily["requests"]), "rpd_limit": 500,
+        }
+
+    def reserve_google_request(self, estimated_input_tokens: int) -> int:
+        """Reserve a request before sending it, so parallel workers stay below limits."""
+        estimated = max(1, int(estimated_input_tokens))
+        now = int(datetime.now(timezone.utc).timestamp())
+        day = datetime.fromtimestamp(now, ZoneInfo("America/Los_Angeles")).date().isoformat()
+        with self.connect() as db:
+            # Check and reservation use one transaction, so parallel workers
+            # cannot both consume the last available request.
+            db.execute("BEGIN IMMEDIATE")
+            minute = db.execute(
+                "SELECT COUNT(*) AS requests, COALESCE(SUM(input_tokens + output_tokens), 0) AS tokens "
+                "FROM google_usage WHERE created_at_epoch > ?", (now - 60,)
+            ).fetchone()
+            daily = db.execute(
+                "SELECT COUNT(*) AS requests FROM google_usage WHERE pacific_day = ?", (day,)
+            ).fetchone()
+            if int(minute["requests"]) >= 15:
+                raise ValueError("Google AI Studio: исчерпан лимит RPM 15/15. Повторите через минуту.")
+            if int(minute["tokens"]) + estimated > 250_000:
+                raise ValueError("Google AI Studio: следующий запрос превысит лимит TPM 250K. Повторите после обновления минутного окна.")
+            if int(daily["requests"]) >= 500:
+                raise ValueError("Google AI Studio: исчерпан суточный лимит RPD 500/500. Он обновится в полночь по Pacific Time.")
+            cursor = db.execute(
+                "INSERT INTO google_usage(created_at_epoch,pacific_day,input_tokens,output_tokens) VALUES(?,?,?,0)",
+                (now, day, estimated),
+            )
+            return int(cursor.lastrowid)
+
+    def settle_google_request(self, reservation_id: int, input_tokens: int | None, output_tokens: int | None) -> None:
+        """Replace the conservative reservation with API-reported token usage when available."""
+        if input_tokens is None and output_tokens is None:
+            return
+        with self.connect() as db:
+            current = db.execute("SELECT input_tokens, output_tokens FROM google_usage WHERE id = ?", (reservation_id,)).fetchone()
+            if current is None:
+                return
+            db.execute(
+                "UPDATE google_usage SET input_tokens = ?, output_tokens = ? WHERE id = ?",
+                (
+                    max(0, int(input_tokens)) if input_tokens is not None else int(current["input_tokens"]),
+                    max(0, int(output_tokens)) if output_tokens is not None else int(current["output_tokens"]),
+                    reservation_id,
+                ),
             )
 
     def start_run(self, project_id: str, stage_key: str, command: str = "") -> int:
