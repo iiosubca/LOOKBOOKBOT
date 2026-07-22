@@ -14,3 +14,4 @@ logs/
 *.sqlite3
 .env
 .tools/
+*.egg-info/
