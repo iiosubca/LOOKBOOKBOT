@@ -88,6 +88,8 @@ class StateStore:
                     note TEXT NOT NULL DEFAULT '',
                     manual_override INTEGER NOT NULL DEFAULT 0,
                     manual_confirmed_at TEXT,
+                    needs_rematch INTEGER NOT NULL DEFAULT 0,
+                    rematch_requested_at TEXT,
                     PRIMARY KEY (project_id, look_id),
                     FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
                 );
@@ -113,6 +115,10 @@ class StateStore:
                 db.execute("ALTER TABLE credits ADD COLUMN manual_override INTEGER NOT NULL DEFAULT 0")
             if "manual_confirmed_at" not in credit_columns:
                 db.execute("ALTER TABLE credits ADD COLUMN manual_confirmed_at TEXT")
+            if "needs_rematch" not in credit_columns:
+                db.execute("ALTER TABLE credits ADD COLUMN needs_rematch INTEGER NOT NULL DEFAULT 0")
+            if "rematch_requested_at" not in credit_columns:
+                db.execute("ALTER TABLE credits ADD COLUMN rematch_requested_at TEXT")
 
     def save_project(
         self,
@@ -382,6 +388,39 @@ class StateStore:
             key = (sheet.casefold(), number)
             pairs.setdefault(key, []).append(str(row["look_id"]))
         return {key: looks for key, looks in pairs.items() if len(looks) > 1}
+
+    def set_credit_rematch_requested(self, project_id: str, look_id: str, requested: bool) -> None:
+        """Persist the operator's target list without altering the map itself."""
+        with self.connect() as db:
+            db.execute(
+                """
+                UPDATE credits
+                SET needs_rematch = ?, rematch_requested_at = ?,
+                    manual_override = CASE WHEN ? THEN 0 ELSE manual_override END,
+                    manual_confirmed_at = CASE WHEN ? THEN NULL ELSE manual_confirmed_at END
+                WHERE project_id = ? AND look_id = ?
+                """,
+                (int(requested), utc_now() if requested else None, int(requested), int(requested), project_id, look_id),
+            )
+
+    def requested_credit_rematches(self, project_id: str) -> list[str]:
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT look_id FROM credits WHERE project_id = ? AND needs_rematch = 1 ORDER BY look_id",
+                (project_id,),
+            ).fetchall()
+        return [str(row["look_id"]) for row in rows]
+
+    def clear_credit_rematches(self, project_id: str, look_ids: list[str]) -> None:
+        if not look_ids:
+            return
+        placeholders = ", ".join("?" for _ in look_ids)
+        with self.connect() as db:
+            db.execute(
+                f"UPDATE credits SET needs_rematch = 0, rematch_requested_at = NULL "
+                f"WHERE project_id = ? AND look_id IN ({placeholders})",
+                (project_id, *look_ids),
+            )
 
     def start_run(self, project_id: str, stage_key: str, command: str = "") -> int:
         with self.connect() as db:

@@ -6,7 +6,8 @@ from pathlib import Path
 import pytest
 
 from lookbookbot.domain import ProviderKind
-from lookbookbot.pipeline import ReviewRequired, _credit_override_batches
+from lookbookbot.pipeline import PipelineEngine, ReviewRequired, _credit_override_batches, _read_tsv, _write_tsv
+from lookbookbot.providers import CodexProvider
 from lookbookbot.state import StateStore
 
 
@@ -79,6 +80,24 @@ def test_duplicate_card_pairs_and_bad_numbers_are_rejected(tmp_path: Path) -> No
         }])
 
 
+def test_rematch_request_is_durable_and_clears_manual_override(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    project = _project(store, tmp_path)
+    store.replace_credits(project.id, _credits())
+    store.save_credit_overrides(project.id, [{
+        "look_id": "LOOK_001", "excel_sheet": "M", "excel_look_number": "9", "note": "manual",
+    }])
+
+    store.set_credit_rematch_requested(project.id, "LOOK_001", True)
+    row = {row["look_id"]: row for row in store.credits(project.id)}["LOOK_001"]
+    assert row["needs_rematch"] == 1
+    assert row["manual_override"] == 0
+    assert store.requested_credit_rematches(project.id) == ["LOOK_001"]
+
+    store.clear_credit_rematches(project.id, ["LOOK_001"])
+    assert store.requested_credit_rematches(project.id) == []
+
+
 def test_swap_batches_are_atomic_and_limited_to_five() -> None:
     current = {
         "LOOK_001": {"excel_sheet": "W", "excel_look_number": "1"},
@@ -92,3 +111,61 @@ def test_swap_batches_are_atomic_and_limited_to_five() -> None:
     ]
     with pytest.raises(ReviewRequired, match="LOOK_002"):
         _credit_override_batches([("LOOK_001", "W", "2")], current)
+
+
+def test_marked_rows_take_the_targeted_credit_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = StateStore(tmp_path / "state.db")
+    project = _project(store, tmp_path)
+    registry = project.project_dir / "control" / "work" / "look-register.tsv"
+    registry.parent.mkdir(parents=True)
+    registry.write_text("look_id\nLOOK_001\n", encoding="utf-8")
+    store.replace_credits(project.id, _credits())
+    store.set_credit_rematch_requested(project.id, "LOOK_001", True)
+    engine = PipelineEngine(store)
+    called: list[list[str]] = []
+
+    def fake_targeted(_project, _provider, requested: list[str]) -> str:
+        called.append(requested)
+        return "targeted"
+
+    monkeypatch.setattr(engine, "_targeted_credit_rematch", fake_targeted)
+    assert engine._credits_map(project, object()) == "targeted"
+    assert called == [["LOOK_001"]]
+
+
+def test_targeted_rematch_restores_every_unmarked_map_row(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = StateStore(tmp_path / "state.db")
+    project = _project(store, tmp_path)
+    map_path = project.project_dir / "control" / "work" / "caption-map.tsv"
+    map_path.parent.mkdir(parents=True)
+    rows = [
+        {
+            "look_id": "LOOK_001", "excel_sheet": "W", "excel_look_number": "1", "excel_image": "one.jpg",
+            "left_filename": "one-full.jpg", "right_filename": "one-close.jpg", "evidence_file": "control/work/mapping-evidence/LOOK_001.jpg", "visual_status": "CONFIRMED",
+        },
+        {
+            "look_id": "LOOK_002", "excel_sheet": "W", "excel_look_number": "2", "excel_image": "two.jpg",
+            "left_filename": "two-full.jpg", "right_filename": "two-close.jpg", "evidence_file": "control/work/mapping-evidence/LOOK_002.jpg", "visual_status": "CONFIRMED",
+        },
+    ]
+    _write_tsv(map_path, rows)
+    store.replace_credits(project.id, rows)
+    store.set_credit_rematch_requested(project.id, "LOOK_001", True)
+    engine = PipelineEngine(store)
+    monkeypatch.setattr(engine.controller, "script", lambda *_args, **_kwargs: None)
+
+    def simulated_agent(_project, _provider, _stage: str) -> None:
+        changed = _read_tsv(map_path)
+        changed[0].update({"excel_sheet": "M", "excel_look_number": "9", "excel_image": "nine.jpg", "visual_status": "CONFIRMED"})
+        changed[1].update({"excel_sheet": "M", "excel_look_number": "8", "excel_image": "eight.jpg", "visual_status": "CONFIRMED"})
+        _write_tsv(map_path, changed)
+
+    monkeypatch.setattr(engine, "_delegate_codex", simulated_agent)
+    result = engine._targeted_credit_rematch(project, CodexProvider(), ["LOOK_001"])
+    after = {row["look_id"]: row for row in _read_tsv(map_path)}
+
+    assert "LOOK_001" in result
+    assert after["LOOK_001"]["excel_sheet"] == "M"
+    assert after["LOOK_002"]["excel_sheet"] == "W"
+    assert after["LOOK_002"]["excel_look_number"] == "2"
+    assert store.requested_credit_rematches(project.id) == []

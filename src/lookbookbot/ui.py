@@ -311,20 +311,24 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         toolbar = QHBoxLayout()
-        hint = QLabel("Исправьте только ошибочную карточку Excel; остальные подтверждённые строки не пересчитываются.")
+        hint = QLabel("Отметьте галочкой только спорные луки: повторно сопоставляться будут лишь они, остальные CONFIRMED останутся замороженными.")
         hint.setObjectName("Muted")
+        rematch = QPushButton("↻ Повторно сопоставить отмеченные")
+        rematch.clicked.connect(self._run_targeted_credit_rematch)
         save = QPushButton("Сохранить ручные правки")
         save.clicked.connect(self._save_credit_edits)
         toolbar.addWidget(hint, 1)
+        toolbar.addWidget(rematch)
         toolbar.addWidget(save)
         layout.addLayout(toolbar)
         content = QSplitter(Qt.Orientation.Horizontal)
-        self.credits_table = QTableWidget(0, 6)
-        self.credits_table.setHorizontalHeaderLabels(["LOOK", "Лист Excel", "№ карточки", "Статус", "Примечание", "Доказательство"])
+        self.credits_table = QTableWidget(0, 7)
+        self.credits_table.setHorizontalHeaderLabels(["Повторить", "LOOK", "Лист Excel", "№ карточки", "Статус", "Примечание", "Доказательство"])
         self.credits_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        self.credits_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        self.credits_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         self.credits_table.itemSelectionChanged.connect(self._preview_selected_credit)
         self.credits_table.itemChanged.connect(self._highlight_credit_duplicates_from_table)
+        self.credits_table.itemChanged.connect(self._credit_rematch_checkbox_changed)
         content.addWidget(self.credits_table)
         self.credit_preview = ImagePreview("Трёхпанельная проверка")
         content.addWidget(self.credit_preview)
@@ -499,10 +503,15 @@ class MainWindow(QMainWindow):
         if start_key:
             self.store.reset_from(self.project.id, start_key)
             self._refresh_stages()
+        self._start_pipeline(start_key, not self.run_one.isChecked())
+
+    def _start_pipeline(self, start_key: str | None, continue_after: bool) -> None:
+        if self.project is None:
+            return
         self.run_button.setEnabled(False)
         self.run_button.setText("ВЫПОЛНЯЕТСЯ…")
         self.worker_thread = QThread(self)
-        self.worker = PipelineWorker(self.store, self.project.id, start_key, not self.run_one.isChecked())
+        self.worker = PipelineWorker(self.store, self.project.id, start_key, continue_after)
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.run)
         self.worker.log.connect(self._append_log)
@@ -632,10 +641,17 @@ class MainWindow(QMainWindow):
         try:
             self.credits_table.setRowCount(len(rows))
             for index, row in enumerate(rows):
+                checkbox = QTableWidgetItem()
+                checkbox.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsSelectable)
+                checkbox.setCheckState(
+                    Qt.CheckState.Checked if row.get("needs_rematch") else Qt.CheckState.Unchecked
+                )
+                checkbox.setToolTip("Отметьте, если этот лук нужно сопоставить с Excel заново. Остальные строки не будут повторно проверяться.")
+                self.credits_table.setItem(index, 0, checkbox)
                 values = [row["look_id"], row["excel_sheet"], row["excel_look_number"], row["visual_status"], row["note"], row["evidence_file"]]
-                for column, value in enumerate(values):
+                for column, value in enumerate(values, start=1):
                     item = QTableWidgetItem(str(value or ""))
-                    if column in (0, 3, 5):
+                    if column in (1, 4, 6):
                         item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                     self.credits_table.setItem(index, column, item)
         finally:
@@ -654,12 +670,12 @@ class MainWindow(QMainWindow):
             return
         edits: list[dict[str, str]] = []
         for row in range(self.credits_table.rowCount()):
-            look_id = self.credits_table.item(row, 0).text()
+            look_id = self.credits_table.item(row, 1).text()
             edits.append({
                 "look_id": look_id,
-                "excel_sheet": self.credits_table.item(row, 1).text().strip(),
-                "excel_look_number": self.credits_table.item(row, 2).text().strip(),
-                "note": self.credits_table.item(row, 4).text().strip(),
+                "excel_sheet": self.credits_table.item(row, 2).text().strip(),
+                "excel_look_number": self.credits_table.item(row, 3).text().strip(),
+                "note": self.credits_table.item(row, 5).text().strip(),
             })
         try:
             changed = self.store.save_credit_overrides(self.project.id, edits)
@@ -675,14 +691,43 @@ class MainWindow(QMainWindow):
                 "перед вёрсткой программа создаст для них новые proof cards и перепроверит их без пересчёта остальных строк."
             )
 
+    def _credit_rematch_checkbox_changed(self, item: QTableWidgetItem) -> None:
+        if self._loading_credits or not self.project or item.column() != 0:
+            return
+        look_item = self.credits_table.item(item.row(), 1)
+        if look_item is None:
+            return
+        requested = item.checkState() == Qt.CheckState.Checked
+        self.store.set_credit_rematch_requested(self.project.id, look_item.text(), requested)
+        self._style_credit_statuses(self.store.credits(self.project.id))
+
+    def _run_targeted_credit_rematch(self) -> None:
+        if not self.project:
+            return
+        targets = self.store.requested_credit_rematches(self.project.id)
+        if not targets:
+            QMessageBox.information(
+                self,
+                "Нет отмеченных луков",
+                "Поставьте галочки рядом с лукaми, которые нужно сопоставить с Excel заново.",
+            )
+            return
+        self.store.reset_from(self.project.id, "credits_map")
+        self._refresh_stages()
+        self._append_log("Запущена точечная повторная сверка: " + ", ".join(targets))
+        # The rematch worker intentionally stops after the credit stage so
+        # the operator can review only the corrected proof cards before any
+        # later controller gate or InDesign work begins.
+        self._start_pipeline("credits_map", continue_after=False)
+
     def _credit_table_duplicates(self) -> dict[tuple[str, str], list[str]]:
         pairs: dict[tuple[str, str], list[str]] = {}
         for row in range(self.credits_table.rowCount()):
-            sheet = self.credits_table.item(row, 1).text().strip()
-            number = self.credits_table.item(row, 2).text().strip()
+            sheet = self.credits_table.item(row, 2).text().strip()
+            number = self.credits_table.item(row, 3).text().strip()
             if not sheet or not number:
                 continue
-            pairs.setdefault((sheet.casefold(), number), []).append(self.credits_table.item(row, 0).text())
+            pairs.setdefault((sheet.casefold(), number), []).append(self.credits_table.item(row, 1).text())
         return {pair: looks for pair, looks in pairs.items() if len(looks) > 1}
 
     def _highlight_credit_duplicates_from_table(self, *_args) -> None:
@@ -691,9 +736,9 @@ class MainWindow(QMainWindow):
         duplicates = self._credit_table_duplicates()
         duplicate_looks = {look_id for looks in duplicates.values() for look_id in looks}
         for row in range(self.credits_table.rowCount()):
-            look_id = self.credits_table.item(row, 0).text()
+            look_id = self.credits_table.item(row, 1).text()
             is_duplicate = look_id in duplicate_looks
-            for column in (1, 2):
+            for column in (2, 3):
                 item = self.credits_table.item(row, column)
                 item.setBackground(QColor("#7f1d1d") if is_duplicate else QColor("#0c121d"))
                 item.setForeground(QColor("#fecaca") if is_duplicate else QColor("#e8edf5"))
@@ -701,16 +746,19 @@ class MainWindow(QMainWindow):
 
     def _style_credit_statuses(self, rows: list[dict]) -> None:
         for index, row in enumerate(rows):
-            item = self.credits_table.item(index, 3)
+            item = self.credits_table.item(index, 4)
             confirmed = str(row.get("visual_status", "")).upper() == "CONFIRMED"
             item.setForeground(QColor("#34d399") if confirmed else QColor("#fbbf24"))
+            if row.get("needs_rematch"):
+                item.setForeground(QColor("#fbbf24"))
+                item.setToolTip("Отмечено для точечной повторной сверки. До нажатия кнопки карта не меняется.")
             if row.get("manual_override"):
                 item.setToolTip("Подтверждено вручную оператором; контроллер создаст новую proof-card перед применением в InDesign.")
 
     def _preview_selected_credit(self) -> None:
         if not self.project or self.credits_table.currentRow() < 0:
             return
-        evidence = self.credits_table.item(self.credits_table.currentRow(), 5).text()
+        evidence = self.credits_table.item(self.credits_table.currentRow(), 6).text()
         self.credit_preview.set_image(self.project.project_dir / evidence if evidence else None)
 
     def _load_runs(self) -> None:
