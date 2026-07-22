@@ -1,0 +1,16 @@
+.venv/
+build/
+dist/
+*.spec
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.idea/
+.vscode/
+data/
+logs/
+*.db
+*.sqlite3
+.env
+.tools/

@@ -1,0 +1,672 @@
+from __future__ import annotations
+
+import os
+from datetime import date
+from pathlib import Path
+
+from PySide6.QtCore import QDate, QObject, QSize, Qt, QThread, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QPixmap
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDateEdit,
+    QFileDialog,
+    QFormLayout,
+    QFrame,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QSplitter,
+    QStackedWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QTabWidget,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
+
+from .config import ToolPaths
+from .discovery import discover_sources, infer_output_root
+from .domain import ProviderKind, STAGES, StageStatus, project_code
+from .pipeline import PipelineEngine
+from .providers import ProviderError, make_provider
+from .state import StateStore
+
+
+STATUS_ICON = {
+    StageStatus.PENDING.value: "○",
+    StageStatus.RUNNING.value: "◌",
+    StageStatus.PASSED.value: "✓",
+    StageStatus.REVIEW.value: "!",
+    StageStatus.FAILED.value: "×",
+    StageStatus.BLOCKED.value: "■",
+}
+
+STATUS_COLOR = {
+    StageStatus.PENDING.value: "#7c8798",
+    StageStatus.RUNNING.value: "#f59e0b",
+    StageStatus.PASSED.value: "#10b981",
+    StageStatus.REVIEW.value: "#f59e0b",
+    StageStatus.FAILED.value: "#ef4444",
+    StageStatus.BLOCKED.value: "#ef4444",
+}
+
+
+class PipelineWorker(QObject):
+    log = Signal(str)
+    stage = Signal(str, str, str)
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, store: StateStore, project_id: str, start_key: str | None, continue_after: bool) -> None:
+        super().__init__()
+        self.store = store
+        self.project_id = project_id
+        self.start_key = start_key
+        self.continue_after = continue_after
+
+    def run(self) -> None:
+        try:
+            project = self.store.get_project(self.project_id)
+            engine = PipelineEngine(
+                self.store,
+                log=self.log.emit,
+                progress=lambda key, status, message: self.stage.emit(key, status.value, message),
+            )
+            result = engine.run(project, self.start_key, continue_after=self.continue_after)
+        except Exception as error:
+            self.failed.emit(str(error))
+        else:
+            self.finished.emit(result)
+
+
+class ImagePreview(QLabel):
+    def __init__(self, placeholder: str) -> None:
+        super().__init__(placeholder)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setMinimumSize(260, 360)
+        self.setStyleSheet("background:#111827;border:1px solid #273244;border-radius:12px;color:#7c8798;")
+        self._path: Path | None = None
+
+    def set_image(self, path: Path | None) -> None:
+        self._path = path
+        if path is None or not path.is_file():
+            self.setPixmap(QPixmap())
+            self.setText("Изображение не найдено")
+            return
+        pixmap = QPixmap(str(path))
+        if pixmap.isNull():
+            self.setPixmap(QPixmap())
+            self.setText(path.name)
+            return
+        self.setText("")
+        self.setPixmap(pixmap.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        if self._path:
+            self.set_image(self._path)
+
+
+class MainWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.store = StateStore()
+        self.tools = ToolPaths.defaults()
+        self.project = self.store.active_project()
+        self.worker_thread: QThread | None = None
+        self.worker: PipelineWorker | None = None
+        self.stage_items: dict[str, QListWidgetItem] = {}
+        self.setWindowTitle("LOOKBOOKBOT")
+        self.resize(1500, 940)
+        self.setMinimumSize(1180, 760)
+        self._build_ui()
+        self._apply_style()
+        self._load_settings()
+        self._load_project()
+
+    def _build_ui(self) -> None:
+        root = QWidget()
+        self.setCentralWidget(root)
+        outer = QVBoxLayout(root)
+        outer.setContentsMargins(24, 20, 24, 20)
+        outer.setSpacing(14)
+
+        header = QHBoxLayout()
+        title_box = QVBoxLayout()
+        title = QLabel("LOOKBOOKBOT")
+        title.setObjectName("Title")
+        subtitle = QLabel("Управляемая вёрстка лукбука в Adobe InDesign")
+        subtitle.setObjectName("Muted")
+        title_box.addWidget(title)
+        title_box.addWidget(subtitle)
+        header.addLayout(title_box)
+        header.addStretch()
+        self.project_label = QLabel("Проект не выбран")
+        self.project_label.setObjectName("ProjectBadge")
+        header.addWidget(self.project_label)
+        outer.addLayout(header)
+
+        setup = QFrame()
+        setup.setObjectName("Card")
+        setup_layout = QHBoxLayout(setup)
+        setup_layout.setContentsMargins(18, 14, 18, 14)
+        setup_layout.setSpacing(10)
+        self.source_edit = QLineEdit()
+        self.source_edit.setPlaceholderText("Папка с PDF, Excel и hires")
+        self.source_edit.setMinimumWidth(380)
+        browse = QPushButton("Выбрать папку")
+        browse.clicked.connect(self._browse_sources)
+        self.date_edit = QDateEdit(QDate.currentDate())
+        self.date_edit.setCalendarPopup(True)
+        self.date_edit.setDisplayFormat("dd.MM.yyyy")
+        self.provider_combo = QComboBox()
+        self.provider_combo.addItem("Codex", ProviderKind.CODEX.value)
+        self.provider_combo.addItem("Ollama", ProviderKind.OLLAMA.value)
+        self.provider_combo.addItem("llama.cpp", ProviderKind.LLAMACPP.value)
+        self.provider_combo.currentIndexChanged.connect(self._provider_changed)
+        self.model_combo = QComboBox()
+        self.model_combo.setEditable(True)
+        self.model_combo.setMinimumWidth(180)
+        test_provider = QPushButton("Проверить модель")
+        test_provider.clicked.connect(self._test_provider)
+        create = QPushButton("Создать / открыть проект")
+        create.setObjectName("Primary")
+        create.clicked.connect(self._save_project)
+        setup_layout.addWidget(QLabel("Исходники"))
+        setup_layout.addWidget(self.source_edit, 1)
+        setup_layout.addWidget(browse)
+        setup_layout.addWidget(QLabel("Дата"))
+        setup_layout.addWidget(self.date_edit)
+        setup_layout.addWidget(QLabel("ИИ"))
+        setup_layout.addWidget(self.provider_combo)
+        setup_layout.addWidget(self.model_combo)
+        setup_layout.addWidget(test_provider)
+        setup_layout.addWidget(create)
+        outer.addWidget(setup)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        outer.addWidget(splitter, 1)
+
+        sidebar = QFrame()
+        sidebar.setObjectName("Card")
+        sidebar.setMinimumWidth(320)
+        sidebar.setMaximumWidth(400)
+        side_layout = QVBoxLayout(sidebar)
+        side_layout.setContentsMargins(14, 14, 14, 14)
+        side_layout.addWidget(QLabel("Этапы выпуска"))
+        self.stage_list = QListWidget()
+        self.stage_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.stage_list.itemSelectionChanged.connect(self._stage_selected)
+        for stage in STAGES:
+            item = QListWidgetItem(f"○  {stage.title}")
+            item.setData(Qt.ItemDataRole.UserRole, stage.key)
+            item.setToolTip(stage.description)
+            item.setSizeHint(QSize(280, 44))
+            self.stage_list.addItem(item)
+            self.stage_items[stage.key] = item
+        side_layout.addWidget(self.stage_list, 1)
+        clear_selection = QPushButton("Продолжить с места остановки")
+        clear_selection.clicked.connect(self.stage_list.clearSelection)
+        side_layout.addWidget(clear_selection)
+        self.approved = QCheckBox("Согласовано — разрешить финальные PDF")
+        self.approved.toggled.connect(self._approval_changed)
+        side_layout.addWidget(self.approved)
+        self.run_one = QCheckBox("Выполнить только выбранный этап")
+        side_layout.addWidget(self.run_one)
+        self.run_button = QPushButton("▶  ПУСК")
+        self.run_button.setObjectName("Run")
+        self.run_button.clicked.connect(self._run_pipeline)
+        side_layout.addWidget(self.run_button)
+        splitter.addWidget(sidebar)
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_overview(), "Обзор")
+        self.tabs.addTab(self._build_looks(), "Список луков")
+        self.tabs.addTab(self._build_credits(), "Список кредитов")
+        self.tabs.addTab(self._build_log(), "Журнал")
+        splitter.addWidget(self.tabs)
+        splitter.setStretchFactor(1, 1)
+
+    def _build_overview(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(18, 18, 18, 18)
+        self.stage_title = QLabel("Выберите проект")
+        self.stage_title.setObjectName("SectionTitle")
+        self.stage_description = QLabel("Программа сохраняет каждый подтверждённый этап и продолжает с первой незавершённой строки.")
+        self.stage_description.setWordWrap(True)
+        self.stage_description.setObjectName("Muted")
+        self.project_path = QLineEdit()
+        self.project_path.setReadOnly(True)
+        open_project = QPushButton("Открыть папку проекта")
+        open_project.clicked.connect(self._open_project_folder)
+        self.source_report = QTextEdit()
+        self.source_report.setReadOnly(True)
+        self.source_report.setPlaceholderText("После выбора исходников здесь появится проверка комплекта.")
+        self.source_report.setMaximumHeight(200)
+        layout.addWidget(self.stage_title)
+        layout.addWidget(self.stage_description)
+        layout.addSpacing(12)
+        layout.addWidget(QLabel("Папка выпуска"))
+        row = QHBoxLayout()
+        row.addWidget(self.project_path, 1)
+        row.addWidget(open_project)
+        layout.addLayout(row)
+        layout.addWidget(QLabel("Проверка комплекта"))
+        layout.addWidget(self.source_report)
+        layout.addStretch()
+        return page
+
+    def _build_looks(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        toolbar = QHBoxLayout()
+        hint = QLabel("PDF определяет порядок. Слева всегда полный рост, справа — клоузап.")
+        hint.setObjectName("Muted")
+        save = QPushButton("Сохранить ручные правки")
+        save.clicked.connect(self._save_look_edits)
+        swap = QPushButton("Поменять фото в выбранной строке")
+        swap.clicked.connect(self._swap_selected_look)
+        toolbar.addWidget(hint, 1)
+        toolbar.addWidget(swap)
+        toolbar.addWidget(save)
+        layout.addLayout(toolbar)
+        content = QSplitter(Qt.Orientation.Vertical)
+        self.looks_table = QTableWidget(0, 7)
+        self.looks_table.setHorizontalHeaderLabels(["№", "LOOK", "PDF", "Полный рост — слева", "Клоузап — справа", "Статус", "Примечание"])
+        self.looks_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.looks_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.looks_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        self.looks_table.itemSelectionChanged.connect(self._preview_selected_look)
+        content.addWidget(self.looks_table)
+        previews = QWidget()
+        preview_layout = QHBoxLayout(previews)
+        self.left_preview = ImagePreview("Полный рост")
+        self.right_preview = ImagePreview("Клоузап")
+        preview_layout.addWidget(self.left_preview)
+        preview_layout.addWidget(self.right_preview)
+        content.addWidget(previews)
+        content.setStretchFactor(0, 2)
+        content.setStretchFactor(1, 3)
+        layout.addWidget(content, 1)
+        return page
+
+    def _build_credits(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        toolbar = QHBoxLayout()
+        hint = QLabel("Исправьте только ошибочную карточку Excel; остальные подтверждённые строки не пересчитываются.")
+        hint.setObjectName("Muted")
+        save = QPushButton("Сохранить ручные правки")
+        save.clicked.connect(self._save_credit_edits)
+        toolbar.addWidget(hint, 1)
+        toolbar.addWidget(save)
+        layout.addLayout(toolbar)
+        content = QSplitter(Qt.Orientation.Horizontal)
+        self.credits_table = QTableWidget(0, 6)
+        self.credits_table.setHorizontalHeaderLabels(["LOOK", "Лист Excel", "№ карточки", "Статус", "Примечание", "Доказательство"])
+        self.credits_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.credits_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        self.credits_table.itemSelectionChanged.connect(self._preview_selected_credit)
+        content.addWidget(self.credits_table)
+        self.credit_preview = ImagePreview("Трёхпанельная проверка")
+        content.addWidget(self.credit_preview)
+        content.setStretchFactor(0, 3)
+        content.setStretchFactor(1, 2)
+        layout.addWidget(content, 1)
+        return page
+
+    def _build_log(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        self.log_view = QTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setFont(QFont("Cascadia Mono", 9))
+        layout.addWidget(self.log_view)
+        return page
+
+    def _apply_style(self) -> None:
+        self.setStyleSheet(
+            """
+            QMainWindow, QWidget { background:#090d14; color:#e8edf5; font-family:'Segoe UI'; font-size:13px; }
+            QFrame#Card, QTabWidget::pane { background:#111827; border:1px solid #263247; border-radius:14px; }
+            QLabel#Title { font-size:30px; font-weight:800; color:#ffffff; }
+            QLabel#SectionTitle { font-size:24px; font-weight:700; color:#ffffff; }
+            QLabel#Muted { color:#91a0b5; }
+            QLabel#ProjectBadge { background:#172554; color:#93c5fd; border:1px solid #1d4ed8; padding:8px 14px; border-radius:12px; font-weight:600; }
+            QLineEdit, QComboBox, QDateEdit, QTextEdit, QTableWidget, QListWidget {
+                background:#0c121d; color:#e8edf5; border:1px solid #2a374d; border-radius:8px; padding:6px;
+                selection-background-color:#1d4ed8; selection-color:white;
+            }
+            QComboBox QAbstractItemView { background:#111827; color:#e8edf5; selection-background-color:#1d4ed8; }
+            QPushButton { background:#1f2937; color:#e8edf5; border:1px solid #344157; border-radius:8px; padding:8px 12px; }
+            QPushButton:hover { background:#2b374a; }
+            QPushButton#Primary { background:#1d4ed8; border-color:#2563eb; font-weight:600; }
+            QPushButton#Run { background:#10b981; color:#052e24; border:none; padding:13px; font-size:15px; font-weight:800; }
+            QPushButton#Run:disabled { background:#334155; color:#94a3b8; }
+            QHeaderView::section { background:#162033; color:#b8c4d6; border:none; border-right:1px solid #2a374d; padding:7px; }
+            QTabBar::tab { background:#111827; color:#91a0b5; padding:10px 18px; border:1px solid #263247; }
+            QTabBar::tab:selected { color:white; background:#1d4ed8; }
+            QListWidget::item { border-radius:8px; margin:2px; padding:6px; }
+            QListWidget::item:selected { background:#1e3a8a; color:white; }
+            QSplitter::handle { background:#090d14; width:8px; height:8px; }
+            """
+        )
+
+    def _load_settings(self) -> None:
+        source = self.store.get_setting("last_source")
+        if source:
+            self.source_edit.setText(source)
+        provider = self.store.get_setting("provider", ProviderKind.CODEX.value)
+        index = self.provider_combo.findData(provider)
+        if index >= 0:
+            self.provider_combo.setCurrentIndex(index)
+        self.model_combo.setCurrentText(self.store.get_setting(f"model_{provider}", ""))
+
+    def _load_project(self) -> None:
+        self.project = self.store.active_project()
+        if self.project is None:
+            self._refresh_stages()
+            return
+        self.project_label.setText(self.project.name)
+        self.project_path.setText(str(self.project.project_dir))
+        self.source_edit.setText(str(self.project.source_dir))
+        self.date_edit.setDate(QDate(self.project.show_date.year, self.project.show_date.month, self.project.show_date.day))
+        index = self.provider_combo.findData(self.project.provider.value)
+        if index >= 0:
+            self.provider_combo.setCurrentIndex(index)
+        self.model_combo.setCurrentText(self.project.model)
+        self.approved.blockSignals(True)
+        self.approved.setChecked(self.store.is_approved(self.project.id))
+        self.approved.blockSignals(False)
+        self._refresh_stages()
+        self._load_looks()
+        self._load_credits()
+        self._load_runs()
+
+    def _browse_sources(self) -> None:
+        selected = QFileDialog.getExistingDirectory(self, "Выберите папку исходников", self.source_edit.text() or str(Path.home()))
+        if not selected:
+            return
+        self.source_edit.setText(selected)
+        self._inspect_sources(Path(selected))
+
+    def _inspect_sources(self, source: Path) -> bool:
+        report = discover_sources(source, self.tools)
+        self.source_report.setPlainText("\n".join(("✓ " if report.bundle else "! ") + line for line in report.messages))
+        return report.bundle is not None
+
+    def _save_project(self) -> None:
+        source = Path(self.source_edit.text().strip()).expanduser()
+        if not self._inspect_sources(source):
+            QMessageBox.warning(self, "Исходники не готовы", self.source_report.toPlainText())
+            return
+        qdate = self.date_edit.date()
+        show_date = date(qdate.year(), qdate.month(), qdate.day())
+        output_root = infer_output_root(source)
+        project_dir = output_root / project_code(show_date)
+        provider = ProviderKind(str(self.provider_combo.currentData()))
+        model = self.model_combo.currentText().strip()
+        self.project = self.store.save_project(
+            name=project_code(show_date), source_dir=source.resolve(), output_root=output_root,
+            project_dir=project_dir, show_date=show_date, provider=provider, model=model,
+        )
+        self.store.set_setting("last_source", str(source.resolve()))
+        self.store.set_setting("provider", provider.value)
+        self.store.set_setting(f"model_{provider.value}", model)
+        self._append_log(f"Проект открыт: {project_dir}")
+        self._load_project()
+
+    def _provider_changed(self) -> None:
+        kind = ProviderKind(str(self.provider_combo.currentData()))
+        saved = self.store.get_setting(f"model_{kind.value}", "")
+        self.model_combo.clear()
+        defaults = {
+            ProviderKind.CODEX: ["", "gpt-5.6-sol", "gpt-5.5"],
+            ProviderKind.OLLAMA: [saved] if saved else [],
+            ProviderKind.LLAMACPP: [saved or "local"],
+        }
+        self.model_combo.addItems([item for item in defaults[kind] if item or kind == ProviderKind.CODEX])
+        self.model_combo.setCurrentText(saved)
+
+    def _test_provider(self) -> None:
+        kind = ProviderKind(str(self.provider_combo.currentData()))
+        provider = make_provider(
+            kind, self.model_combo.currentText().strip(),
+            ollama_endpoint=self.store.get_setting("ollama_endpoint", "http://127.0.0.1:11434"),
+            llama_endpoint=self.store.get_setting("llama_endpoint", "http://127.0.0.1:8080"),
+        )
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            message = provider.health()
+            models = provider.list_models()
+        except ProviderError as error:
+            QMessageBox.warning(self, "Подключение не готово", str(error))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        if models:
+            current = self.model_combo.currentText()
+            self.model_combo.clear()
+            self.model_combo.addItems(models)
+            if current:
+                self.model_combo.setCurrentText(current)
+        QMessageBox.information(self, "Подключение работает", message)
+
+    def _run_pipeline(self) -> None:
+        if self.project is None:
+            QMessageBox.information(self, "Сначала создайте проект", "Выберите исходники, дату и нажмите «Создать / открыть проект».")
+            return
+        selected = self.stage_list.selectedItems()
+        start_key = str(selected[0].data(Qt.ItemDataRole.UserRole)) if selected else None
+        self.run_button.setEnabled(False)
+        self.run_button.setText("ВЫПОЛНЯЕТСЯ…")
+        self.worker_thread = QThread(self)
+        self.worker = PipelineWorker(self.store, self.project.id, start_key, not self.run_one.isChecked())
+        self.worker.moveToThread(self.worker_thread)
+        self.worker_thread.started.connect(self.worker.run)
+        self.worker.log.connect(self._append_log)
+        self.worker.stage.connect(self._worker_stage)
+        self.worker.finished.connect(self._worker_finished)
+        self.worker.failed.connect(self._worker_failed)
+        self.worker.finished.connect(self.worker_thread.quit)
+        self.worker.failed.connect(self.worker_thread.quit)
+        self.worker_thread.finished.connect(self.worker.deleteLater)
+        self.worker_thread.finished.connect(self.worker_thread.deleteLater)
+        self.tabs.setCurrentIndex(3)
+        self.worker_thread.start()
+
+    def _worker_stage(self, key: str, status: str, message: str) -> None:
+        self._append_log(f"[{key}] {message}")
+        self._refresh_stages()
+
+    def _worker_finished(self, result) -> None:
+        self._append_log(result.message)
+        self._finish_worker()
+        if result.stopped_at:
+            QMessageBox.warning(self, "Этап требует внимания", result.message)
+        else:
+            QMessageBox.information(self, "Выполнение завершено", result.message)
+
+    def _worker_failed(self, message: str) -> None:
+        self._append_log("ОШИБКА: " + message)
+        self._finish_worker()
+        QMessageBox.critical(self, "Ошибка выполнения", message)
+
+    def _finish_worker(self) -> None:
+        self.run_button.setEnabled(True)
+        self.run_button.setText("▶  ПУСК")
+        self._load_project()
+
+    def _refresh_stages(self) -> None:
+        rows = self.store.stage_rows(self.project.id) if self.project else {}
+        for stage in STAGES:
+            status = rows.get(stage.key, {}).get("status", StageStatus.PENDING.value)
+            item = self.stage_items[stage.key]
+            item.setText(f"{STATUS_ICON.get(status, '○')}  {stage.title}")
+            item.setForeground(QColor(STATUS_COLOR.get(status, "#e8edf5")))
+            error = rows.get(stage.key, {}).get("error", "")
+            item.setToolTip(error or stage.description)
+
+    def _stage_selected(self) -> None:
+        selected = self.stage_list.selectedItems()
+        if not selected:
+            self.stage_title.setText("Продолжение с места остановки")
+            self.stage_description.setText("Пуск начнёт работу с первой незавершённой строки.")
+            return
+        key = str(selected[0].data(Qt.ItemDataRole.UserRole))
+        stage = next(stage for stage in STAGES if stage.key == key)
+        self.stage_title.setText(stage.title)
+        self.stage_description.setText(stage.description)
+        if key == "looks":
+            self.tabs.setCurrentIndex(1)
+        elif key == "credits_map":
+            self.tabs.setCurrentIndex(2)
+        else:
+            self.tabs.setCurrentIndex(0)
+
+    def _load_looks(self) -> None:
+        rows = self.store.looks(self.project.id) if self.project else []
+        self.looks_table.setRowCount(len(rows))
+        for index, row in enumerate(rows):
+            values = [row["spread_order"], row["look_id"], row["pdf_spread"], row["left_filename"], row["right_filename"], row["status"], row["note"]]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem("" if value is None else str(value))
+                if column in (0, 1, 2, 5):
+                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.looks_table.setItem(index, column, item)
+
+    def _save_look_edits(self) -> None:
+        if not self.project:
+            return
+        current = {row["look_id"]: row for row in self.store.looks(self.project.id)}
+        changed = 0
+        for row in range(self.looks_table.rowCount()):
+            look_id = self.looks_table.item(row, 1).text()
+            before = current.get(look_id, {})
+            left = self.looks_table.item(row, 3).text().strip()
+            right = self.looks_table.item(row, 4).text().strip()
+            note = self.looks_table.item(row, 6).text().strip()
+            if left == before.get("left_filename") and right == before.get("right_filename") and note == before.get("note", ""):
+                continue
+            self.store.update_look(
+                self.project.id, look_id,
+                left_filename=left,
+                right_filename=right,
+                status="manual",
+                note=note,
+            )
+            changed += 1
+        if changed:
+            self.store.reset_from(self.project.id, "looks")
+            self._refresh_stages()
+            self._append_log(f"Ручные правки списка луков сохранены: {changed}. Следующий запуск начнётся с их контролируемой проверки.")
+
+    def _swap_selected_look(self) -> None:
+        row = self.looks_table.currentRow()
+        if row < 0:
+            return
+        left = self.looks_table.item(row, 3).text()
+        right = self.looks_table.item(row, 4).text()
+        self.looks_table.item(row, 3).setText(right)
+        self.looks_table.item(row, 4).setText(left)
+        self._save_look_edits()
+        self._preview_selected_look()
+
+    def _preview_selected_look(self) -> None:
+        if not self.project or self.looks_table.currentRow() < 0:
+            return
+        row = self.looks_table.currentRow()
+        hires = self.project.project_dir / "control" / "work" / "_mat" / "hires"
+        self.left_preview.set_image(hires / self.looks_table.item(row, 3).text())
+        self.right_preview.set_image(hires / self.looks_table.item(row, 4).text())
+
+    def _load_credits(self) -> None:
+        rows = self.store.credits(self.project.id) if self.project else []
+        self.credits_table.setRowCount(len(rows))
+        for index, row in enumerate(rows):
+            values = [row["look_id"], row["excel_sheet"], row["excel_look_number"], row["visual_status"], row["note"], row["evidence_file"]]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value or ""))
+                if column in (0, 5):
+                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.credits_table.setItem(index, column, item)
+
+    def _save_credit_edits(self) -> None:
+        if not self.project:
+            return
+        current = {row["look_id"]: row for row in self.store.credits(self.project.id)}
+        changed = 0
+        for row in range(self.credits_table.rowCount()):
+            look_id = self.credits_table.item(row, 0).text()
+            before = current.get(look_id, {})
+            sheet = self.credits_table.item(row, 1).text().strip()
+            number = self.credits_table.item(row, 2).text().strip()
+            note = self.credits_table.item(row, 4).text().strip()
+            if sheet == before.get("excel_sheet") and number == before.get("excel_look_number") and note == before.get("note", ""):
+                continue
+            self.store.update_credit(
+                self.project.id, look_id,
+                excel_sheet=sheet,
+                excel_look_number=number,
+                visual_status="PENDING",
+                note=note,
+            )
+            changed += 1
+        if changed:
+            self.store.reset_from(self.project.id, "credits_map")
+            self._refresh_stages()
+            self._append_log(f"Ручные правки кредитов сохранены: {changed}. Они будут проверены отдельными proof cards без пересчёта подтверждённых строк.")
+
+    def _preview_selected_credit(self) -> None:
+        if not self.project or self.credits_table.currentRow() < 0:
+            return
+        evidence = self.credits_table.item(self.credits_table.currentRow(), 5).text()
+        self.credit_preview.set_image(self.project.project_dir / evidence if evidence else None)
+
+    def _load_runs(self) -> None:
+        self.log_view.clear()
+        if not self.project:
+            return
+        for run in self.store.recent_runs(self.project.id, 50):
+            self.log_view.append(f"[{run['started_at']}] {run['stage_key']} — {run['status']}\n{run['output']}\n")
+
+    def _append_log(self, text: str) -> None:
+        self.log_view.append(text)
+        scrollbar = self.log_view.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def _approval_changed(self, checked: bool) -> None:
+        if self.project:
+            self.store.set_approved(self.project.id, checked)
+            if checked:
+                self.store.reset_from(self.project.id, "final")
+            self._refresh_stages()
+
+    def _open_project_folder(self) -> None:
+        if self.project and self.project.project_dir.exists():
+            os.startfile(self.project.project_dir)  # type: ignore[attr-defined]
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        if self.worker_thread and self.worker_thread.isRunning():
+            answer = QMessageBox.question(
+                self, "Операция выполняется",
+                "Закрытие окна не должно прерывать текущую операцию InDesign. Оставить программу открытой?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+        super().closeEvent(event)
