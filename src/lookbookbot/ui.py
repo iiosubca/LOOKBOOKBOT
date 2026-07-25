@@ -4,7 +4,7 @@ import os
 from datetime import date
 from pathlib import Path
 
-from PySide6.QtCore import QDate, QObject, QSize, Qt, QThread, Signal
+from PySide6.QtCore import QDate, QObject, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSplitter,
     QStackedWidget,
@@ -35,6 +36,7 @@ from PySide6.QtWidgets import (
 )
 
 from .config import ToolPaths
+from .controller import read_json
 from .discovery import discover_sources, infer_output_root
 from .domain import ProviderKind, STAGES, StageStatus, project_code
 from .pipeline import PipelineEngine
@@ -130,6 +132,9 @@ class MainWindow(QMainWindow):
         self.worker: PipelineWorker | None = None
         self.stage_items: dict[str, QListWidgetItem] = {}
         self._loading_credits = False
+        self.final_export_timer = QTimer(self)
+        self.final_export_timer.setInterval(750)
+        self.final_export_timer.timeout.connect(self._refresh_final_export_progress)
         self.setWindowTitle("LOOKBOOKBOT")
         self.resize(1500, 940)
         self.setMinimumSize(1180, 760)
@@ -246,6 +251,16 @@ class MainWindow(QMainWindow):
         self.run_button.setObjectName("Run")
         self.run_button.clicked.connect(self._run_pipeline)
         side_layout.addWidget(self.run_button)
+        self.final_export_label = QLabel()
+        self.final_export_label.setObjectName("Muted")
+        self.final_export_label.setWordWrap(True)
+        self.final_export_progress = QProgressBar()
+        self.final_export_progress.setRange(0, 5)
+        self.final_export_progress.setTextVisible(True)
+        self.final_export_progress.hide()
+        self.final_export_label.hide()
+        side_layout.addWidget(self.final_export_label)
+        side_layout.addWidget(self.final_export_progress)
         splitter.addWidget(sidebar)
 
         self.tabs = QTabWidget()
@@ -604,6 +619,10 @@ class MainWindow(QMainWindow):
 
     def _worker_stage(self, key: str, status: str, message: str) -> None:
         self._append_log(f"[{key}] {message}")
+        if key == "final" and status == StageStatus.RUNNING.value:
+            self._begin_final_export_progress()
+        elif key == "final" and status == StageStatus.PASSED.value:
+            self._refresh_final_export_progress()
         self._refresh_stages()
 
     def _worker_finished(self, result) -> None:
@@ -620,9 +639,44 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Ошибка выполнения", message)
 
     def _finish_worker(self) -> None:
+        if self.final_export_timer.isActive():
+            self.final_export_timer.stop()
+        self._refresh_final_export_progress()
         self.run_button.setEnabled(True)
         self.run_button.setText("▶  ПУСК")
         self._load_project()
+
+    def _begin_final_export_progress(self) -> None:
+        self.final_export_progress.setRange(0, 5)
+        self.final_export_progress.setValue(0)
+        self.final_export_progress.show()
+        self.final_export_label.setText("Финальные PDF: подготовка экспорта…")
+        self.final_export_label.show()
+        self._refresh_final_export_progress()
+        self.final_export_timer.start()
+
+    def _refresh_final_export_progress(self) -> None:
+        if self.project is None:
+            return
+        manifest = read_json(self.project.project_dir / "control" / "final-deliverables.json")
+        outputs = manifest.get("outputs")
+        if not isinstance(outputs, list) or not outputs:
+            return
+        total = len(outputs)
+        complete = sum(1 for output in outputs if isinstance(output, dict) and output.get("identity") and output.get("verified_at"))
+        current = next((output for output in outputs if isinstance(output, dict) and not output.get("identity")), None)
+        self.final_export_progress.setRange(0, total)
+        self.final_export_progress.setValue(complete)
+        self.final_export_progress.show()
+        self.final_export_label.show()
+        if str(manifest.get("status", "")).casefold() == "complete" and complete == total:
+            self.final_export_label.setText(f"Финальные PDF готовы: {complete} из {total}")
+            return
+        if isinstance(current, dict):
+            filename = Path(str(current.get("path", "PDF"))).name
+            self.final_export_label.setText(f"Экспорт PDF {complete + 1} из {total}: {filename}")
+        else:
+            self.final_export_label.setText(f"Проверка финальных PDF: {complete} из {total}")
 
     def _refresh_stages(self) -> None:
         rows = self.store.stage_rows(self.project.id) if self.project else {}
