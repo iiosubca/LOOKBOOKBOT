@@ -22,6 +22,7 @@ from .domain import (
 from .providers import CodexProvider, ModelProvider, ProviderError, make_provider
 from .secrets import get_google_api_key
 from .state import StateStore
+from .visual_audit import visual_audit_blocker_message
 
 
 class PipelineError(RuntimeError):
@@ -336,7 +337,7 @@ class PipelineEngine:
         else:
             self._run_local_visual(project, provider)
         if not evidence_passed(project.project_dir, "visual"):
-            raise ReviewRequired("Визуальная проверка не завершена. В таблице этапа показаны проблемные луки.")
+            raise ReviewRequired(visual_audit_blocker_message(project.project_dir))
         return "Все развороты подтверждены: порядок фото, ссылки, кредиты, safe area и clearance."
 
     def _review(self, project: ProjectRecord) -> str:

@@ -42,6 +42,7 @@ from .project_import import ExistingProjectError, open_existing_project
 from .providers import ProviderError, make_provider
 from .secrets import get_google_api_key, save_google_api_key
 from .state import StateStore
+from .visual_audit import load_visual_audit
 
 
 STATUS_ICON = {
@@ -248,10 +249,11 @@ class MainWindow(QMainWindow):
         splitter.addWidget(sidebar)
 
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._build_overview(), "Обзор")
-        self.tabs.addTab(self._build_looks(), "Список луков")
-        self.tabs.addTab(self._build_credits(), "Список кредитов")
-        self.tabs.addTab(self._build_log(), "Журнал")
+        self.overview_tab = self.tabs.addTab(self._build_overview(), "Обзор")
+        self.looks_tab = self.tabs.addTab(self._build_looks(), "Список луков")
+        self.credits_tab = self.tabs.addTab(self._build_credits(), "Список кредитов")
+        self.visual_tab = self.tabs.addTab(self._build_visual_audit(), "Визуальная проверка")
+        self.log_tab = self.tabs.addTab(self._build_log(), "Журнал")
         splitter.addWidget(self.tabs)
         splitter.setStretchFactor(1, 1)
 
@@ -349,6 +351,34 @@ class MainWindow(QMainWindow):
         layout.addWidget(content, 1)
         return page
 
+    def _build_visual_audit(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        toolbar = QHBoxLayout()
+        self.visual_audit_summary = QLabel("Визуальный аудит ещё не запускался.")
+        self.visual_audit_summary.setObjectName("Muted")
+        self.refresh_visual_audit = QPushButton("Обновить результаты")
+        self.refresh_visual_audit.clicked.connect(self._load_visual_audit)
+        toolbar.addWidget(self.visual_audit_summary, 1)
+        toolbar.addWidget(self.refresh_visual_audit)
+        layout.addLayout(toolbar)
+        content = QSplitter(Qt.Orientation.Horizontal)
+        self.visual_audit_table = QTableWidget(0, 4)
+        self.visual_audit_table.setHorizontalHeaderLabels(["LOOK", "Статус", "Причина", "Доказательство"])
+        self.visual_audit_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.visual_audit_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.visual_audit_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.visual_audit_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.visual_audit_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.visual_audit_table.itemSelectionChanged.connect(self._preview_selected_visual_audit)
+        content.addWidget(self.visual_audit_table)
+        self.visual_audit_preview = ImagePreview("Выберите лук в таблице")
+        content.addWidget(self.visual_audit_preview)
+        content.setStretchFactor(0, 3)
+        content.setStretchFactor(1, 2)
+        layout.addWidget(content, 1)
+        return page
+
     def _build_log(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -417,6 +447,7 @@ class MainWindow(QMainWindow):
         self._refresh_stages()
         self._load_looks()
         self._load_credits()
+        self._load_visual_audit()
         self._load_runs()
         self._refresh_google_quota()
 
@@ -563,7 +594,7 @@ class MainWindow(QMainWindow):
         self.worker.failed.connect(self.worker_thread.quit)
         self.worker_thread.finished.connect(self.worker.deleteLater)
         self.worker_thread.finished.connect(self.worker_thread.deleteLater)
-        self.tabs.setCurrentIndex(3)
+        self.tabs.setCurrentIndex(self.log_tab)
         self.worker_thread.start()
 
     def _continue_from_checkpoint(self) -> None:
@@ -614,11 +645,13 @@ class MainWindow(QMainWindow):
         self.stage_title.setText(stage.title)
         self.stage_description.setText(stage.description)
         if key == "looks":
-            self.tabs.setCurrentIndex(1)
+            self.tabs.setCurrentIndex(self.looks_tab)
         elif key == "credits_map":
-            self.tabs.setCurrentIndex(2)
+            self.tabs.setCurrentIndex(self.credits_tab)
+        elif key == "visual":
+            self.tabs.setCurrentIndex(self.visual_tab)
         else:
-            self.tabs.setCurrentIndex(0)
+            self.tabs.setCurrentIndex(self.overview_tab)
 
     def _load_looks(self) -> None:
         rows = self.store.looks(self.project.id) if self.project else []
@@ -801,6 +834,36 @@ class MainWindow(QMainWindow):
             return
         evidence = self.credits_table.item(self.credits_table.currentRow(), 6).text()
         self.credit_preview.set_image(self.project.project_dir / evidence if evidence else None)
+
+    def _load_visual_audit(self) -> None:
+        rows = load_visual_audit(self.project.project_dir) if self.project else []
+        self.visual_audit_table.setRowCount(len(rows))
+        blocked = 0
+        for index, row in enumerate(rows):
+            values = [row.look_id, row.status, row.reason, row.evidence_image]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 1:
+                    is_clear = row.status == "CLEAR"
+                    item.setForeground(QColor("#34d399") if is_clear else QColor("#f87171"))
+                    if not is_clear:
+                        blocked += 1
+                if column == 3:
+                    item.setToolTip("Выберите строку, чтобы открыть это доказательство справа.")
+                self.visual_audit_table.setItem(index, column, item)
+        if not rows:
+            self.visual_audit_summary.setText("Controller-evidence визуального аудита ещё не создан.")
+            self.visual_audit_preview.set_image(None)
+        elif blocked:
+            self.visual_audit_summary.setText(f"Требуют внимания: {blocked} из {len(rows)} луков. Выберите строку для просмотра доказательства.")
+        else:
+            self.visual_audit_summary.setText(f"Clearance-аудит: все {len(rows)} луков CLEAR. Если этап всё ещё не пройден, откройте «Журнал»: не записан PASS visual.")
+
+    def _preview_selected_visual_audit(self) -> None:
+        if not self.project or self.visual_audit_table.currentRow() < 0:
+            return
+        evidence = self.visual_audit_table.item(self.visual_audit_table.currentRow(), 3).text()
+        self.visual_audit_preview.set_image(self.project.project_dir / evidence if evidence else None)
 
     def _load_runs(self) -> None:
         self.log_view.clear()
