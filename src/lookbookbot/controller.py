@@ -111,7 +111,26 @@ class LookbookController:
             if evidence_passed(project, gate):
                 return
             if result.returncode:
-                raise CommandError(result.text)
+                if _is_com_disconnect(result.text):
+                    # The COM worker has already exited and the master lock was
+                    # checked above. Retry exactly the same armed gate once;
+                    # never re-arm, skip, or start a second concurrent worker.
+                    self.runner.log(
+                        f"InDesign потерял COM-соединение на этапе {gate}; "
+                        "выполняется одна безопасная повторная попытка из сохранённой точки."
+                    )
+                    retry = self.gate("apply", project, "--gate", gate, timeout=1800, check=False)
+                    self._wait_for_master(project)
+                    if evidence_passed(project, gate):
+                        return
+                    if retry.returncode:
+                        raise CommandError(
+                            f"InDesign снова потерял связь на этапе {gate}. "
+                            "Документ не был пропущен или перезаписан; повторите этот же этап позднее."
+                        )
+                    result = retry
+                else:
+                    raise CommandError(result.text)
             if "CHECKPOINT" not in result.text.upper() and "PASS" not in result.text.upper():
                 raise CommandError(f"Контроллер не зафиксировал checkpoint для {gate}: {result.text}")
         raise CommandError(f"Превышено число безопасных пакетов этапа {gate}.")
@@ -128,3 +147,7 @@ class LookbookController:
 def _quote(value: str) -> str:
     return f'"{value}"' if " " in value else value
 
+
+def _is_com_disconnect(text: str) -> bool:
+    normalized = text.casefold()
+    return "rpc_e_disconnected" in normalized or "0x80010108" in normalized
