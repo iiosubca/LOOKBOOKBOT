@@ -235,7 +235,9 @@ class MainWindow(QMainWindow):
         # desktop width or when Google quota controls were visible.
         source_row = QHBoxLayout()
         source_row.setSpacing(10)
-        source_row.addWidget(QLabel("Исходники"))
+        source_label = QLabel("Исходники")
+        source_label.setObjectName("FormLabel")
+        source_row.addWidget(source_label)
         source_row.addWidget(self.source_edit, 1)
         source_row.addWidget(browse)
         source_row.addSpacing(14)
@@ -244,7 +246,9 @@ class MainWindow(QMainWindow):
 
         model_row = QHBoxLayout()
         model_row.setSpacing(10)
-        model_row.addWidget(QLabel("ИИ"))
+        provider_label = QLabel("ИИ")
+        provider_label.setObjectName("FormLabel")
+        model_row.addWidget(provider_label)
         model_row.addWidget(self.provider_combo)
         model_row.addWidget(self.model_combo)
         model_row.addSpacing(14)
@@ -465,16 +469,20 @@ class MainWindow(QMainWindow):
             """
             QMainWindow, QWidget {
                 background:#f5f5f2; color:#111111;
-                font-family:'Helvetica Neue', Arial, 'Segoe UI', sans-serif; font-size:13px;
+                font-family:'TSUM Circe', 'Circe', Arial, sans-serif; font-size:13px;
             }
             QFrame#Card, QTabWidget::pane { background:#ffffff; border:1px solid #d8d8d2; border-radius:0; }
             QLabel#Title {
-                font-family:Arial, 'Helvetica Neue', sans-serif; font-size:29px;
+                font-family:'TSUM Circe Bold', 'Circe Bold', Arial, sans-serif; font-size:29px;
                 font-weight:700; letter-spacing:0.8px; color:#111111;
             }
-            QLabel#SectionTitle { font-size:23px; font-weight:700; letter-spacing:0.2px; color:#111111; }
+            QLabel#SectionTitle {
+                font-family:'TSUM Circe Bold', 'Circe Bold', Arial, sans-serif;
+                font-size:23px; font-weight:700; letter-spacing:0.2px; color:#111111;
+            }
             QLabel#Muted { color:#6d6d68; }
             QLabel#BrandLogo { background:transparent; }
+            QLabel#FormLabel { background:transparent; font-family:'TSUM Circe Bold', 'Circe Bold', Arial, sans-serif; font-weight:700; }
             QLabel#ProjectBadge {
                 background:#111111; color:#ffffff; border:1px solid #111111;
                 padding:9px 14px; border-radius:0; font-weight:700; letter-spacing:0.3px;
@@ -486,7 +494,7 @@ class MainWindow(QMainWindow):
             QComboBox QAbstractItemView { background:#ffffff; color:#111111; selection-background-color:#111111; }
             QPushButton {
                 background:#ffffff; color:#111111; border:1px solid #111111;
-                border-radius:0; padding:9px 13px; font-weight:600;
+                border-radius:0; padding:9px 13px; font-family:'TSUM Circe Bold', 'Circe Bold', Arial, sans-serif; font-weight:700;
             }
             QPushButton:hover { background:#111111; color:#ffffff; }
             QPushButton#Primary { background:#111111; color:#ffffff; border-color:#111111; font-weight:700; }
