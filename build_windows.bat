@@ -7,8 +7,11 @@ if not exist ".venv\Scripts\pyinstaller.exe" (
   exit /b 1
 )
 
-call ".venv\Scripts\pyinstaller.exe" --noconfirm --clean --windowed --name LOOKBOOKBOT --paths src --icon "src\assets\lookbookbot.ico" --add-data "src\assets\lbb-logo.png;assets" --add-data "src\assets\lookbookbot.ico;assets" launcher.py
+call ".venv\Scripts\pyinstaller.exe" --noconfirm --clean --onefile --windowed --name LOOKBOOKBOT --paths src --icon "src\assets\lookbookbot.ico" --add-data "src\assets\lbb-logo.png;assets" --add-data "src\assets\lookbookbot.ico;assets" launcher.py
+if errorlevel 1 exit /b 1
+
+copy /Y "dist\LOOKBOOKBOT.exe" "LOOKBOOKBOT.exe" >nul
 if errorlevel 1 exit /b 1
 
 echo.
-echo Build ready: dist\LOOKBOOKBOT\LOOKBOOKBOT.exe
+echo Build ready: LOOKBOOKBOT.exe

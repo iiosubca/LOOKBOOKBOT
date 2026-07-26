@@ -15,4 +15,5 @@ logs/
 .env
 .tools/
 tmp/
+LOOKBOOKBOT.exe
 *.egg-info/
