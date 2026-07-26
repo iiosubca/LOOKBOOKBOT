@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from datetime import date
 from pathlib import Path
 
@@ -66,6 +67,14 @@ STATUS_COLOR = {
 }
 
 
+def _asset_path(filename: str) -> Path:
+    """Return a bundled asset both from source and a PyInstaller build."""
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if bundle_root:
+        return Path(bundle_root) / "assets" / filename
+    return Path(__file__).resolve().parents[1] / "assets" / filename
+
+
 class PipelineWorker(QObject):
     log = Signal(str)
     stage = Signal(str, str, str)
@@ -99,7 +108,7 @@ class ImagePreview(QLabel):
         super().__init__(placeholder)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMinimumSize(260, 360)
-        self.setStyleSheet("background:#111827;border:1px solid #273244;border-radius:12px;color:#7c8798;")
+        self.setStyleSheet("background:#ffffff;border:1px solid #d8d8d2;color:#6d6d68;")
         self._path: Path | None = None
 
     def set_image(self, path: Path | None) -> None:
@@ -154,13 +163,30 @@ class MainWindow(QMainWindow):
         outer.setSpacing(14)
 
         header = QHBoxLayout()
+        header.setSpacing(16)
+        self.logo_label = QLabel()
+        self.logo_label.setObjectName("BrandLogo")
+        logo = QPixmap(str(_asset_path("lbb-logo.png")))
+        if not logo.isNull():
+            self.logo_label.setPixmap(
+                logo.scaled(
+                    108,
+                    66,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+        self.logo_label.setFixedSize(108, 66)
+        self.logo_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         title_box = QVBoxLayout()
+        title_box.setSpacing(2)
         title = QLabel("LOOKBOOKBOT")
         title.setObjectName("Title")
         subtitle = QLabel("Управляемая вёрстка лукбука в Adobe InDesign")
         subtitle.setObjectName("Muted")
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
+        header.addWidget(self.logo_label)
         header.addLayout(title_box)
         header.addStretch()
         self.project_label = QLabel("Проект не выбран")
@@ -437,28 +463,60 @@ class MainWindow(QMainWindow):
     def _apply_style(self) -> None:
         self.setStyleSheet(
             """
-            QMainWindow, QWidget { background:#090d14; color:#e8edf5; font-family:'Segoe UI'; font-size:13px; }
-            QFrame#Card, QTabWidget::pane { background:#111827; border:1px solid #263247; border-radius:14px; }
-            QLabel#Title { font-size:30px; font-weight:800; color:#ffffff; }
-            QLabel#SectionTitle { font-size:24px; font-weight:700; color:#ffffff; }
-            QLabel#Muted { color:#91a0b5; }
-            QLabel#ProjectBadge { background:#172554; color:#93c5fd; border:1px solid #1d4ed8; padding:8px 14px; border-radius:12px; font-weight:600; }
-            QLineEdit, QComboBox, QDateEdit, QTextEdit, QTableWidget, QListWidget {
-                background:#0c121d; color:#e8edf5; border:1px solid #2a374d; border-radius:8px; padding:6px;
-                selection-background-color:#1d4ed8; selection-color:white;
+            QMainWindow, QWidget {
+                background:#f5f5f2; color:#111111;
+                font-family:'Helvetica Neue', Arial, 'Segoe UI', sans-serif; font-size:13px;
             }
-            QComboBox QAbstractItemView { background:#111827; color:#e8edf5; selection-background-color:#1d4ed8; }
-            QPushButton { background:#1f2937; color:#e8edf5; border:1px solid #344157; border-radius:8px; padding:8px 12px; }
-            QPushButton:hover { background:#2b374a; }
-            QPushButton#Primary { background:#1d4ed8; border-color:#2563eb; font-weight:600; }
-            QPushButton#Run { background:#10b981; color:#052e24; border:none; padding:13px; font-size:15px; font-weight:800; }
-            QPushButton#Run:disabled { background:#334155; color:#94a3b8; }
-            QHeaderView::section { background:#162033; color:#b8c4d6; border:none; border-right:1px solid #2a374d; padding:7px; }
-            QTabBar::tab { background:#111827; color:#91a0b5; padding:10px 18px; border:1px solid #263247; }
-            QTabBar::tab:selected { color:white; background:#1d4ed8; }
-            QListWidget::item { border-radius:8px; margin:2px; padding:6px; }
-            QListWidget::item:selected { background:#1e3a8a; color:white; }
-            QSplitter::handle { background:#090d14; width:8px; height:8px; }
+            QFrame#Card, QTabWidget::pane { background:#ffffff; border:1px solid #d8d8d2; border-radius:0; }
+            QLabel#Title {
+                font-family:Arial, 'Helvetica Neue', sans-serif; font-size:29px;
+                font-weight:700; letter-spacing:0.8px; color:#111111;
+            }
+            QLabel#SectionTitle { font-size:23px; font-weight:700; letter-spacing:0.2px; color:#111111; }
+            QLabel#Muted { color:#6d6d68; }
+            QLabel#BrandLogo { background:transparent; }
+            QLabel#ProjectBadge {
+                background:#111111; color:#ffffff; border:1px solid #111111;
+                padding:9px 14px; border-radius:0; font-weight:700; letter-spacing:0.3px;
+            }
+            QLineEdit, QComboBox, QDateEdit, QTextEdit, QTableWidget, QListWidget {
+                background:#ffffff; color:#111111; border:1px solid #cfcfca; border-radius:0; padding:7px;
+                selection-background-color:#111111; selection-color:#ffffff;
+            }
+            QComboBox QAbstractItemView { background:#ffffff; color:#111111; selection-background-color:#111111; }
+            QPushButton {
+                background:#ffffff; color:#111111; border:1px solid #111111;
+                border-radius:0; padding:9px 13px; font-weight:600;
+            }
+            QPushButton:hover { background:#111111; color:#ffffff; }
+            QPushButton#Primary { background:#111111; color:#ffffff; border-color:#111111; font-weight:700; }
+            QPushButton#Primary:hover { background:#e84b16; border-color:#e84b16; }
+            QPushButton#Run {
+                background:#e84b16; color:#ffffff; border:1px solid #e84b16;
+                padding:13px; font-size:15px; font-weight:800; letter-spacing:0.3px;
+            }
+            QPushButton#Run:hover { background:#111111; border-color:#111111; }
+            QPushButton#Run:disabled { background:#e3e3de; color:#8b8b84; border-color:#e3e3de; }
+            QHeaderView::section {
+                background:#efefeb; color:#111111; border:none;
+                border-right:1px solid #d8d8d2; border-bottom:1px solid #d8d8d2; padding:8px; font-weight:700;
+            }
+            QTabBar::tab {
+                background:#ffffff; color:#6d6d68; padding:11px 18px;
+                border:1px solid #d8d8d2; border-bottom:none; border-radius:0; font-weight:600;
+            }
+            QTabBar::tab:hover { color:#111111; background:#f0f0ec; }
+            QTabBar::tab:selected { color:#ffffff; background:#111111; border-color:#111111; }
+            QListWidget::item { border-radius:0; margin:1px 0; padding:7px; }
+            QListWidget::item:hover { background:#f0f0ec; }
+            QListWidget::item:selected { background:#111111; color:#ffffff; }
+            QTableWidget::item { padding:5px; }
+            QProgressBar { background:#e8e8e3; border:none; border-radius:0; text-align:center; color:#111111; }
+            QProgressBar::chunk { background:#e84b16; }
+            QCheckBox { spacing:7px; }
+            QCheckBox::indicator { width:15px; height:15px; border:1px solid #111111; background:#ffffff; }
+            QCheckBox::indicator:checked { background:#111111; }
+            QSplitter::handle { background:#f5f5f2; width:8px; height:8px; }
             """
         )
 

@@ -7,7 +7,7 @@ if not exist ".venv\Scripts\pyinstaller.exe" (
   exit /b 1
 )
 
-call ".venv\Scripts\pyinstaller.exe" --noconfirm --clean --windowed --name LOOKBOOKBOT --paths src launcher.py
+call ".venv\Scripts\pyinstaller.exe" --noconfirm --clean --windowed --name LOOKBOOKBOT --paths src --add-data "src\assets\lbb-logo.png;assets" launcher.py
 if errorlevel 1 exit /b 1
 
 echo.
