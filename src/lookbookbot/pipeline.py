@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -333,7 +334,7 @@ class PipelineEngine:
         if evidence_passed(project.project_dir, "visual"):
             return "Визуальная проверка уже подтверждена текущим master."
         if isinstance(provider, CodexProvider):
-            self._delegate_codex(project, provider, "visual")
+            self._run_parallel_codex_visual(project, provider)
         else:
             self._run_local_visual(project, provider)
         if not evidence_passed(project.project_dir, "visual"):
@@ -428,6 +429,94 @@ class PipelineEngine:
                 "confirm-reference-look", root, "--look", card.stem,
                 "--note", decision.note or "Reference pair visually matches; full length left, close-up right.", timeout=120,
             )
+
+    def _prepare_visual_proof(self, project: ProjectRecord) -> list[Path]:
+        """Run the single-writer InDesign portion of the visual gate."""
+        root = project.project_dir
+        arm = self.controller.gate("arm", root, "--gate", "visual", timeout=120, check=False)
+        if arm.returncode and "armed" not in arm.text.casefold():
+            self.log(arm.text)
+        self.controller.script("prepare_composition_audit.py", root, timeout=600)
+        for _ in range(100):
+            result = self.controller.gate("apply-composition", root, timeout=1800, check=False)
+            if result.returncode:
+                raise PipelineError(result.text)
+            if "PASS composition" in result.text or "PASS COMPOSITION" in result.text.upper():
+                break
+            if "CHECKPOINT" not in result.text.upper():
+                break
+        for _ in range(6):
+            rendered = self.controller.gate("render-visual-proof", root, timeout=1800, check=False)
+            if rendered.returncode == 0:
+                pairs = _latest_cards(root / "control" / "visual" / "proof" / "pairs")
+                if not pairs:
+                    raise PipelineError("Визуальный proof не содержит разворотов для проверки.")
+                return pairs
+            plan = self.controller.gate("plan-clearance-corrections", root, timeout=900, check=False)
+            if plan.returncode:
+                raise ReviewRequired(plan.text or rendered.text)
+            for _batch in range(100):
+                applied = self.controller.gate("apply-composition", root, timeout=1800, check=False)
+                if applied.returncode:
+                    raise PipelineError(applied.text)
+                if "PASS composition" in applied.text or "CHECKPOINT" not in applied.text.upper():
+                    break
+        raise ReviewRequired("Caption clearance не удалось довести до CLEAR за шесть контролируемых итераций.")
+
+    def _run_parallel_codex_visual(self, project: ProjectRecord, provider: CodexProvider) -> None:
+        """Inspect disjoint proof batches concurrently; keep InDesign and PASS single-writer."""
+        root = project.project_dir
+        pairs = self._prepare_visual_proof(project)
+        confirmations = root / "control" / "visual" / "confirmations"
+        pending = [proof for proof in pairs if not (confirmations / f"{proof.stem}.json").is_file()]
+        batches = _path_batches(pending, size=5)
+        if batches:
+            workers = min(4, len(batches))
+            self.log(f"Визуальная проверка: {len(pending)} разворотов в {len(batches)} независимых пакетах, одновременно до {workers}.")
+            failures: list[str] = []
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="lookbook-visual") as executor:
+                futures = {
+                    executor.submit(self._confirm_codex_visual_batch, provider, root, batch): batch
+                    for batch in batches
+                }
+                for future in as_completed(futures):
+                    batch = futures[future]
+                    labels = ", ".join(proof.stem for proof in batch)
+                    try:
+                        future.result()
+                    except (ProviderError, CommandError, OSError, ValueError) as error:
+                        failures.append(f"{labels}: {error}")
+                    else:
+                        self.log(f"Визуальный пакет завершён: {labels}")
+            if failures:
+                raise ReviewRequired("Не завершены независимые пакеты визуальной проверки:\n" + "\n".join(failures))
+        missing = [proof.stem for proof in pairs if not (confirmations / f"{proof.stem}.json").is_file()]
+        if missing:
+            raise ReviewRequired("Не подтверждены текущие visual-proof развороты: " + ", ".join(missing))
+        self.controller.gate(
+            "record-visual", root,
+            "--notes", "Все current-master proofs проверены в независимых пакетах; компьютерный caption clearance сохранён.",
+            timeout=300,
+        )
+
+    def _confirm_codex_visual_batch(self, provider: CodexProvider, root: Path, proofs: list[Path]) -> None:
+        look_ids = [proof.stem for proof in proofs]
+        proof_lines = "\n".join(f"- {proof.stem}: {proof}" for proof in proofs)
+        prompt = f"""Выполни только свой независимый пакет визуальной проверки лукбука.
+
+Проект: {root}
+Тебе разрешены только эти LOOK: {", ".join(look_ids)}.
+Proof-развороты, которые нужно реально просмотреть:
+{proof_lines}
+
+Открой каждый proof. Для каждого проверь: full-length слева, close-up справа, видимые кредиты читаемы и не пересекают модель, находятся внутри safe area; не меняй фото, страницы, фреймы, InDesign или composition plan.
+
+После просмотра каждого именно назначенного LOOK выполни штатную команду `confirm-visual-look` с конкретной заметкой не короче 25 символов. Запрещено подтверждать LOOK из другого пакета, запускать arm/apply/render/record-visual, экспортировать PDF или менять InDesign. Если хотя бы один разворот нельзя честно подтвердить, не создавай для него confirmation и в финальном сообщении укажи его ID и причину.
+
+Не выполняй `record-visual`: это делает координатор только после окончания всех пакетов."""
+        result = provider.run_agent(prompt, root)
+        if result:
+            self.log("Codex visual batch: " + result[-1200:])
 
     def _run_local_visual(self, project: ProjectRecord, provider: ModelProvider) -> None:
         root = project.project_dir
@@ -585,6 +674,13 @@ def _latest_cards(root: Path) -> list[Path]:
         by_parent.setdefault(path.parent, []).append(path)
     parent = max(by_parent, key=lambda path: max(item.stat().st_mtime_ns for item in by_parent[path]))
     return sorted(by_parent[parent], key=lambda path: path.stem)
+
+
+def _path_batches(paths: list[Path], *, size: int) -> list[list[Path]]:
+    """Split proof paths into fixed, non-overlapping review assignments."""
+    if size < 1:
+        raise ValueError("Batch size must be positive.")
+    return [paths[index : index + size] for index in range(0, len(paths), size)]
 
 
 def _credit_override_batches(
