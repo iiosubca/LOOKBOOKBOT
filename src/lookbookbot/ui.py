@@ -278,7 +278,7 @@ class MainWindow(QMainWindow):
         sidebar.setMaximumWidth(400)
         side_layout = QVBoxLayout(sidebar)
         side_layout.setContentsMargins(14, 14, 14, 14)
-        stage_heading = QLabel("Этапы выпуска")
+        stage_heading = QLabel("ЭТАПЫ ВЫПУСКА")
         stage_heading.setObjectName("SidebarTitle")
         side_layout.addWidget(stage_heading)
         self.stage_list = QListWidget()
@@ -328,11 +328,11 @@ class MainWindow(QMainWindow):
         splitter.addWidget(sidebar)
 
         self.tabs = QTabWidget()
-        self.overview_tab = self.tabs.addTab(self._build_overview(), "Обзор")
-        self.looks_tab = self.tabs.addTab(self._build_looks(), "Список луков")
-        self.credits_tab = self.tabs.addTab(self._build_credits(), "Список кредитов")
-        self.visual_tab = self.tabs.addTab(self._build_visual_audit(), "Визуальная проверка")
-        self.log_tab = self.tabs.addTab(self._build_log(), "Журнал")
+        self.overview_tab = self.tabs.addTab(self._build_overview(), "ОБЗОР")
+        self.looks_tab = self.tabs.addTab(self._build_looks(), "СПИСОК ЛУКОВ")
+        self.credits_tab = self.tabs.addTab(self._build_credits(), "СПИСОК КРЕДИТОВ")
+        self.visual_tab = self.tabs.addTab(self._build_visual_audit(), "ВИЗУАЛЬНАЯ ПРОВЕРКА")
+        self.log_tab = self.tabs.addTab(self._build_log(), "ЖУРНАЛ")
         splitter.addWidget(self.tabs)
         splitter.setStretchFactor(1, 1)
 
@@ -340,7 +340,7 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(18, 18, 18, 18)
-        self.stage_title = QLabel("Выберите проект")
+        self.stage_title = QLabel("ВЫБЕРИТЕ ПРОЕКТ")
         self.stage_title.setObjectName("SectionTitle")
         self.stage_description = QLabel("Программа сохраняет каждый подтверждённый этап и продолжает с первой незавершённой строки.")
         self.stage_description.setWordWrap(True)
@@ -472,20 +472,20 @@ class MainWindow(QMainWindow):
             """
             QMainWindow, QWidget {
                 background:#f5f5f2; color:#111111;
-                font-family:'TSUM Circe', 'Circe', Arial, sans-serif; font-size:13px;
+                font-family:'TSUM Circe', 'Circe', Arial, sans-serif; font-size:14px;
             }
             QFrame#Card, QTabWidget::pane { background:#ffffff; border:1px solid #d8d8d2; border-radius:0; }
             QLabel#Title {
-                font-family:'TSUM Circe Bold', 'Circe Bold', Arial, sans-serif; font-size:29px;
+                font-family:'TSUM Circe Bold', 'Circe Bold', Arial, sans-serif; font-size:36px;
                 font-weight:700; letter-spacing:0.8px; color:#111111;
             }
             QLabel#SectionTitle {
                 font-family:'TSUM Circe Bold', 'Circe Bold', Arial, sans-serif;
-                font-size:23px; font-weight:700; letter-spacing:0.2px; color:#111111;
+                font-size:29px; font-weight:700; letter-spacing:0.4px; color:#111111;
             }
             QLabel#SidebarTitle {
                 background:transparent; font-family:'TSUM Circe Bold', 'Circe Bold', Arial, sans-serif;
-                font-size:16px; font-weight:700; color:#111111;
+                font-size:20px; font-weight:700; letter-spacing:0.3px; color:#111111;
             }
             QLabel#Muted { color:#6d6d68; }
             QLabel#BrandLogo { background:transparent; }
@@ -513,7 +513,7 @@ class MainWindow(QMainWindow):
             QPushButton#Continue:hover { background:#e84b16; border-color:#e84b16; }
             QPushButton#Run {
                 background:#e84b16; color:#ffffff; border:1px solid #e84b16;
-                padding:13px; font-size:15px; font-weight:800; letter-spacing:0.3px;
+                padding:13px; font-size:18px; font-weight:800; letter-spacing:0.5px;
             }
             QPushButton#Run:hover { background:#111111; border-color:#111111; }
             QPushButton#Run:disabled { background:#e3e3de; color:#8b8b84; border-color:#e3e3de; }
@@ -845,12 +845,12 @@ class MainWindow(QMainWindow):
     def _stage_selected(self) -> None:
         selected = self.stage_list.selectedItems()
         if not selected:
-            self.stage_title.setText("Продолжение с места остановки")
+            self.stage_title.setText("ПРОДОЛЖЕНИЕ С МЕСТА ОСТАНОВКИ")
             self.stage_description.setText("Пуск начнёт работу с первой незавершённой строки.")
             return
         key = str(selected[0].data(Qt.ItemDataRole.UserRole))
         stage = next(stage for stage in STAGES if stage.key == key)
-        self.stage_title.setText(stage.title)
+        self.stage_title.setText(stage.title.upper())
         self.stage_description.setText(stage.description)
         if key == "looks":
             self.tabs.setCurrentIndex(self.looks_tab)
