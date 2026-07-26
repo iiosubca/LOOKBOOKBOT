@@ -132,6 +132,9 @@ class MainWindow(QMainWindow):
         self.worker: PipelineWorker | None = None
         self.stage_items: dict[str, QListWidgetItem] = {}
         self._loading_credits = False
+        self.visual_progress_timer = QTimer(self)
+        self.visual_progress_timer.setInterval(750)
+        self.visual_progress_timer.timeout.connect(self._refresh_visual_progress)
         self.final_export_timer = QTimer(self)
         self.final_export_timer.setInterval(750)
         self.final_export_timer.timeout.connect(self._refresh_final_export_progress)
@@ -269,6 +272,16 @@ class MainWindow(QMainWindow):
         self.run_button.setObjectName("Run")
         self.run_button.clicked.connect(self._run_pipeline)
         side_layout.addWidget(self.run_button)
+        self.visual_progress_label = QLabel()
+        self.visual_progress_label.setObjectName("Muted")
+        self.visual_progress_label.setWordWrap(True)
+        self.visual_progress = QProgressBar()
+        self.visual_progress.setRange(0, 1)
+        self.visual_progress.setTextVisible(True)
+        self.visual_progress.hide()
+        self.visual_progress_label.hide()
+        side_layout.addWidget(self.visual_progress_label)
+        side_layout.addWidget(self.visual_progress)
         self.final_export_label = QLabel()
         self.final_export_label.setObjectName("Muted")
         self.final_export_label.setWordWrap(True)
@@ -478,6 +491,7 @@ class MainWindow(QMainWindow):
         self.approved.setChecked(self.store.is_approved(self.project.id))
         self.approved.blockSignals(False)
         self._refresh_stages()
+        self._refresh_visual_progress()
         self._load_looks()
         self._load_credits()
         self._load_visual_audit()
@@ -641,6 +655,10 @@ class MainWindow(QMainWindow):
             self._begin_final_export_progress()
         elif key == "final" and status == StageStatus.PASSED.value:
             self._refresh_final_export_progress()
+        if key == "visual" and status == StageStatus.RUNNING.value:
+            self._begin_visual_progress()
+        elif key == "visual" and status == StageStatus.PASSED.value:
+            self._refresh_visual_progress()
         self._refresh_stages()
 
     def _worker_finished(self, result) -> None:
@@ -657,12 +675,52 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Ошибка выполнения", message)
 
     def _finish_worker(self) -> None:
+        if self.visual_progress_timer.isActive():
+            self.visual_progress_timer.stop()
         if self.final_export_timer.isActive():
             self.final_export_timer.stop()
+        self._refresh_visual_progress()
         self._refresh_final_export_progress()
         self.run_button.setEnabled(True)
         self.run_button.setText("▶  ПУСК")
         self._load_project()
+
+    def _begin_visual_progress(self) -> None:
+        self.visual_progress.setRange(0, 1)
+        self.visual_progress.setValue(0)
+        self.visual_progress.show()
+        self.visual_progress_label.setText("Визуальная проверка: подготавливаются proof-развороты…")
+        self.visual_progress_label.show()
+        self._refresh_visual_progress()
+        self.visual_progress_timer.start()
+
+    def _refresh_visual_progress(self) -> None:
+        if self.project is None:
+            self.visual_progress.hide()
+            self.visual_progress_label.hide()
+            return
+        rows = self.store.stage_rows(self.project.id)
+        status = rows.get("visual", {}).get("status")
+        state = read_json(self.project.project_dir / "control" / "lookbook-state.json")
+        total = int(state.get("look_count", 0) or 0)
+        confirmations = self.project.project_dir / "control" / "visual" / "confirmations"
+        complete = len(list(confirmations.glob("LOOK_*.json"))) if confirmations.is_dir() else 0
+        if status != StageStatus.RUNNING.value:
+            if self.visual_progress_timer.isActive():
+                self.visual_progress_timer.stop()
+            self.visual_progress.hide()
+            self.visual_progress_label.hide()
+            return
+        self.visual_progress.show()
+        self.visual_progress_label.show()
+        self.visual_progress.setRange(0, max(total, 1))
+        self.visual_progress.setValue(min(complete, total))
+        if total and complete >= total:
+            self.visual_progress_label.setText(f"Визуальная проверка: {complete} из {total} — фиксируется итоговый PASS…")
+        elif total:
+            self.visual_progress_label.setText(f"Визуальная проверка: подтверждено {complete} из {total} разворотов")
+        else:
+            self.visual_progress_label.setText("Визуальная проверка: создаются proof-развороты…")
 
     def _begin_final_export_progress(self) -> None:
         self.final_export_progress.setRange(0, 5)

@@ -112,13 +112,17 @@ class LookbookController:
                 return
             if result.returncode:
                 if _is_com_disconnect(result.text):
-                    # The COM worker has already exited and the master lock was
-                    # checked above. Retry exactly the same armed gate once;
-                    # never re-arm, skip, or start a second concurrent worker.
+                    # The native controller already tries a safe cold restart
+                    # for an idle InDesign instance. This remains one bounded
+                    # fallback attempt; never re-arm, skip, or run concurrently.
                     self.runner.log(
                         f"InDesign потерял COM-соединение на этапе {gate}; "
                         "выполняется одна безопасная повторная попытка из сохранённой точки."
                     )
+                    # Give a just-restarted InDesign server time to register
+                    # its COM endpoint before the fallback command attaches.
+                    time.sleep(4)
+                    self._wait_for_master(project)
                     retry = self.gate("apply", project, "--gate", gate, timeout=1800, check=False)
                     self._wait_for_master(project)
                     if evidence_passed(project, gate):

@@ -33,6 +33,7 @@ def test_native_gate_retries_one_safe_com_disconnect(tmp_path: Path, monkeypatch
 
     monkeypatch.setattr(controller, "gate", fake_gate)
     monkeypatch.setattr(controller, "_wait_for_master", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("lookbookbot.controller.time.sleep", lambda *_args, **_kwargs: None)
     evidence_checks = iter([False, False, False, True])
     monkeypatch.setattr("lookbookbot.controller.evidence_passed", lambda *_args: next(evidence_checks))
 
