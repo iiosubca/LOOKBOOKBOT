@@ -230,9 +230,8 @@ class MainWindow(QMainWindow):
         create.clicked.connect(self._save_project)
         existing = QPushButton("Открыть готовый проект")
         existing.clicked.connect(self._open_existing_project)
-        # Keep independent controls on separate rows. A single wide toolbar
-        # made fixed-width inputs overlap when the window was near its normal
-        # desktop width or when Google quota controls were visible.
+        # Source selection stays wide on its own row. The provider controls
+        # and the project actions fit together on the second row.
         source_row = QHBoxLayout()
         source_row.setSpacing(10)
         source_label = QLabel("Исходники")
@@ -255,17 +254,12 @@ class MainWindow(QMainWindow):
         model_row.addWidget(self.google_key_label)
         model_row.addWidget(self.google_key_edit)
         model_row.addWidget(self.google_quota, 1)
-
-        actions_row = QHBoxLayout()
-        actions_row.setSpacing(10)
-        actions_row.addStretch()
-        actions_row.addWidget(test_provider)
-        actions_row.addWidget(create)
-        actions_row.addWidget(existing)
+        model_row.addWidget(test_provider)
+        model_row.addWidget(create)
+        model_row.addWidget(existing)
 
         setup_layout.addLayout(source_row)
         setup_layout.addLayout(model_row)
-        setup_layout.addLayout(actions_row)
         outer.addWidget(setup)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -476,16 +470,16 @@ class MainWindow(QMainWindow):
             }
             QFrame#Card, QTabWidget::pane { background:#ffffff; border:1px solid #d8d8d2; border-radius:0; }
             QLabel#Title {
-                font-family:'TSUM Circe Bold', 'Circe Bold', Arial, sans-serif; font-size:36px;
+                font-family:'TSUM Circe Bold', 'Circe Bold', Arial, sans-serif; font-size:32px;
                 font-weight:700; letter-spacing:0.8px; color:#111111;
             }
             QLabel#SectionTitle {
                 font-family:'TSUM Circe Bold', 'Circe Bold', Arial, sans-serif;
-                font-size:29px; font-weight:700; letter-spacing:0.4px; color:#111111;
+                font-size:26px; font-weight:700; letter-spacing:0.4px; color:#111111;
             }
             QLabel#SidebarTitle {
                 background:transparent; font-family:'TSUM Circe Bold', 'Circe Bold', Arial, sans-serif;
-                font-size:20px; font-weight:700; letter-spacing:0.3px; color:#111111;
+                font-size:18px; font-weight:700; letter-spacing:0.3px; color:#111111;
             }
             QLabel#Muted { color:#6d6d68; }
             QLabel#BrandLogo { background:transparent; }
