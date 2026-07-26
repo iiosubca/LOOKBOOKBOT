@@ -278,7 +278,9 @@ class MainWindow(QMainWindow):
         sidebar.setMaximumWidth(400)
         side_layout = QVBoxLayout(sidebar)
         side_layout.setContentsMargins(14, 14, 14, 14)
-        side_layout.addWidget(QLabel("Этапы выпуска"))
+        stage_heading = QLabel("Этапы выпуска")
+        stage_heading.setObjectName("SidebarTitle")
+        side_layout.addWidget(stage_heading)
         self.stage_list = QListWidget()
         self.stage_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.stage_list.itemSelectionChanged.connect(self._stage_selected)
@@ -290,7 +292,8 @@ class MainWindow(QMainWindow):
             self.stage_list.addItem(item)
             self.stage_items[stage.key] = item
         side_layout.addWidget(self.stage_list, 1)
-        continue_button = QPushButton("▶ Продолжить с места остановки")
+        continue_button = QPushButton("ПРОДОЛЖИТЬ С МЕСТА ОСТАНОВКИ")
+        continue_button.setObjectName("Continue")
         continue_button.clicked.connect(self._continue_from_checkpoint)
         side_layout.addWidget(continue_button)
         self.approved = QCheckBox("Согласовано — разрешить финальные PDF")
@@ -480,6 +483,10 @@ class MainWindow(QMainWindow):
                 font-family:'TSUM Circe Bold', 'Circe Bold', Arial, sans-serif;
                 font-size:23px; font-weight:700; letter-spacing:0.2px; color:#111111;
             }
+            QLabel#SidebarTitle {
+                background:transparent; font-family:'TSUM Circe Bold', 'Circe Bold', Arial, sans-serif;
+                font-size:16px; font-weight:700; color:#111111;
+            }
             QLabel#Muted { color:#6d6d68; }
             QLabel#BrandLogo { background:transparent; }
             QLabel#FormLabel { background:transparent; font-family:'TSUM Circe Bold', 'Circe Bold', Arial, sans-serif; font-weight:700; }
@@ -499,6 +506,11 @@ class MainWindow(QMainWindow):
             QPushButton:hover { background:#111111; color:#ffffff; }
             QPushButton#Primary { background:#111111; color:#ffffff; border-color:#111111; font-weight:700; }
             QPushButton#Primary:hover { background:#e84b16; border-color:#e84b16; }
+            QPushButton#Continue {
+                background:#111111; color:#ffffff; border-color:#111111;
+                font-family:'TSUM Circe Bold', 'Circe Bold', Arial, sans-serif; font-weight:700; letter-spacing:0.2px;
+            }
+            QPushButton#Continue:hover { background:#e84b16; border-color:#e84b16; }
             QPushButton#Run {
                 background:#e84b16; color:#ffffff; border:1px solid #e84b16;
                 padding:13px; font-size:15px; font-weight:800; letter-spacing:0.3px;
@@ -521,7 +533,7 @@ class MainWindow(QMainWindow):
             QTableWidget::item { padding:5px; }
             QProgressBar { background:#e8e8e3; border:none; border-radius:0; text-align:center; color:#111111; }
             QProgressBar::chunk { background:#e84b16; }
-            QCheckBox { spacing:7px; }
+            QCheckBox { background:transparent; spacing:7px; }
             QCheckBox::indicator { width:15px; height:15px; border:1px solid #111111; background:#ffffff; }
             QCheckBox::indicator:checked { background:#111111; }
             QSplitter::handle { background:#f5f5f2; width:8px; height:8px; }
