@@ -320,6 +320,13 @@ class PipelineEngine:
             self._delegate_codex(project, provider, "map")
         else:
             self._confirm_local_reference_proofs(project, provider)
+        # The visual mapper may legitimately run validate-map itself after the
+        # last reference confirmation.  Calling it a second time is not a
+        # failure of the map: the controller correctly reports that the next
+        # gate is structure.  Accept its durable PASS instead of surfacing a
+        # false "control map" error to the operator.
+        if evidence_passed(root, "map"):
+            return "PDF-порядок, пары изображений и кредитная карта уже подтверждены контроллером."
         self.controller.gate("validate-map", root, timeout=600)
         if not evidence_passed(root, "map"):
             raise PipelineError("Контроллер не записал PASS map.")
@@ -347,8 +354,7 @@ class PipelineEngine:
         if evidence_passed(root, "pdf"):
             return "Review-PDF уже проверен контроллером."
         pdf = review_pdf_filename(project.show_date)
-        self.controller.gate("pre-export", root, "--pdf", pdf, "--quarantine-existing", timeout=180)
-        self.controller.gate("export-pdf", root, "--pdf", pdf, timeout=1800)
+        self.controller.export_review_pdf(root, pdf)
         self.controller.gate("verify-pdf", root, "--pdf", pdf, timeout=1800)
         self.controller.gate("complete", root, timeout=180)
         if not evidence_passed(root, "pdf"):

@@ -40,3 +40,28 @@ def test_native_gate_retries_one_safe_com_disconnect(tmp_path: Path, monkeypatch
     controller.apply_native_gate(tmp_path, "release")
 
     assert calls == ["arm", "apply", "apply"]
+
+
+def test_review_export_reissues_permit_after_safe_com_recovery(tmp_path: Path, monkeypatch) -> None:
+    controller = LookbookController(_tools(tmp_path), CommandRunner())
+    calls: list[str] = []
+    export_attempts = 0
+
+    def fake_gate(action: str, _project: Path, *_args, **_kwargs) -> CommandResult:
+        nonlocal export_attempts
+        calls.append(action)
+        if action == "pre-export":
+            return CommandResult((), 0, "PERMIT", "", 0)
+        export_attempts += 1
+        if export_attempts == 1:
+            return CommandResult((), 1, "", "RPC_E_DISCONNECTED 0x80010108", 0)
+        return CommandResult((), 0, "PDF EXPORTED", "", 0)
+
+    monkeypatch.setattr(controller, "gate", fake_gate)
+    monkeypatch.setattr(controller, "_wait_for_master", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(controller, "_restart_controlled_indesign", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr("lookbookbot.controller.time.sleep", lambda *_args, **_kwargs: None)
+
+    controller.export_review_pdf(tmp_path, "review.pdf")
+
+    assert calls == ["pre-export", "export-pdf", "pre-export", "export-pdf"]

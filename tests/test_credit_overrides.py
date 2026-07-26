@@ -184,3 +184,32 @@ def test_map_gate_skips_reaccepting_an_unchanged_confirmed_map(tmp_path: Path, m
 
     assert "уже подтверждена" in result
     assert calls == []
+
+
+def test_map_gate_does_not_revalidate_after_mapper_already_passed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = StateStore(tmp_path / "state.db")
+    project = _project(store, tmp_path)
+    project.project_dir.mkdir()
+    control = project.project_dir / "control"
+    control.mkdir()
+    (control / "lookbook-state.json").write_text("{}", encoding="utf-8")
+    store.replace_looks(project.id, [{"look_id": "LOOK_001", "spread_order": "1"}])
+    engine = PipelineEngine(store)
+    calls: list[str] = []
+    mapper_completed = False
+
+    def passed(_root: Path, gate: str) -> bool:
+        return gate == "map" and mapper_completed
+
+    def completed_mapper(*_args, **_kwargs) -> None:
+        nonlocal mapper_completed
+        mapper_completed = True
+
+    monkeypatch.setattr("lookbookbot.pipeline.evidence_passed", passed)
+    monkeypatch.setattr(engine, "_delegate_codex", completed_mapper)
+    monkeypatch.setattr(engine.controller, "gate", lambda *args, **kwargs: calls.append(str(args[0])))
+
+    result = engine._map_gate(project, CodexProvider())
+
+    assert result
+    assert calls == ["prepare-reference-order"]
