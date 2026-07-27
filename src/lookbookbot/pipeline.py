@@ -20,7 +20,7 @@ from .domain import (
     review_pdf_filename,
     visible_date_text,
 )
-from .providers import CodexProvider, ModelProvider, ProviderError, make_provider
+from .providers import CodexProvider, ModelProvider, ProviderError, VisionDecision, make_provider
 from .secrets import get_google_api_key
 from .state import StateStore
 from .visual_audit import visual_audit_blocker_message
@@ -184,7 +184,16 @@ class PipelineEngine:
         self.controller.script("render_caption_mapping_evidence.py", root, "--map", "control/work/caption-map.tsv", "--hires", "control/work/_mat/hires", timeout=1800)
 
         if isinstance(provider, CodexProvider):
-            self._delegate_codex(project, provider, "credits_map")
+            rejected = self._confirm_codex_credit_proofs_parallel(project, provider)
+            if rejected:
+                # A proposed mapping is never silently accepted after a visual
+                # rejection.  Freeze the proven rows and let the existing
+                # one-to-one rematch workflow handle only the disputed cards.
+                self.log(
+                    "Кредитные карточки требуют точечной пересверки: "
+                    + ", ".join(rejected)
+                )
+                self._targeted_credit_rematch(project, provider, rejected)
         else:
             self._select_local_credit_overrides(project, provider, manual_assignments)
             if manual_assignments:
@@ -317,7 +326,7 @@ class PipelineEngine:
             )
         self.controller.gate("prepare-reference-order", root, timeout=1800)
         if isinstance(provider, CodexProvider):
-            self._delegate_codex(project, provider, "map")
+            self._confirm_codex_reference_proofs_parallel(project, provider)
         else:
             self._confirm_local_reference_proofs(project, provider)
         # The visual mapper may legitimately run validate-map itself after the
@@ -415,6 +424,149 @@ class PipelineEngine:
         looks = ",".join(look for look, _note in accepted)
         notes = "||".join(f"{look}={note}" for look, note in accepted)
         self.controller.script("auto_caption_map.py", root, "--mode", "confirm-review", "--looks", looks, "--notes", notes, timeout=600)
+
+    def _confirm_codex_credit_proofs_parallel(self, project: ProjectRecord, provider: CodexProvider) -> list[str]:
+        """Inspect disjoint proposed credit cards concurrently, then commit serially.
+
+        `auto_caption_map.py` rewrites the shared TSV and therefore remains a
+        single-writer operation.  Codex workers only read a fixed group of up
+        to five already-rendered proof cards and return structured decisions;
+        the coordinator validates and records those decisions afterwards.
+        """
+        root = project.project_dir
+        mapping = _read_tsv(root / "control" / "work" / "caption-map.tsv")
+        pending = [
+            row for row in mapping
+            if row.get("visual_status") != "CONFIRMED"
+        ]
+        if not pending:
+            return []
+        batches = _row_batches(pending, size=5)
+        workers = min(4, len(batches))
+        self.log(
+            f"Сверка кредитов: {len(pending)} карточек в {len(batches)} независимых пакетах, параллельно до {workers}."
+        )
+        decisions: dict[str, VisionDecision] = {}
+        failures: list[str] = []
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="lookbook-credits") as executor:
+            futures = {
+                executor.submit(self._inspect_codex_credit_batch, provider, root, batch): batch
+                for batch in batches
+            }
+            for future in as_completed(futures):
+                batch = futures[future]
+                labels = ", ".join(str(row["look_id"]) for row in batch)
+                try:
+                    decisions.update(future.result())
+                except (ProviderError, ValueError, OSError) as error:
+                    failures.append(f"{labels}: {error}")
+                else:
+                    self.log(f"Пакет кредитов просмотрен: {labels}")
+        if failures:
+            raise ReviewRequired("Не завершены независимые пакеты сверки кредитов:\n" + "\n".join(failures))
+
+        accepted = [
+            (str(row["look_id"]), _safe_confirmation_note(decisions[str(row["look_id"])].note))
+            for row in pending
+            if decisions.get(str(row["look_id"])) and decisions[str(row["look_id"])].accepted
+        ]
+        for batch in _pair_batches(accepted, size=5):
+            self._confirm_credit_batch(root, batch)
+        rejected = [
+            str(row["look_id"]) for row in pending
+            if not decisions.get(str(row["look_id"])) or not decisions[str(row["look_id"])].accepted
+        ]
+        return rejected
+
+    def _inspect_codex_credit_batch(
+        self, provider: CodexProvider, root: Path, rows: list[dict[str, str]],
+    ) -> dict[str, VisionDecision]:
+        expected = [str(row["look_id"]) for row in rows]
+        cards = []
+        for row in rows:
+            evidence = root / str(row.get("evidence_file", ""))
+            if not evidence.is_file():
+                raise ValueError(f"{row['look_id']}: отсутствует proof-карточка {evidence}")
+            cards.append(f"- {row['look_id']}: {evidence}")
+        prompt = f"""Выполни только независимую визуальную сверку предложенных кредитных карточек.
+
+Проект: {root}
+Тебе разрешено смотреть только эти proof-карточки:
+{chr(10).join(cards)}
+
+Каждая карточка состоит из Excel-лука и двух фотографий PDF-лука. Для каждого LOOK проверь реальное совпадение по модели, одежде, цвету, аксессуарам, обуви, сумке, позе и силуэту. Нельзя использовать порядок, номера строк, гендер, названия файлов или фон как доказательство.
+
+Ничего не записывай, не запускай команды, не меняй TSV и не открывай InDesign. Верни только JSON без Markdown:
+{{"decisions":[{{"look_id":"LOOK_001","accepted":true,"note":"не менее двух конкретных видимых признаков"}}]}}
+
+В JSON должны быть ровно эти LOOK: {", ".join(expected)}. Если карточка не совпадает, верни accepted=false и укажи конкретную причину."""
+        raw = provider.run_readonly_agent(prompt, root, timeout=3600)
+        return _parse_codex_batch_decisions(raw, expected)
+
+    def _confirm_codex_reference_proofs_parallel(self, project: ProjectRecord, provider: CodexProvider) -> None:
+        """Confirm PDF-reference evidence in parallel without concurrent controller writes."""
+        root = project.project_dir
+        cards = _latest_cards(root / "control" / "work" / "reference-order")
+        confirmations = root / "control" / "reference-order" / "confirmations"
+        pending = [card for card in cards if not (confirmations / f"{card.stem}.json").is_file()]
+        if not pending:
+            return
+        batches = _path_batches(pending, size=5)
+        workers = min(4, len(batches))
+        self.log(
+            f"Сверка PDF-референса: {len(pending)} карточек в {len(batches)} независимых пакетах, параллельно до {workers}."
+        )
+        decisions: dict[str, VisionDecision] = {}
+        failures: list[str] = []
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="lookbook-reference") as executor:
+            futures = {
+                executor.submit(self._inspect_codex_reference_batch, provider, root, batch): batch
+                for batch in batches
+            }
+            for future in as_completed(futures):
+                batch = futures[future]
+                labels = ", ".join(card.stem for card in batch)
+                try:
+                    decisions.update(future.result())
+                except (ProviderError, ValueError, OSError) as error:
+                    failures.append(f"{labels}: {error}")
+                else:
+                    self.log(f"Пакет PDF-референса просмотрен: {labels}")
+        if failures:
+            raise ReviewRequired("Не завершены независимые пакеты PDF-референса:\n" + "\n".join(failures))
+        rejected = [card.stem for card in pending if not decisions.get(card.stem) or not decisions[card.stem].accepted]
+        if rejected:
+            details = "; ".join(
+                f"{look}: {decisions[look].note}" for look in rejected if look in decisions
+            )
+            raise ReviewRequired("PDF-референс не подтвердил зарегистрированные пары: " + (details or ", ".join(rejected)))
+        # Immutable confirmations are written one by one by the coordinator.
+        # This keeps a single durable controller sequence while vision work is parallel.
+        for card in pending:
+            self.controller.gate(
+                "confirm-reference-look", root, "--look", card.stem,
+                "--note", _safe_confirmation_note(decisions[card.stem].note), timeout=120,
+            )
+
+    def _inspect_codex_reference_batch(
+        self, provider: CodexProvider, root: Path, cards: list[Path],
+    ) -> dict[str, VisionDecision]:
+        expected = [card.stem for card in cards]
+        card_lines = "\n".join(f"- {card.stem}: {card}" for card in cards)
+        prompt = f"""Выполни только независимую проверку соответствия PDF-референса и пар hires.
+
+Проект: {root}
+Разрешены только эти карточки:
+{card_lines}
+
+На каждой карточке сверху PDF-разворот, ниже — назначенные full-length слева и close-up справа. Для каждого LOOK проверь, что это один и тот же лук по модели, одежде, цвету, обуви, сумке, аксессуарам, позе и кадрированию. Номера, имена файлов и порядок не являются доказательством.
+
+Ничего не записывай, не запускай команды, не меняй реестр и не открывай InDesign. Верни только JSON без Markdown:
+{{"decisions":[{{"look_id":"LOOK_001","accepted":true,"note":"не менее двух конкретных видимых признаков"}}]}}
+
+В JSON должны быть ровно эти LOOK: {", ".join(expected)}."""
+        raw = provider.run_readonly_agent(prompt, root, timeout=3600)
+        return _parse_codex_batch_decisions(raw, expected)
 
     def _confirm_local_reference_proofs(self, project: ProjectRecord, provider: ModelProvider) -> None:
         root = project.project_dir
@@ -687,6 +839,59 @@ def _path_batches(paths: list[Path], *, size: int) -> list[list[Path]]:
     if size < 1:
         raise ValueError("Batch size must be positive.")
     return [paths[index : index + size] for index in range(0, len(paths), size)]
+
+
+def _row_batches(rows: list[dict[str, str]], *, size: int) -> list[list[dict[str, str]]]:
+    """Split a fixed TSV order into bounded, independent proof assignments."""
+    if size < 1:
+        raise ValueError("Batch size must be positive.")
+    return [rows[index : index + size] for index in range(0, len(rows), size)]
+
+
+def _pair_batches(rows: list[tuple[str, str]], *, size: int) -> list[list[tuple[str, str]]]:
+    if size < 1:
+        raise ValueError("Batch size must be positive.")
+    return [rows[index : index + size] for index in range(0, len(rows), size)]
+
+
+def _safe_confirmation_note(note: str) -> str:
+    """Keep controller's ``LOOK=note||LOOK=note`` transport unambiguous."""
+    cleaned = " ".join(str(note).replace("||", ";").replace("\r", " ").replace("\n", " ").split())
+    if len(cleaned) < 25:
+        raise ValueError("Визуальное подтверждение должно содержать конкретное наблюдение не короче 25 символов.")
+    return cleaned
+
+
+def _parse_codex_batch_decisions(raw: str, expected_looks: list[str]) -> dict[str, VisionDecision]:
+    """Validate a no-write Codex batch response before any controller mutation."""
+    text = str(raw).strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        raise ProviderError("Codex не вернул JSON с результатом независимой визуальной сверки.")
+    try:
+        payload = json.loads(text[start : end + 1])
+    except json.JSONDecodeError as error:
+        raise ProviderError("Codex вернул некорректный JSON для независимой визуальной сверки.") from error
+    raw_decisions = payload.get("decisions") if isinstance(payload, dict) else None
+    if not isinstance(raw_decisions, list):
+        raise ProviderError("В ответе Codex отсутствует список decisions.")
+    expected = set(expected_looks)
+    parsed: dict[str, VisionDecision] = {}
+    for item in raw_decisions:
+        if not isinstance(item, dict):
+            raise ProviderError("Codex вернул некорректную запись решения.")
+        look_id = str(item.get("look_id", "")).strip()
+        if look_id not in expected or look_id in parsed:
+            raise ProviderError("Codex вернул лишний или повторённый LOOK в независимом пакете.")
+        accepted = item.get("accepted", item.get("match"))
+        if not isinstance(accepted, bool):
+            raise ProviderError(f"{look_id}: поле accepted должно быть true или false.")
+        note = _safe_confirmation_note(str(item.get("note", "")))
+        parsed[look_id] = VisionDecision(accepted=accepted, note=note, raw=text)
+    if set(parsed) != expected:
+        missing = ", ".join(sorted(expected - set(parsed)))
+        raise ProviderError("Codex не вернул решение для всех назначенных LOOK: " + missing)
+    return parsed
 
 
 def _credit_override_batches(

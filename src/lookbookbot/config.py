@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,6 +15,20 @@ DEFAULT_TEMPLATE = Path(
 DEFAULT_RUNTIME = Path(
     r"C:\Users\vdiza\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
 )
+
+
+def bundled_skill_root() -> Path:
+    """Return the versioned automation engine shipped with LOOKBOOKBOT.
+
+    The global Codex skill remains a fallback for developer use, but release
+    jobs must not silently change behaviour because another session updated a
+    file under ``~/.codex`` after this application was tested.
+    """
+    if getattr(sys, "frozen", False):
+        candidate = Path(getattr(sys, "_MEIPASS")) / "automation-engine" / "lookbook-layout"
+    else:
+        candidate = Path(__file__).resolve().parents[2] / "automation-engine" / "lookbook-layout"
+    return candidate if candidate.is_dir() else DEFAULT_SKILL_ROOT
 
 
 def app_data_dir() -> Path:
@@ -56,7 +71,7 @@ class ToolPaths:
 
     @classmethod
     def defaults(cls) -> "ToolPaths":
-        root = Path(os.environ.get("LOOKBOOKBOT_SKILL_ROOT", DEFAULT_SKILL_ROOT))
+        root = Path(os.environ.get("LOOKBOOKBOT_SKILL_ROOT", bundled_skill_root()))
         template = Path(os.environ.get("LOOKBOOKBOT_TEMPLATE", DEFAULT_TEMPLATE))
         return cls(
             python=bundled_python(),

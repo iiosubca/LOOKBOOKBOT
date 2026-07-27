@@ -70,10 +70,17 @@ class CodexProvider(ModelProvider):
         return result.stdout.strip() or f"Codex CLI: {self.binary}"
 
     def run_agent(self, prompt: str, workspace: Path, timeout: int = 7200) -> str:
+        return self._run_agent(prompt, workspace, timeout=timeout, sandbox="danger-full-access")
+
+    def run_readonly_agent(self, prompt: str, workspace: Path, timeout: int = 7200) -> str:
+        """Run an evidence-only Codex worker without filesystem write authority."""
+        return self._run_agent(prompt, workspace, timeout=timeout, sandbox="read-only")
+
+    def _run_agent(self, prompt: str, workspace: Path, *, timeout: int, sandbox: str) -> str:
         self.health()
         assert self.binary is not None
         command = [
-            str(self.binary), "exec", "--json", "--sandbox", "danger-full-access",
+            str(self.binary), "exec", "--json", "--sandbox", sandbox,
             "--skip-git-repo-check", "--cd", str(workspace),
         ]
         if self.model:

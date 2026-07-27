@@ -1,5 +1,12 @@
 # LOOKBOOKBOT for Windows
 
+## Version 0.2
+
+- The tested automation engine is included with the application, so a release does not silently depend on changed global Codex files.
+- PDF-reference and credit proof cards are inspected in independent bounded batches; one coordinator records the immutable confirmations.
+- A caption-clearance retry re-applies only changed looks while retaining a full native verification record for the complete lookbook.
+- The five approved PDFs export from one InDesign session with a checkpoint for each file and parallel post-export verification.
+
 LOOKBOOKBOT — настольная программа для управляемой сборки лукбуков TSUM в Adobe InDesign. Она не считает сохранённый INDD или появившийся PDF завершением этапа: состояние берётся только из evidence-контроллера `lookbook-layout`.
 
 ## Что уже работает

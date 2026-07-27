@@ -206,7 +206,7 @@ def test_map_gate_does_not_revalidate_after_mapper_already_passed(tmp_path: Path
         mapper_completed = True
 
     monkeypatch.setattr("lookbookbot.pipeline.evidence_passed", passed)
-    monkeypatch.setattr(engine, "_delegate_codex", completed_mapper)
+    monkeypatch.setattr(engine, "_confirm_codex_reference_proofs_parallel", completed_mapper)
     monkeypatch.setattr(engine.controller, "gate", lambda *args, **kwargs: calls.append(str(args[0])))
 
     result = engine._map_gate(project, CodexProvider())
