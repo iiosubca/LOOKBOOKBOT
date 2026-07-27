@@ -1,5 +1,10 @@
 # LOOKBOOKBOT for Windows
 
+## Version 0.2.2
+
+- A first composition-correction batch now starts from an empty checkpoint as intended; the durable delta file is required only after the native InDesign worker has completed a batch.
+- Multi-batch correction passes validate only the corrections already saved in the current batch, then validate the complete set before the final transaction.
+
 ## Version 0.2.1
 
 - Codex proof reviewers now receive the actual attached proof-card images in read-only mode; local image paths alone are no longer relied upon.

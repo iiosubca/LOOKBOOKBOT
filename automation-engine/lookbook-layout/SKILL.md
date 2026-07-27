@@ -115,6 +115,10 @@ For `images` and `captions`, one `apply` command performs exactly one four-look 
 
 When a blocked caption-clearance proof produces a signed correction plan, the next `apply-composition` is a **delta** pass: it retains the archived, already proven 50-look native baseline, checks every unchanged link and graphic bound read-only, and applies only the changed photo crops or existing credits-frame targets in the same four-look saved transactions. Its final native evidence still contains all looks and is bound to the new plan. Never replace this with an unchecked bulk reapply or a full-document mouse operation.
 
+On the first delta call, `control\progress\composition-delta.json` does not exist yet by design. Treat its absence before the native call as an empty zero-look checkpoint; require it only after an incomplete native return. If the worker returns without both final evidence and a checkpoint, keep the visual gate blocked with that specific recovery message.
+
+In a multi-batch delta pass, validate only the caption-frame corrections recorded in the saved delta checkpoint after each batch. Require the complete correction set only in the final transaction; a correction scheduled for a later batch is not an error on the earlier checkpoint.
+
 Do not use the Pages panel to duplicate spreads, create pages, drag pages, or create frames during this workflow. Do not run legacy scripts such as `Audit Lookbook Master.jsx`, `audit_lookbook_master.jsx`, or any project-copied audit. The only visual-stage exception is a recorded correction of an existing image graphic: it may exchange the two existing graphics or move a graphic horizontally inside its own existing frame, never move or alter a frame. The Scripts-panel runner beginning `00_LOOKBOOK_GATE` exists only as a diagnosed manual fallback, never as the normal route.
 
 ### Controller reconciliation after a Codex timeout

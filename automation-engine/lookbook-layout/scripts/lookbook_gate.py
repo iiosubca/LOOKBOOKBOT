@@ -2972,7 +2972,11 @@ def command_apply_composition(args: argparse.Namespace) -> None:
             if candidate.is_file():
                 delta_base = candidate
     if delta_base is not None:
-        before = read_json(progress_file(project, "composition-delta"))
+        delta_progress_path = progress_file(project, "composition-delta")
+        # The first targeted composition call has no checkpoint yet.  Absence
+        # before the native worker starts is expected; only a missing record
+        # *after* an incomplete worker return is evidence of a failed save.
+        before = read_json(delta_progress_path) if delta_progress_path.exists() else {}
         before_count = len(before.get("completed_looks", [])) if isinstance(before.get("completed_looks"), list) else 0
         run_com_driver(["-Action", "ApplyCompositionDelta", "-Project", str(project), "-BatchSize", "4"], timeout_seconds=240)
         try:
@@ -2980,7 +2984,9 @@ def command_apply_composition(args: argparse.Namespace) -> None:
             print(f"PASS composition: targeted native corrections are recorded against all {total} fixed containers.")
             return
         except GateError:
-            after = read_json(progress_file(project, "composition-delta"))
+            if not delta_progress_path.exists():
+                fail("Targeted composition did not write a durable checkpoint or final evidence. The visual gate remains blocked.")
+            after = read_json(delta_progress_path)
             completed = len(after.get("completed_looks", [])) if isinstance(after.get("completed_looks"), list) else 0
             if completed <= before_count:
                 fail("Targeted composition batch did not advance durable progress. Retry apply-composition without changing the plan.")

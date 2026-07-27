@@ -1200,7 +1200,20 @@ function Invoke-CompositionDelta([string]$ProjectPath, [int]$MaximumLooks) {
             if ($visualCaptionCorrections.ContainsKey($captionLabel)) { $captionCorrection = Apply-VisualCaptionCorrection $caption $visualCaptionCorrections[$captionLabel] $captionStyle $id }
             $deltaByLook[$id] = [ordered]@{ look_id = $id; left_image_filename = $leftFilename; right_image_filename = $rightFilename; planned_shift_points = $shift; before_left_graphic_bounds = @($before); after_left_graphic_bounds = @($after); caption_correction = $captionCorrection }
         }
-        Assert-Baseline $doc (Join-Path $control 'evidence\structure.json') $captionGeometryPath $false $correctionPath $state; Assert-VisualCaptionCorrectionsApplied $doc $visualCaptionCorrections
+        # A delta invocation saves at most four target looks.  Do not demand
+        # geometry for a later caption target before its own transaction has
+        # run; verify every completed correction now and the full set only
+        # when the last target has been durably applied.
+        $appliedCaptionCorrections = @{}
+        foreach ($item in @($deltaByLook.Values)) {
+            $id = [string]$item.look_id
+            $captionLabel = "LOOKBOOK_CREDITS|$id"
+            if ($null -ne $item.caption_correction -and $visualCaptionCorrections.ContainsKey($captionLabel)) {
+                $appliedCaptionCorrections[$captionLabel] = $visualCaptionCorrections[$captionLabel]
+            }
+        }
+        Assert-Baseline $doc (Join-Path $control 'evidence\structure.json') $captionGeometryPath $false $correctionPath $state; Assert-VisualCaptionCorrectionsApplied $doc $appliedCaptionCorrections
+        if ($deltaByLook.Count -eq $targets.Count) { Assert-VisualCaptionCorrectionsApplied $doc $visualCaptionCorrections }
         $doc.Save() | Out-Null
         Write-CompositionDeltaProgress $control $state $arm $masterPath $baseHash $planHash $correctionHash $deltaByLook
         if ($deltaByLook.Count -eq $targets.Count) {
