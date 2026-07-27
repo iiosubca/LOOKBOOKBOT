@@ -72,11 +72,37 @@ class CodexProvider(ModelProvider):
     def run_agent(self, prompt: str, workspace: Path, timeout: int = 7200) -> str:
         return self._run_agent(prompt, workspace, timeout=timeout, sandbox="danger-full-access")
 
-    def run_readonly_agent(self, prompt: str, workspace: Path, timeout: int = 7200) -> str:
-        """Run an evidence-only Codex worker without filesystem write authority."""
-        return self._run_agent(prompt, workspace, timeout=timeout, sandbox="read-only")
+    def run_readonly_agent(
+        self,
+        prompt: str,
+        workspace: Path,
+        timeout: int = 7200,
+        *,
+        images: list[Path] | None = None,
+    ) -> str:
+        """Run an evidence-only Codex worker with explicit proof-card attachments.
 
-    def _run_agent(self, prompt: str, workspace: Path, *, timeout: int, sandbox: str) -> str:
+        A CLI worker cannot infer that a textual local path should be interpreted
+        as an image.  Passing the fixed proof cards via ``--image`` gives it the
+        actual pixels while the read-only sandbox prevents any project mutation.
+        """
+        attachments = list(images or [])
+        missing = [str(path) for path in attachments if not path.is_file()]
+        if missing:
+            raise ProviderError("Не найдены карточки для визуальной сверки: " + ", ".join(missing))
+        return self._run_agent(
+            prompt, workspace, timeout=timeout, sandbox="read-only", images=attachments,
+        )
+
+    def _run_agent(
+        self,
+        prompt: str,
+        workspace: Path,
+        *,
+        timeout: int,
+        sandbox: str,
+        images: list[Path] | None = None,
+    ) -> str:
         self.health()
         assert self.binary is not None
         command = [
@@ -85,6 +111,11 @@ class CodexProvider(ModelProvider):
         ]
         if self.model:
             command.extend(["--model", self.model.removeprefix("codex/")])
+        if images:
+            # ``--image`` accepts several values.  Use the ``--image=...``
+            # form for every attachment so the final text prompt can never be
+            # consumed as another image filename by the CLI parser.
+            command.extend(f"--image={path}" for path in images)
         command.append(prompt)
         try:
             result = subprocess.run(

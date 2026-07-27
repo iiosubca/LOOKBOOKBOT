@@ -483,11 +483,13 @@ class PipelineEngine:
     ) -> dict[str, VisionDecision]:
         expected = [str(row["look_id"]) for row in rows]
         cards = []
+        attachments: list[Path] = []
         for row in rows:
             evidence = root / str(row.get("evidence_file", ""))
             if not evidence.is_file():
                 raise ValueError(f"{row['look_id']}: отсутствует proof-карточка {evidence}")
             cards.append(f"- {row['look_id']}: {evidence}")
+            attachments.append(evidence)
         prompt = f"""Выполни только независимую визуальную сверку предложенных кредитных карточек.
 
 Проект: {root}
@@ -500,7 +502,7 @@ class PipelineEngine:
 {{"decisions":[{{"look_id":"LOOK_001","accepted":true,"note":"не менее двух конкретных видимых признаков"}}]}}
 
 В JSON должны быть ровно эти LOOK: {", ".join(expected)}. Если карточка не совпадает, верни accepted=false и укажи конкретную причину."""
-        raw = provider.run_readonly_agent(prompt, root, timeout=3600)
+        raw = provider.run_readonly_agent(prompt, root, timeout=3600, images=attachments)
         return _parse_codex_batch_decisions(raw, expected)
 
     def _confirm_codex_reference_proofs_parallel(self, project: ProjectRecord, provider: CodexProvider) -> None:
@@ -565,7 +567,7 @@ class PipelineEngine:
 {{"decisions":[{{"look_id":"LOOK_001","accepted":true,"note":"не менее двух конкретных видимых признаков"}}]}}
 
 В JSON должны быть ровно эти LOOK: {", ".join(expected)}."""
-        raw = provider.run_readonly_agent(prompt, root, timeout=3600)
+        raw = provider.run_readonly_agent(prompt, root, timeout=3600, images=cards)
         return _parse_codex_batch_decisions(raw, expected)
 
     def _confirm_local_reference_proofs(self, project: ProjectRecord, provider: ModelProvider) -> None:

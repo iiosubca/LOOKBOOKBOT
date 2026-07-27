@@ -1,5 +1,9 @@
 # LOOKBOOKBOT for Windows
 
+## Version 0.2.1
+
+- Codex proof reviewers now receive the actual attached proof-card images in read-only mode; local image paths alone are no longer relied upon.
+
 ## Version 0.2
 
 - The tested automation engine is included with the application, so a release does not silently depend on changed global Codex files.
