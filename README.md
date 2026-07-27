@@ -1,5 +1,9 @@
 # LOOKBOOKBOT for Windows
 
+## Version 0.2.3
+
+- Parallel Codex workers now always launch without a visible Windows Terminal window; their output remains captured by LOOKBOOKBOT.
+
 ## Version 0.2.2
 
 - A first composition-correction batch now starts from an empty checkpoint as intended; the durable delta file is required only after the native InDesign worker has completed a batch.

@@ -16,6 +16,17 @@ from .config import codex_binary
 from .domain import ProviderKind
 
 
+def _background_creationflags() -> int:
+    """Keep short-lived CLI workers out of Windows Terminal.
+
+    LOOKBOOKBOT is a windowed application.  Without this flag Windows can
+    attach every concurrent ``codex exec`` worker to a fresh Terminal tab.
+    The workers communicate only through captured stdout/stderr, so no
+    visible console is required.
+    """
+    return getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
+
 class ProviderError(RuntimeError):
     pass
 
@@ -61,7 +72,7 @@ class CodexProvider(ModelProvider):
         try:
             result = subprocess.run(
                 [str(self.binary), "--version"], capture_output=True, text=True, encoding="utf-8", errors="replace",
-                timeout=15, stdin=subprocess.DEVNULL,
+                timeout=15, stdin=subprocess.DEVNULL, creationflags=_background_creationflags(),
             )
         except OSError as error:
             raise ProviderError(f"Codex CLI найден, но не запускается: {error}") from error
@@ -120,7 +131,7 @@ class CodexProvider(ModelProvider):
         try:
             result = subprocess.run(
                 command, cwd=workspace, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                timeout=timeout, stdin=subprocess.DEVNULL,
+                timeout=timeout, stdin=subprocess.DEVNULL, creationflags=_background_creationflags(),
             )
         except subprocess.TimeoutExpired as error:
             raise ProviderError("Codex превысил лимит времени. Контроллер будет перечитан перед повтором.") from error
