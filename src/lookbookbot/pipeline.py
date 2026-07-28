@@ -596,7 +596,7 @@ class PipelineEngine:
         arm = self.controller.gate("arm", root, "--gate", "visual", timeout=120, check=False)
         if arm.returncode and "armed" not in arm.text.casefold():
             self.log(arm.text)
-        self.controller.script("prepare_composition_audit.py", root, timeout=600)
+        self._prepare_or_resume_visual_composition(root)
         for _ in range(100):
             result = self.controller.gate("apply-composition", root, timeout=1800, check=False)
             if result.returncode:
@@ -683,7 +683,7 @@ Proof-развороты, которые нужно реально просмо�
         arm = self.controller.gate("arm", root, "--gate", "visual", timeout=120, check=False)
         if arm.returncode and "armed" not in arm.text.casefold():
             self.log(arm.text)
-        self.controller.script("prepare_composition_audit.py", root, timeout=600)
+        self._prepare_or_resume_visual_composition(root)
         for _ in range(100):
             result = self.controller.gate("apply-composition", root, timeout=1800, check=False)
             if result.returncode:
@@ -718,6 +718,31 @@ Proof-развороты, которые нужно реально просмо�
                 raise ReviewRequired(f"{proof.stem}: визуальная модель отклонила разворот — {decision.note}")
             self.controller.gate("confirm-visual-look", root, "--look", proof.stem, "--note", decision.note, timeout=120)
         self.controller.gate("record-visual", root, "--notes", "Проверены все current-master proofs и компьютерный caption clearance.", timeout=300)
+
+    def _prepare_or_resume_visual_composition(self, root: Path) -> None:
+        """Create the initial composition plan once, then resume that exact plan.
+
+        A visual stage can stop after the initial plan has been saved but before
+        the first native batch.  Recreating that plan would discard its signed
+        retry state and causes the controller's deliberate "already exists"
+        guard.  Resume instead; a safe pre-flight reconciliation can restore a
+        missing prior credits position from same-master native evidence without
+        opening InDesign.
+        """
+        plan = root / "control" / "visual" / "composition-plan.tsv"
+        if not plan.is_file():
+            self.controller.script("prepare_composition_audit.py", root, timeout=600)
+            return
+        correction = root / "control" / "visual" / "clearance-correction-plan.json"
+        if correction.is_file():
+            reconciled = self.controller.gate(
+                "reconcile-clearance-plan-priors", root, timeout=180, check=False,
+            )
+            if reconciled.returncode:
+                raise PipelineError(reconciled.text)
+            if reconciled.text:
+                self.log(reconciled.text)
+        self.log("Возобновляю сохранённый composition plan без его пересоздания.")
 
     def _apply_credit_overrides(self, project: ProjectRecord) -> list[tuple[str, str, str]]:
         root = project.project_dir

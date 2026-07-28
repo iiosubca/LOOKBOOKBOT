@@ -119,6 +119,8 @@ On the first delta call, `control\progress\composition-delta.json` does not exis
 
 In a multi-batch delta pass, validate only the caption-frame corrections recorded in the saved delta checkpoint after each batch. Require the complete correction set only in the final transaction; a correction scheduled for a later batch is not an error on the earlier checkpoint.
 
+If a visual attempt stops after `composition-plan.tsv` has been written, resume that exact signed plan; never run `prepare_composition_audit.py` a second time. Before its first delta batch, `reconcile-clearance-plan-priors` may restore a prior credits-frame position only from same-master native `ApplyComposition` or `ApplyCompositionDelta` evidence. It never opens InDesign and refuses a plan with a durable delta checkpoint.
+
 Do not use the Pages panel to duplicate spreads, create pages, drag pages, or create frames during this workflow. Do not run legacy scripts such as `Audit Lookbook Master.jsx`, `audit_lookbook_master.jsx`, or any project-copied audit. The only visual-stage exception is a recorded correction of an existing image graphic: it may exchange the two existing graphics or move a graphic horizontally inside its own existing frame, never move or alter a frame. The Scripts-panel runner beginning `00_LOOKBOOK_GATE` exists only as a diagnosed manual fallback, never as the normal route.
 
 ### Controller reconciliation after a Codex timeout

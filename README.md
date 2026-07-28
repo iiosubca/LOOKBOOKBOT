@@ -1,5 +1,9 @@
 # LOOKBOOKBOT for Windows
 
+## Version 0.2.4
+
+- A stopped visual stage now resumes its saved composition plan instead of attempting to create it again. Before an unstarted retry, the app can recover the prior signed credits-frame position from native delta evidence without opening InDesign.
+
 ## Version 0.2.3
 
 - Parallel Codex workers now always launch without a visible Windows Terminal window; their output remains captured by LOOKBOOKBOT.

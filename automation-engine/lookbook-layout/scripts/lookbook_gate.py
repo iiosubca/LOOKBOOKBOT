@@ -2364,7 +2364,10 @@ def _current_master_composition_item(project: Path, state: dict[str, Any], look_
             continue
         if (
             evidence.get("schema") != SCHEMA
-            or evidence.get("generator") != "run_lookbook_gate_com.ps1:ApplyComposition"
+            or evidence.get("generator") not in {
+                "run_lookbook_gate_com.ps1:ApplyComposition",
+                "run_lookbook_gate_com.ps1:ApplyCompositionDelta",
+            }
             or evidence.get("session_id") != state["session_id"]
             or not isinstance(evidence.get("master"), dict)
             or not same_identity(evidence["master"], master)
@@ -2400,6 +2403,45 @@ def _reconcile_caption_priors_with_current_master(project: Path, state: dict[str
             correction.pop("prior_frame_bounds", None)
         elif not _same_bounds(actual, before):
             correction["prior_frame_bounds"] = actual
+
+
+def command_reconcile_clearance_plan_priors(args: argparse.Namespace) -> None:
+    """Repair an unstarted retry plan using only existing native evidence.
+
+    A visual retry can replace a prior delta correction.  Older releases only
+    recognised ``ApplyComposition`` evidence, not ``ApplyCompositionDelta``,
+    and therefore omitted the already-saved frame position from the new plan.
+    This reconciliation is deliberately pre-flight only: it refuses a durable
+    delta checkpoint and never opens or changes InDesign.
+    """
+    project = project_path(args.project)
+    state = load_state(project)
+    if current_gate(project, state) != "visual":
+        fail("Clearance-plan reconciliation can run only at the visual gate.")
+    if any(visual_confirmation_dir(project).glob("*.json")):
+        fail("Clearance-plan reconciliation cannot alter a visually confirmed master; begin a revision.")
+    plan = composition_plan_path(project)
+    correction_path = clearance_correction_plan_path(project)
+    if not plan.is_file() or not correction_path.is_file():
+        print("PASS visual resume: no signed clearance retry plan needs reconciliation.")
+        return
+    if progress_file(project, "composition-delta").exists():
+        fail("Clearance retry already has a durable composition checkpoint; resume it without changing its signed plan.")
+    validate_composition_plan(project, state)
+    data = read_json(correction_path)
+    corrections = data.get("caption_corrections", [])
+    if not isinstance(corrections, list):
+        fail("Caption-clearance correction plan has invalid caption_corrections.")
+    before = json.dumps(corrections, ensure_ascii=False, sort_keys=True)
+    _reconcile_caption_priors_with_current_master(project, state, corrections)
+    after = json.dumps(corrections, ensure_ascii=False, sort_keys=True)
+    if before != after:
+        data["caption_corrections"] = corrections
+        data["created_at"] = utc_now()
+        write_json(correction_path, data)
+        print("PASS visual resume: signed prior credits geometry was restored from same-master native composition evidence.")
+    else:
+        print("PASS visual resume: existing signed composition plan is already consistent with the saved master.")
 
 
 def command_plan_clearance_corrections(args: argparse.Namespace) -> None:
@@ -4315,6 +4357,9 @@ def parser() -> argparse.ArgumentParser:
     clearance_plan = commands.add_parser("plan-clearance-corrections", help="replace a blocked visual plan with bounded horizontal-only corrections")
     clearance_plan.add_argument("project")
     clearance_plan.set_defaults(func=command_plan_clearance_corrections)
+    reconcile_clearance_plan = commands.add_parser("reconcile-clearance-plan-priors", help="repair an unstarted visual retry plan from same-master native evidence")
+    reconcile_clearance_plan.add_argument("project")
+    reconcile_clearance_plan.set_defaults(func=command_reconcile_clearance_plan_priors)
     safe_calibration = commands.add_parser("calibrate-safe-area", help="replan one existing credits correction inside the native page safe area")
     safe_calibration.add_argument("project")
     safe_calibration.add_argument("--look", required=True)

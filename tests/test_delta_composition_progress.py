@@ -66,3 +66,32 @@ def test_delta_worker_defers_unapplied_caption_corrections_until_final_batch() -
 
     assert "Assert-VisualCaptionCorrectionsApplied $doc $appliedCaptionCorrections" in source
     assert "if ($deltaByLook.Count -eq $targets.Count) { Assert-VisualCaptionCorrectionsApplied $doc $visualCaptionCorrections }" in source
+
+
+def test_retry_plan_recovers_prior_caption_geometry_from_delta_evidence(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    master = project / "master.indd"
+    master.parent.mkdir(parents=True)
+    master.write_bytes(b"master")
+    archive = project / "control" / "history" / "visual-clearance-test" / "visual"
+    archive.mkdir(parents=True)
+    state = {"session_id": "session", "master": "master.indd"}
+    gate.write_json(archive / "composition-applied.json", {
+        "schema": gate.SCHEMA,
+        "generator": "run_lookbook_gate_com.ps1:ApplyCompositionDelta",
+        "session_id": "session",
+        "master": gate.identity(master),
+        "items": [{
+            "look_id": "LOOK_019",
+            "caption_correction": {"after_frame_bounds": [89.0, 126.0, 356.0, 246.0]},
+        }],
+    })
+    correction = {
+        "look_id": "LOOK_019",
+        "from_frame_bounds": [89.0, 66.0, 356.0, 186.0],
+        "to_frame_bounds": [439.0, 416.0, 706.0, 536.0],
+    }
+
+    gate._reconcile_caption_priors_with_current_master(project, state, [correction])
+
+    assert correction["prior_frame_bounds"] == [89.0, 126.0, 356.0, 246.0]
