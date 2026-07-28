@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import subprocess
@@ -190,7 +191,7 @@ class LookbookController:
             time.sleep(2)
 
     @staticmethod
-    def _wait_for_indesign_ready(timeout: int = 45) -> None:
+    def _wait_for_indesign_ready(timeout: int = 60) -> None:
         """Wait until one restarted, document-free InDesign instance is ready.
 
         The neutral title is a conservative proof that there is no document.
@@ -198,7 +199,7 @@ class LookbookController:
         still being torn down.
         """
         script = r'''
-$deadline = (Get-Date).AddSeconds($args[0])
+$deadline = (Get-Date).AddSeconds(__TIMEOUT__)
 do {
     $instances = @(Get-Process -Name InDesign -ErrorAction SilentlyContinue)
     if ($instances.Count -eq 1 -and [string]$instances[0].MainWindowTitle -match '^Adobe InDesign(?: 2026)?$') {
@@ -207,11 +208,11 @@ do {
     Start-Sleep -Seconds 1
 } while ((Get-Date) -lt $deadline)
 exit 1
-'''
+'''.replace("__TIMEOUT__", str(int(timeout)))
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         try:
             completed = subprocess.run(
-                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script, str(timeout)],
+                _powershell_encoded_command(script),
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -255,8 +256,9 @@ exit 1
             return False
         if not master.is_file():
             return False
+        master_literal = str(master).replace("'", "''")
         script = r'''
-param([string]$Master)
+$Master = '__MASTER_PATH__'
 $ErrorActionPreference = 'Stop'
 $SAVE_NO = 1852776480
 
@@ -284,12 +286,17 @@ function Remove-ControlledLocks {
 }
 
 function Wait-NeutralStartWindow {
-    for ($second = 0; $second -lt 40; $second++) {
+    for ($second = 0; $second -lt 45; $second++) {
         $current = @(Get-InDesignInstances)
         if ($current.Count -eq 1 -and (Test-NeutralStartWindow $current[0])) { return $true }
         Start-Sleep -Seconds 1
     }
     return $false
+}
+
+function Start-NeutralInstance([string]$Executable) {
+    Start-Process -FilePath $Executable -WindowStyle Hidden
+    return Wait-NeutralStartWindow
 }
 
 function Restart-NeutralInstance {
@@ -302,10 +309,18 @@ function Restart-NeutralInstance {
     Remove-ControlledLocks
     if ($existing) {
         Stop-Process -Id $existing.Id -Force
-        Wait-Process -Id $existing.Id -Timeout 15 -ErrorAction SilentlyContinue
+        Wait-Process -Id $existing.Id -Timeout 20 -ErrorAction SilentlyContinue
     }
-    Start-Process -FilePath $exe -WindowStyle Hidden
-    if (-not (Wait-NeutralStartWindow)) { exit 11 }
+    if (Start-NeutralInstance $exe) { exit 0 }
+
+    # A cold InDesign launch occasionally terminates before creating its COM
+    # server.  With no process left there is still provably no open document,
+    # so one more launch is safe and avoids handing a transient startup race
+    # back to the operator.  Never retry when any ambiguous process remains.
+    $afterFirstLaunch = @(Get-InDesignInstances)
+    if ($afterFirstLaunch.Count -ne 0) { exit 11 }
+    Start-Sleep -Seconds 2
+    if (-not (Start-NeutralInstance $exe)) { exit 12 }
     exit 0
 }
 
@@ -332,17 +347,17 @@ try {
     if ($app.Documents.Count -ne 0) { exit 15 }
     Restart-NeutralInstance
 } catch { exit 16 }
-'''
+'''.replace("__MASTER_PATH__", master_literal)
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         try:
             completed = subprocess.run(
-                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script, "-Master", str(master)],
+                _powershell_encoded_command(script),
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
                 creationflags=creationflags,
-                timeout=30,
+                timeout=120,
             )
         except subprocess.TimeoutExpired:
             return False
@@ -356,3 +371,15 @@ def _quote(value: str) -> str:
 def _is_com_disconnect(text: str) -> bool:
     normalized = text.casefold()
     return "rpc_e_disconnected" in normalized or "0x80010108" in normalized
+
+
+def _powershell_encoded_command(script: str) -> list[str]:
+    """Return a Windows-safe, argument-free PowerShell invocation.
+
+    PowerShell can silently discard named parameters supplied after a long
+    ``-Command`` string.  In COM recovery that turns a valid master path into
+    an empty string and incorrectly triggers the safety refusal.  Encoding
+    the complete script removes that parser boundary entirely.
+    """
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    return ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded]

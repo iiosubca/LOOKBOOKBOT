@@ -1,5 +1,13 @@
 # LOOKBOOKBOT for Windows
 
+## Version 0.2.15
+
+- Windows PowerShell recovery now receives the controlled master path inside an encoded script rather than as a parameter after `-Command`. That parameter was silently lost in the packaged app, causing a false safety refusal even with one neutral, document-free InDesign instance.
+
+## Version 0.2.14
+
+- COM-recovery no longer aborts its own 45-second neutral-start check after 30 seconds. It now permits a full controlled launch window and, only when no InDesign process remains, one additional cold launch before reporting a safety block.
+
 ## Version 0.2.13
 
 - The read-only `release` audit now self-recovers from `RPC_E_DISCONNECTED`: when InDesign has one provably document-free neutral start window, LOOKBOOKBOT restarts only that automation instance and retries the same armed release audit up to twice. It never re-arms, skips the audit, or changes the saved master.

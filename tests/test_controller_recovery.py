@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import base64
 from pathlib import Path
+from types import SimpleNamespace
 
 from lookbookbot.config import ToolPaths
 from lookbookbot.controller import CommandError, CommandResult, CommandRunner, LookbookController
@@ -94,6 +97,31 @@ def test_com_disconnect_stops_when_safe_restart_cannot_be_proven(tmp_path: Path,
         assert "не смогло доказать" in str(error)
     else:
         raise AssertionError("a non-provable restart must not touch InDesign")
+
+
+def test_safe_restart_waits_for_a_cold_indesign_launch(tmp_path: Path, monkeypatch) -> None:
+    controller = LookbookController(_tools(tmp_path), CommandRunner())
+    master = tmp_path / "controlled.indd"
+    master.touch()
+    control = tmp_path / "control"
+    control.mkdir()
+    (control / "lookbook-state.json").write_text(json.dumps({"master": master.name}), encoding="utf-8")
+    calls: list[tuple[list[str], dict]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("lookbookbot.controller.subprocess.run", fake_run)
+
+    assert controller._restart_controlled_indesign(tmp_path) is True
+    assert calls[0][1]["timeout"] == 120
+    command = calls[0][0]
+    assert "-EncodedCommand" in command
+    script = base64.b64decode(command[-1]).decode("utf-16-le")
+    assert str(master) in script
+    assert "function Start-NeutralInstance" in script
+    assert "$afterFirstLaunch.Count -ne 0" in script
 
 
 def test_review_export_reissues_permit_after_safe_com_recovery(tmp_path: Path, monkeypatch) -> None:
