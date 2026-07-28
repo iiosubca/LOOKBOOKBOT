@@ -95,3 +95,10 @@ def test_retry_plan_recovers_prior_caption_geometry_from_delta_evidence(tmp_path
     gate._reconcile_caption_priors_with_current_master(project, state, [correction])
 
     assert correction["prior_frame_bounds"] == [89.0, 126.0, 356.0, 246.0]
+
+
+def test_fast_planner_does_not_certify_compact_foreground_as_clear() -> None:
+    # The exact audit rejects a compact 1% silhouette even though total
+    # coverage alone looks small.  The fast planner must make the same safe
+    # decision before it spends another full proof-export cycle.
+    assert gate._planning_clearance_status(0.01)[0] == gate.CAPTION_CLEARANCE_COLLISION

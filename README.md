@@ -1,6 +1,6 @@
 # LOOKBOOKBOT for Windows
 
-## Version 0.2.22
+## Version 0.2.23
 
 - Credit-proof notes now recognise concrete visual cues in Russian and English, including explicit labels such as `garment=...; bag=...`.
 - If a controller rejects a single credit proof because its note is too generic, the app re-opens only that exact proof card, requests a structured observation, and retries the same safe batch without resetting confirmed looks.

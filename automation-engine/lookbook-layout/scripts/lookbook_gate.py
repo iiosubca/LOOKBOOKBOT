@@ -1117,6 +1117,18 @@ def _caption_clearance_status(coverage: float, largest_component: float) -> tupl
     return CAPTION_CLEARANCE_CLEAR, "credits rectangle contains only the studio background"
 
 
+def _planning_clearance_status(coverage: float) -> tuple[str, str]:
+    """Return a conservative clearance classification for the fast planner.
+
+    The integral-image planner can count foreground pixels instantly, but it
+    cannot determine whether those pixels form one model/garment silhouette.
+    Treating its entire retained foreground as one component prevents it from
+    certifying a 1--2% compact patch as CLEAR only for the final, exact audit
+    to reject that same position after another full PDF export.
+    """
+    return _caption_clearance_status(coverage, coverage)
+
+
 def _caption_clearance_metrics_from_image(image: Any, item: dict[str, Any], background: Any, tolerance: float, np: Any) -> tuple[dict[str, Any], Any, Any]:
     """Inspect one visible credits block in a preloaded original photograph.
 
@@ -1225,11 +1237,10 @@ def _fast_caption_clearance_evaluator(image: Any, background: Any, tolerance: fl
         occupied = int(integral[y1, x1] - integral[y0, x1] - integral[y1, x0] + integral[y0, x0])
         coverage = occupied / float((x1 - x0) * (y1 - y0))
         # Planning must be fast enough to test the entire legal crop/frame
-        # grid.  It uses total coverage as a permissive candidate filter; the
-        # full audit above then measures connected components on the saved
-        # result before the proof can pass.  This avoids mistaking tiny JPEG
-        # texture islands for a garment and re-running an identical plan.
-        status, reason = _caption_clearance_status(coverage, 0.0)
+        # grid, but it must never claim CLEAR more readily than the final
+        # exact audit.  A compact model edge can have a low total coverage and
+        # still fail there because it is one substantial component.
+        status, reason = _planning_clearance_status(coverage)
         return {"status": status, "reason": reason, "coverage": round(coverage, 6), "largest_component": round(coverage, 6)}
 
     return evaluate

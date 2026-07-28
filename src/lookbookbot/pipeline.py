@@ -28,6 +28,9 @@ from .state import StateStore
 from .visual_audit import visual_audit_blocker_message
 
 
+MAX_CLEARANCE_RECOVERY_ATTEMPTS = 16
+
+
 class PipelineError(RuntimeError):
     pass
 
@@ -672,8 +675,14 @@ class PipelineEngine:
                 break
             if "CHECKPOINT" not in result.text.upper():
                 break
+        # A visual proof is expensive, but a fixed small retry count is not a
+        # clearance rule.  A valid plan can correct several independent looks
+        # in sequence, so keep applying new signed plans until the proof is
+        # clear.  The duplicate-plan guard below is the real convergence
+        # boundary: it prevents an unattended job from spending hours applying
+        # the same geometry again and again.
         seen_clearance_plans: set[str] = set()
-        for _ in range(6):
+        for attempt in range(1, MAX_CLEARANCE_RECOVERY_ATTEMPTS + 1):
             rendered = self.controller.gate("render-visual-proof", root, timeout=1800, check=False)
             if rendered.returncode == 0:
                 pairs = _latest_cards(root / "control" / "visual" / "proof" / "pairs")
@@ -689,36 +698,43 @@ class PipelineEngine:
             plan_data = json.loads(plan_path.read_text(encoding="utf-8"))
             # The controller archives every retry with a fresh timestamp, so
             # hashing the file itself would make an identical no-op plan look
-            # new. Compare only the executable content before spending another
+            # new. Compare only executable geometry before spending another
             # full InDesign proof export.
-            plan_digest = json.dumps(
-                {
-                    "corrections": plan_data.get("corrections", []),
-                    "caption_corrections": plan_data.get("caption_corrections", []),
-                    "unresolved": plan_data.get("unresolved", []),
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
+            plan_digest = _clearance_plan_digest(plan_data)
             unresolved = [
                 str(item.get("look_id"))
                 for item in plan_data.get("unresolved", [])
                 if isinstance(item, dict) and isinstance(item.get("look_id"), str)
             ]
-            if unresolved and plan_digest in seen_clearance_plans:
+            executable = list(plan_data.get("corrections", [])) + list(plan_data.get("caption_corrections", []))
+            if not executable:
+                suffix = ": " + ", ".join(unresolved) if unresolved else ""
                 raise PipelineError(
-                    "Контроллер повторил неизменный план caption-clearance без допустимой коррекции: "
-                    + ", ".join(unresolved)
+                    "Контроллер не нашёл следующей допустимой коррекции caption-clearance"
+                    + suffix
+                    + ". Документ не изменён."
+                )
+            if plan_digest in seen_clearance_plans:
+                raise PipelineError(
+                    "Контроллер повторил уже применённый план caption-clearance без новой допустимой коррекции"
+                    + (": " + ", ".join(unresolved) if unresolved else ".")
                 )
             seen_clearance_plans.add(plan_digest)
+            self.log(
+                f"Caption-clearance: выполняю автономную коррекцию {attempt}/{MAX_CLEARANCE_RECOVERY_ATTEMPTS} "
+                f"(фото: {len(plan_data.get('corrections', []))}, кредиты: {len(plan_data.get('caption_corrections', []))})."
+            )
             for _batch in range(100):
                 applied = self.controller.gate("apply-composition", root, timeout=1800, check=False)
                 if applied.returncode:
                     raise PipelineError(applied.text)
                 if "PASS composition" in applied.text or "CHECKPOINT" not in applied.text.upper():
                     break
-        raise PipelineError("Caption-clearance не сошёлся после контролируемых исправлений; журнал содержит последний план.")
+        raise PipelineError(
+            "Caption-clearance не сошёлся после "
+            f"{MAX_CLEARANCE_RECOVERY_ATTEMPTS} различных контролируемых коррекций; "
+            "последний план сохранён без изменения документа."
+        )
 
     def _run_parallel_codex_visual(
         self, project: ProjectRecord, provider: CodexProvider, *, repair_attempts: int = 0,
@@ -1080,6 +1096,25 @@ def _safe_confirmation_note(note: str) -> str:
     if len(cleaned) < 25:
         raise ValueError("Визуальное подтверждение должно содержать конкретное наблюдение не короче 25 символов.")
     return cleaned
+
+
+def _clearance_plan_digest(plan: dict[str, object]) -> str:
+    """Return only the signed geometry that can change a visual retry.
+
+    Timestamps and archive locations change on every controller call, even
+    when a plan would apply exactly the same crop/frame positions.  They must
+    not reset the autonomous convergence guard.
+    """
+    return json.dumps(
+        {
+            "corrections": plan.get("corrections", []),
+            "caption_corrections": plan.get("caption_corrections", []),
+            "unresolved": plan.get("unresolved", []),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def _look_ids_in_text(value: str) -> list[str]:
