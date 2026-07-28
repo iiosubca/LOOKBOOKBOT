@@ -53,6 +53,31 @@ def test_normal_pdf_text_geometry_keeps_measured_glyph_bounds() -> None:
     assert source == "pdf-glyph-coordinates"
 
 
+def test_clearance_retry_rebases_stale_delta_baseline_to_current_master(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    control = project / "control" / "visual"
+    control.mkdir(parents=True)
+    master = project / "master.indd"
+    master.write_bytes(b"master")
+    state = {"session_id": "session", "master": "master.indd", "look_count": 1}
+    active = control / "composition-applied.json"
+    gate.write_json(active, {
+        "schema": gate.SCHEMA,
+        "generator": "run_lookbook_gate_com.ps1:ApplyCompositionDelta",
+        "session_id": "session",
+        "master": gate.identity(master),
+        "items": [{"look_id": "LOOK_001"}],
+    })
+    plan = {"prior_proof_archive": "control/history/old-baseline"}
+
+    changed = gate._rebase_clearance_plan_to_current_master(project, state, plan)
+
+    assert changed is True
+    baseline = project / plan["prior_proof_archive"] / "visual" / "composition-applied.json"
+    assert baseline.is_file()
+    assert gate.read_json(baseline)["master"] == gate.identity(master)
+
+
 def test_controller_exposes_grounded_rejection_recovery_commands() -> None:
     source = GATE_PATH.read_text(encoding="utf-8")
 
@@ -60,3 +85,4 @@ def test_controller_exposes_grounded_rejection_recovery_commands() -> None:
     assert 'restart-visual-confirmations' in source
     assert '--force-looks' in source
     assert "if entries:" in source
+    assert "def _rebase_clearance_plan_to_current_master" in source

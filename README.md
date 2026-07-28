@@ -1,5 +1,9 @@
 # LOOKBOOKBOT for Windows
 
+## Version 0.2.9
+
+- An unstarted clearance retry now automatically rebinds its delta baseline to the current same-master native composition evidence, preventing a stale archived identity from blocking InDesign before the correction starts.
+
 ## Version 0.2.8
 
 - If a nested InDesign PDF form reports every credit row at one baseline, the clearance audit recognises that impossible geometry and uses the real existing credits-frame area for safe correction planning.

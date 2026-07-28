@@ -2473,6 +2473,47 @@ def _reconcile_caption_priors_with_current_master(project: Path, state: dict[str
             correction["prior_frame_bounds"] = actual
 
 
+def _rebase_clearance_plan_to_current_master(project: Path, state: dict[str, Any], data: dict[str, Any]) -> bool:
+    """Bind an unstarted delta plan to the newest same-master native baseline.
+
+    A previous delta can save the INDD after its earlier archive was created.
+    Reusing that older archive then makes the native worker correctly reject
+    its stale identity.  Copying the current immutable native composition
+    evidence into a fresh control-history baseline fixes only the evidence
+    reference; it neither opens nor changes InDesign.
+    """
+    master = identity(state_artifact(project, state, "master"))
+    relative = str(data.get("prior_proof_archive", "")).strip()
+    if relative:
+        try:
+            prior = child_of(project, relative) / "visual" / "composition-applied.json"
+            prior_data = read_json(prior) if prior.is_file() else None
+        except GateError:
+            prior_data = None
+        if isinstance(prior_data, dict) and isinstance(prior_data.get("master"), dict) and same_identity(prior_data["master"], master):
+            return False
+    active = composition_applied_path(project)
+    if not active.is_file():
+        fail("Clearance retry has no current native composition evidence to rebase its baseline.")
+    evidence = read_json(active)
+    if (
+        evidence.get("schema") != SCHEMA
+        or evidence.get("generator") not in {"run_lookbook_gate_com.ps1:ApplyComposition", "run_lookbook_gate_com.ps1:ApplyCompositionDelta"}
+        or evidence.get("session_id") != state["session_id"]
+        or not isinstance(evidence.get("master"), dict)
+        or not same_identity(evidence["master"], master)
+        or not isinstance(evidence.get("items"), list)
+        or len(evidence["items"]) != int(state["look_count"])
+    ):
+        fail("Current native composition evidence does not match the saved master; a new visual proof is required before retrying.")
+    archive = control_path(project) / "history" / f"visual-baseline-{utc_now().replace(':', '-')}"
+    target = archive / "visual" / "composition-applied.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(active, target)
+    data["prior_proof_archive"] = _relative_project_path(project, archive)
+    return True
+
+
 def command_reconcile_clearance_plan_priors(args: argparse.Namespace) -> None:
     """Repair an unstarted retry plan using only existing native evidence.
 
@@ -2503,11 +2544,15 @@ def command_reconcile_clearance_plan_priors(args: argparse.Namespace) -> None:
     before = json.dumps(corrections, ensure_ascii=False, sort_keys=True)
     _reconcile_caption_priors_with_current_master(project, state, corrections)
     after = json.dumps(corrections, ensure_ascii=False, sort_keys=True)
-    if before != after:
+    rebased = _rebase_clearance_plan_to_current_master(project, state, data)
+    if before != after or rebased:
         data["caption_corrections"] = corrections
         data["created_at"] = utc_now()
         write_json(correction_path, data)
-        print("PASS visual resume: signed prior credits geometry was restored from same-master native composition evidence.")
+        if rebased:
+            print("PASS visual resume: delta baseline was rebound to current same-master native composition evidence.")
+        else:
+            print("PASS visual resume: signed prior credits geometry was restored from same-master native composition evidence.")
     else:
         print("PASS visual resume: existing signed composition plan is already consistent with the saved master.")
 
