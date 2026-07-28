@@ -1,5 +1,10 @@
 # LOOKBOOKBOT for Windows
 
+## Version 0.2.13
+
+- The read-only `release` audit now self-recovers from `RPC_E_DISCONNECTED`: when InDesign has one provably document-free neutral start window, LOOKBOOKBOT restarts only that automation instance and retries the same armed release audit up to twice. It never re-arms, skips the audit, or changes the saved master.
+- If the neutral window is already visible, recovery no longer starts with a fragile COM enumeration. It uses the verified process state, then waits for the new InDesign instance to be ready before retrying.
+
 ## Version 0.2.12
 
 - Caption-clearance now measures the actual largest connected foreground component. Scattered JPEG/studio-background texture no longer blocks a safe credits position, while a contiguous garment, bag, or body remains a hard visual block.

@@ -119,7 +119,7 @@ class LookbookController:
                         "InDesign потерял COM-соединение при экспорте review-PDF; "
                         "безопасно перезапускаю только управляемый master и повторяю экспорт."
                     )
-                    time.sleep(4)
+                    self._wait_for_indesign_ready()
                     continue
             raise CommandError(exported.text)
         raise CommandError("Не удалось безопасно восстановить экспорт review-PDF.")
@@ -130,6 +130,11 @@ class LookbookController:
         arm = self.gate("arm", project, "--gate", gate, timeout=120, check=False)
         if arm.returncode and not any(word in arm.text.casefold() for word in ("armed", "progress", "nonce", "already")):
             raise CommandError(arm.text)
+        # Release is a read-only audit and remains bound to the saved arm. An
+        # RPC disconnect has no layout side effect, so two cold recoveries are
+        # safe without re-arming, skipping, or changing the master.
+        max_com_recoveries = 2 if gate == "release" else 1
+        com_recoveries = 0
         for _ in range(max_batches):
             if evidence_passed(project, gate):
                 return
@@ -140,34 +145,36 @@ class LookbookController:
                 return
             if result.returncode:
                 if self._is_com_disconnect(project, result.text):
-                    # The native controller already tries a safe cold restart
-                    # for an idle InDesign instance. This remains one bounded
-                    # fallback attempt; never re-arm, skip, or run concurrently.
-                    self.runner.log(
-                        f"InDesign потерял COM-соединение на этапе {gate}; "
-                        "выполняется одна безопасная повторная попытка из сохранённой точки."
-                    )
-                    # The native driver already makes one idle-server retry.
-                    # For the read-only release audit it can still leave the
-                    # exact controlled master open after the COM client dies.
-                    # Close only that master, reject any other document, and
-                    # restart one provably automation-owned InDesign instance.
-                    if gate == "release":
-                        self._restart_controlled_indesign(project)
-                    # Give a just-restarted InDesign server time to register
-                    # its COM endpoint before the fallback command attaches.
-                    time.sleep(4)
-                    self._wait_for_master(project)
-                    retry = self.gate("apply", project, "--gate", gate, timeout=1800, check=False)
-                    self._wait_for_master(project)
-                    if evidence_passed(project, gate):
-                        return
-                    if retry.returncode:
+                    if com_recoveries >= max_com_recoveries:
                         raise CommandError(
-                            f"InDesign снова потерял связь на этапе {gate}. "
-                            "Документ не был пропущен или перезаписан; повторите этот же этап позднее."
+                            f"InDesign повторно потерял COM-связь на этапе {gate} после "
+                            f"{com_recoveries} безопасных восстановлений. Документ не изменён; "
+                            "автоматическое восстановление остановлено из-за лимита безопасности."
                         )
-                    result = retry
+                    com_recoveries += 1
+                    if gate == "release":
+                        self.runner.log(
+                            "InDesign потерял COM-соединение на release; безопасно перезапускаю "
+                            f"документ-free экземпляр и повторяю тот же arm ({com_recoveries}/{max_com_recoveries})."
+                        )
+                        if not self._restart_controlled_indesign(project):
+                            raise CommandError(
+                                f"InDesign потерял COM-соединение на этапе {gate}, но приложение не смогло "
+                                "доказать, что экземпляр безопасно перезапустить. Документ не изменён."
+                            )
+                        self._wait_for_indesign_ready()
+                    else:
+                        self.runner.log(
+                            f"InDesign потерял COM-соединение на этапе {gate}; повторяю тот же arm "
+                            f"из сохранённой точки ({com_recoveries}/{max_com_recoveries})."
+                        )
+                        # Other native gates may have durable checkpoints that
+                        # the underlying controller can resume itself.  Do not
+                        # close a possible in-progress transactional document.
+                        time.sleep(4)
+                    # Return to the guarded loop.  It preserves the existing
+                    # arm and rechecks both lock and evidence before retrying.
+                    continue
                 else:
                     raise CommandError(result.text)
             if "CHECKPOINT" not in result.text.upper() and "PASS" not in result.text.upper():
@@ -183,6 +190,41 @@ class LookbookController:
             time.sleep(2)
 
     @staticmethod
+    def _wait_for_indesign_ready(timeout: int = 45) -> None:
+        """Wait until one restarted, document-free InDesign instance is ready.
+
+        The neutral title is a conservative proof that there is no document.
+        It also avoids creating a new COM client while the broken client is
+        still being torn down.
+        """
+        script = r'''
+$deadline = (Get-Date).AddSeconds($args[0])
+do {
+    $instances = @(Get-Process -Name InDesign -ErrorAction SilentlyContinue)
+    if ($instances.Count -eq 1 -and [string]$instances[0].MainWindowTitle -match '^Adobe InDesign(?: 2026)?$') {
+        exit 0
+    }
+    Start-Sleep -Seconds 1
+} while ((Get-Date) -lt $deadline)
+exit 1
+'''
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        try:
+            completed = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script, str(timeout)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=creationflags,
+                timeout=timeout + 5,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise CommandError("InDesign не подтвердил готовность после безопасного перезапуска.") from error
+        if completed.returncode:
+            raise CommandError("InDesign не подтвердил безопасное состояние после перезапуска.")
+
+    @staticmethod
     def _is_com_disconnect(project: Path, message: str) -> bool:
         if _is_com_disconnect(message):
             return True
@@ -194,7 +236,7 @@ class LookbookController:
 
     @staticmethod
     def _restart_controlled_indesign(project: Path) -> bool:
-        """Restart only a disconnected, automation-owned release/export session.
+        """Restart only a disconnected, automation-owned InDesign session.
 
         This deliberately refuses to touch InDesign when another document is
         open.  The exact controlled master is read-only at release/export, so
@@ -217,37 +259,79 @@ class LookbookController:
 param([string]$Master)
 $ErrorActionPreference = 'Stop'
 $SAVE_NO = 1852776480
+
+function Get-InDesignInstances {
+    return @(Get-Process -Name InDesign -ErrorAction SilentlyContinue)
+}
+
+function Test-NeutralStartWindow([System.Diagnostics.Process]$Instance) {
+    return [string]$Instance.MainWindowTitle -match '^Adobe InDesign(?: 2026)?$'
+}
+
+function Get-KnownInDesignExecutable([System.Diagnostics.Process]$Instance) {
+    if ($Instance -and $Instance.Path -and (Test-Path -LiteralPath $Instance.Path -PathType Leaf)) {
+        return [string]$Instance.Path
+    }
+    $candidate = Join-Path $env:ProgramFiles 'Adobe\Adobe InDesign 2026\InDesign.exe'
+    if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+    return $null
+}
+
+function Remove-ControlledLocks {
+    $project = Split-Path -Parent $Master
+    Get-ChildItem -LiteralPath $project -Filter '*.idlk' -Force -ErrorAction SilentlyContinue |
+        Remove-Item -Force -Recurse -ErrorAction Stop
+}
+
+function Wait-NeutralStartWindow {
+    for ($second = 0; $second -lt 40; $second++) {
+        $current = @(Get-InDesignInstances)
+        if ($current.Count -eq 1 -and (Test-NeutralStartWindow $current[0])) { return $true }
+        Start-Sleep -Seconds 1
+    }
+    return $false
+}
+
+function Restart-NeutralInstance {
+    $instances = @(Get-InDesignInstances)
+    if ($instances.Count -gt 1) { exit 8 }
+    if ($instances.Count -eq 1 -and -not (Test-NeutralStartWindow $instances[0])) { exit 9 }
+    $existing = if ($instances.Count -eq 1) { $instances[0] } else { $null }
+    $exe = Get-KnownInDesignExecutable $existing
+    if (-not $exe) { exit 10 }
+    Remove-ControlledLocks
+    if ($existing) {
+        Stop-Process -Id $existing.Id -Force
+        Wait-Process -Id $existing.Id -Timeout 15 -ErrorAction SilentlyContinue
+    }
+    Start-Process -FilePath $exe -WindowStyle Hidden
+    if (-not (Wait-NeutralStartWindow)) { exit 11 }
+    exit 0
+}
+
 try {
+    # A neutral title proves the absence of a document.  This is the normal
+    # RPC_E_DISCONNECTED path, so avoid a fragile COM enumeration first.
+    $instances = @(Get-InDesignInstances)
+    if ($instances.Count -eq 0 -or ($instances.Count -eq 1 -and (Test-NeutralStartWindow $instances[0]))) {
+        Restart-NeutralInstance
+    }
+
+    # A non-neutral instance might contain user work.  Attach only here and
+    # proceed exclusively when it contains this exact saved master.
+    if ($instances.Count -ne 1) { exit 12 }
     $app = New-Object -ComObject InDesign.Application
     $wanted = [System.IO.Path]::GetFullPath($Master).ToLowerInvariant()
     $matches = @()
     foreach ($document in @($app.Documents)) {
         $full = [System.IO.Path]::GetFullPath([string]$document.FullName).ToLowerInvariant()
-        if ($full -eq $wanted) { $matches += $document }
-        else { exit 4 }
+        if ($full -eq $wanted) { $matches += $document } else { exit 13 }
     }
-    if ($matches.Count -gt 1) { exit 5 }
+    if ($matches.Count -gt 1) { exit 14 }
     foreach ($document in $matches) { $document.Close($SAVE_NO) }
-    if ($app.Documents.Count -ne 0) { exit 6 }
-    # With no document left in the sole automation session, a project-local
-    # lock can only be stale.  Remove only this controlled master's lock.
-    $project = Split-Path -Parent $Master
-    Get-ChildItem -LiteralPath $project -Filter '*.idlk' -Force -ErrorAction SilentlyContinue |
-        Remove-Item -Force -Recurse -ErrorAction Stop
-    $instances = @(Get-Process -Name InDesign -ErrorAction SilentlyContinue)
-    if ($instances.Count -eq 0) {
-        $candidate = Join-Path $env:ProgramFiles 'Adobe\Adobe InDesign 2026\InDesign.exe'
-        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { exit 7 }
-        Start-Process -FilePath $candidate -WindowStyle Hidden
-        exit 0
-    }
-    if ($instances.Count -ne 1 -or -not $instances[0].Path) { exit 8 }
-    $exe = $instances[0].Path
-    Stop-Process -Id $instances[0].Id -Force
-    Start-Sleep -Seconds 2
-    Start-Process -FilePath $exe -WindowStyle Hidden
-    exit 0
-} catch { exit 9 }
+    if ($app.Documents.Count -ne 0) { exit 15 }
+    Restart-NeutralInstance
+} catch { exit 16 }
 '''
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         try:
