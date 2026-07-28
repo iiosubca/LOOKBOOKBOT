@@ -28,9 +28,6 @@ from .state import StateStore
 from .visual_audit import visual_audit_blocker_message
 
 
-MAX_CLEARANCE_RECOVERY_ATTEMPTS = 16
-
-
 class PipelineError(RuntimeError):
     pass
 
@@ -675,14 +672,16 @@ class PipelineEngine:
                 break
             if "CHECKPOINT" not in result.text.upper():
                 break
-        # A visual proof is expensive, but a fixed small retry count is not a
-        # clearance rule.  A valid plan can correct several independent looks
-        # in sequence, so keep applying new signed plans until the proof is
+        # A visual proof is expensive, but a retry count is not a clearance
+        # rule.  One plan may fix many looks at once, while a later proof can
+        # expose another one of the 50 looks.  Continue until the proof is
         # clear.  The duplicate-plan guard below is the real convergence
         # boundary: it prevents an unattended job from spending hours applying
         # the same geometry again and again.
         seen_clearance_plans: set[str] = set()
-        for attempt in range(1, MAX_CLEARANCE_RECOVERY_ATTEMPTS + 1):
+        attempt = 0
+        while True:
+            attempt += 1
             rendered = self.controller.gate("render-visual-proof", root, timeout=1800, check=False)
             if rendered.returncode == 0:
                 pairs = _latest_cards(root / "control" / "visual" / "proof" / "pairs")
@@ -721,7 +720,7 @@ class PipelineEngine:
                 )
             seen_clearance_plans.add(plan_digest)
             self.log(
-                f"Caption-clearance: выполняю автономную коррекцию {attempt}/{MAX_CLEARANCE_RECOVERY_ATTEMPTS} "
+                f"Caption-clearance: выполняю автономную коррекцию №{attempt} "
                 f"(фото: {len(plan_data.get('corrections', []))}, кредиты: {len(plan_data.get('caption_corrections', []))})."
             )
             for _batch in range(100):
@@ -730,11 +729,6 @@ class PipelineEngine:
                     raise PipelineError(applied.text)
                 if "PASS composition" in applied.text or "CHECKPOINT" not in applied.text.upper():
                     break
-        raise PipelineError(
-            "Caption-clearance не сошёлся после "
-            f"{MAX_CLEARANCE_RECOVERY_ATTEMPTS} различных контролируемых коррекций; "
-            "последний план сохранён без изменения документа."
-        )
 
     def _run_parallel_codex_visual(
         self, project: ProjectRecord, provider: CodexProvider, *, repair_attempts: int = 0,

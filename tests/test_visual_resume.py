@@ -46,7 +46,7 @@ def test_visual_start_creates_plan_only_when_none_exists(tmp_path: Path, monkeyp
     assert scripts == ["prepare_composition_audit.py"]
 
 
-def test_clearance_recovery_continues_past_legacy_six_attempt_limit(tmp_path: Path, monkeypatch) -> None:
+def test_clearance_recovery_has_no_arbitrary_attempt_limit(tmp_path: Path, monkeypatch) -> None:
     engine = PipelineEngine(StateStore(tmp_path / "state.db"))
     root = tmp_path / "project"
     attempts = {"render": 0, "plan": 0, "apply": 0}
@@ -56,7 +56,7 @@ def test_clearance_recovery_continues_past_legacy_six_attempt_limit(tmp_path: Pa
     def gate(action: str, *_args, **_kwargs):
         if action == "render-visual-proof":
             attempts["render"] += 1
-            if attempts["render"] <= 7:
+            if attempts["render"] <= 17:
                 return SimpleNamespace(returncode=1, text="CAPTION CLEARANCE BLOCKED")
             pair = root / "control" / "visual" / "proof" / "pairs" / "final" / "LOOK_001.jpg"
             pair.parent.mkdir(parents=True, exist_ok=True)
@@ -81,7 +81,7 @@ def test_clearance_recovery_continues_past_legacy_six_attempt_limit(tmp_path: Pa
     pairs = engine._prepare_visual_proof(SimpleNamespace(project_dir=root))
 
     assert [pair.stem for pair in pairs] == ["LOOK_001"]
-    assert attempts == {"render": 8, "plan": 7, "apply": 8}
+    assert attempts == {"render": 18, "plan": 17, "apply": 18}
 
 
 def test_clearance_recovery_stops_before_reapplying_identical_plan(tmp_path: Path, monkeypatch) -> None:
