@@ -644,7 +644,9 @@ class PipelineEngine:
                     break
         raise ReviewRequired("Caption clearance не удалось довести до CLEAR за шесть контролируемых итераций.")
 
-    def _run_parallel_codex_visual(self, project: ProjectRecord, provider: CodexProvider) -> None:
+    def _run_parallel_codex_visual(
+        self, project: ProjectRecord, provider: CodexProvider, *, repair_attempts: int = 0,
+    ) -> None:
         """Inspect proof cards concurrently and commit accepted checks serially.
 
         A vision worker is intentionally read-only: it receives the actual JPG
@@ -709,6 +711,20 @@ class PipelineEngine:
                 )
 
         if unresolved:
+            rejected = {
+                proof.stem: decisions[proof.stem]
+                for proof in unresolved
+                if proof.stem in decisions and not decisions[proof.stem].accepted
+            }
+            if len(rejected) == len(unresolved) and repair_attempts < 2:
+                if self._repair_rejected_visual_proofs(root, rejected):
+                    self.log(
+                        "Контролируемая коррекция visual-proof подготовлена; "
+                        "перезапускаю только обязательный новый цикл доказательств."
+                    )
+                    return self._run_parallel_codex_visual(
+                        project, provider, repair_attempts=repair_attempts + 1,
+                    )
             details = "; ".join(
                 f"{proof.stem}: {diagnostics.get(proof.stem, 'нет решения визуальной модели')}"
                 for proof in unresolved
@@ -756,9 +772,47 @@ class PipelineEngine:
         raw = provider.run_readonly_agent(prompt, root, timeout=3600, images=proofs)
         return _parse_codex_batch_decisions(raw, look_ids)
 
-    def _run_local_visual(self, project: ProjectRecord, provider: ModelProvider) -> None:
+    def _repair_rejected_visual_proofs(
+        self, root: Path, rejected: dict[str, VisionDecision],
+    ) -> bool:
+        """Turn a grounded visual rejection into a bounded controller repair.
+
+        The computer clearance audit is renewed before its plan is made.  The
+        controller then archives only the superseded partial confirmations and
+        plans the identified LOOK IDs with its legal image/credits-frame
+        options.  It never edits InDesign directly and never touches an already
+        passed visual/review gate.
+        """
+        look_ids = sorted(rejected)
+        notes = " || ".join(
+            f"{look_id}: {_safe_confirmation_note(rejected[look_id].note)}" for look_id in look_ids
+        )
+        self.log("Визуальная модель отклонила " + ", ".join(look_ids) + "; обновляю controller clearance-аудит.")
+        refreshed = self.controller.gate("refresh-caption-clearance", root, timeout=900, check=False)
+        if refreshed.returncode:
+            self.log("Не удалось обновить caption-clearance для автокоррекции: " + refreshed.text)
+            return False
+        discarded = self.controller.gate(
+            "restart-visual-confirmations", root, "--notes", notes, timeout=180, check=False,
+        )
+        if discarded.returncode:
+            self.log("Не удалось безопасно архивировать partial visual confirmations: " + discarded.text)
+            return False
+        planned = self.controller.gate(
+            "plan-clearance-corrections", root, "--force-looks", ",".join(look_ids), timeout=1800, check=False,
+        )
+        if planned.returncode:
+            self.log("Контроллер не смог построить безопасную visual-коррекцию: " + planned.text)
+            return False
+        self.log(planned.text)
+        return True
+
+    def _run_local_visual(
+        self, project: ProjectRecord, provider: ModelProvider, *, repair_attempts: int = 0,
+    ) -> None:
         root = project.project_dir
         pairs = self._prepare_visual_proof(project)
+        rejected: dict[str, VisionDecision] = {}
         for proof in pairs:
             decision = provider.inspect_proof(
                 "Проверь разворот лукбука. Ответь JSON {\"match\":true/false,\"note\":\"конкретное наблюдение\"}. "
@@ -766,8 +820,14 @@ class PipelineEngine:
                 [proof],
             )
             if not decision.accepted:
-                raise ReviewRequired(f"{proof.stem}: визуальная модель отклонила разворот — {decision.note}")
+                rejected[proof.stem] = decision
+                continue
             self.controller.gate("confirm-visual-look", root, "--look", proof.stem, "--note", decision.note, timeout=120)
+        if rejected:
+            if repair_attempts < 2 and self._repair_rejected_visual_proofs(root, rejected):
+                return self._run_local_visual(project, provider, repair_attempts=repair_attempts + 1)
+            details = "; ".join(f"{look}: {decision.note}" for look, decision in rejected.items())
+            raise ReviewRequired("Автоматическая visual-коррекция не смогла безопасно исправить: " + details)
         self.controller.gate("record-visual", root, "--notes", "Проверены все current-master proofs и компьютерный caption clearance.", timeout=300)
 
     def _prepare_or_resume_visual_composition(self, root: Path) -> None:

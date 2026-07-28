@@ -1,5 +1,10 @@
 # LOOKBOOKBOT for Windows
 
+## Version 0.2.7
+
+- Caption-clearance now composes nested PDF text coordinates correctly, so all rendered credit rows participate in collision detection rather than only their first apparent line.
+- A grounded visual-model rejection automatically archives the incomplete confirmation queue, asks the controller for a bounded correction of only the rejected LOOK IDs, regenerates proof evidence, and resumes the review-PDF flow.
+
 ## Version 0.2.6
 
 - A partially confirmed visual-proof session now resumes its exact existing proof cards. LOOKBOOKBOT no longer re-arms InDesign, reconciles a clearance plan, or rerenders proofs after confirmations have started.

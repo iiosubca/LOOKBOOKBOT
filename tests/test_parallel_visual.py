@@ -165,3 +165,49 @@ def test_partial_visual_confirmation_reuses_current_proof_without_native_work(tm
     resumed = engine._prepare_visual_proof(project)
 
     assert resumed == proofs
+
+
+def test_visual_rejection_starts_a_controller_repair_and_rechecks(tmp_path: Path, monkeypatch) -> None:
+    store = StateStore(tmp_path / "state.db")
+    project = _project(store, tmp_path)
+    engine = PipelineEngine(store)
+    proof = project.project_dir / "control" / "visual" / "proof" / "pairs" / "LOOK_041.jpg"
+    proof.parent.mkdir(parents=True, exist_ok=True)
+    proof.write_bytes(b"proof")
+    confirmations = project.project_dir / "control" / "visual" / "confirmations"
+    attempts = 0
+    repairs: list[list[str]] = []
+    records: list[str] = []
+
+    monkeypatch.setattr(engine, "_prepare_visual_proof", lambda _project: [proof])
+
+    def fake_confirm(_provider, _root: Path, _batch: list[Path]):
+        nonlocal attempts
+        attempts += 1
+        accepted = attempts > 3
+        return {
+            "LOOK_041": VisionDecision(
+                accepted=accepted,
+                note="Кредиты пересекают силуэт модели и требуют новой безопасной коррекции.",
+            )
+        }
+
+    def fake_repair(_root: Path, rejected: dict[str, VisionDecision]) -> bool:
+        repairs.append(sorted(rejected))
+        return True
+
+    def fake_gate(action: str, _root: Path, *args: str, **_kwargs) -> None:
+        records.append(action)
+        if action == "confirm-visual-look":
+            confirmations.mkdir(parents=True, exist_ok=True)
+            (confirmations / "LOOK_041.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(engine, "_confirm_codex_visual_batch", fake_confirm)
+    monkeypatch.setattr(engine, "_repair_rejected_visual_proofs", fake_repair)
+    monkeypatch.setattr(engine.controller, "gate", fake_gate)
+
+    engine._run_parallel_codex_visual(project, CodexProvider())
+
+    assert attempts == 4
+    assert repairs == [["LOOK_041"]]
+    assert records == ["confirm-visual-look", "record-visual"]

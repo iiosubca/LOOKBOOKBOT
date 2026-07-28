@@ -1235,12 +1235,19 @@ def _visible_caption_text_bounds(reader: Any, page_number: int, caption_bounds: 
         glyph_lefts: list[float] = []
         glyph_rights: list[float] = []
 
-        def visit(text: str, _cm: Any, tm: Any, _font: Any, _font_size: Any) -> None:
+        def visit(text: str, cm: Any, tm: Any, _font: Any, _font_size: Any) -> None:
             if not text.strip():
                 return
             try:
-                x = float(tm[4])
-                y = float(tm[5])
+                # InDesign places captions in nested PDF forms.  ``tm`` is
+                # local to that form, so it can place every printed row at the
+                # same apparent coordinate.  Compose it with the current
+                # graphics matrix to obtain real proof-page coordinates.
+                a, b, c, _d, e, f = (float(value) for value in cm[:6])
+                text_x = float(tm[4])
+                text_y = float(tm[5])
+                x = a * text_x + c * text_y + e
+                y = b * text_x + _d * text_y + f
             except (TypeError, ValueError, IndexError):
                 return
             converted = page_height - y
@@ -2338,6 +2345,43 @@ def _archive_visual_cycle_for_clearance_retry(project: Path) -> Path:
     return archive
 
 
+def command_restart_visual_confirmations(args: argparse.Namespace) -> None:
+    """Archive partial visual attestations after a grounded proof rejection.
+
+    This does not change the INDD. It retires only the incomplete confirmation
+    queue at the visual gate so the controller can prepare a new signed visual
+    correction from the same current proof. A completed visual gate remains
+    immutable because its current gate is no longer ``visual``.
+    """
+    project = project_path(args.project)
+    state = load_state(project)
+    if current_gate(project, state) != "visual":
+        fail("Partial visual confirmations can be restarted only at the visual gate.")
+    notes = args.notes.strip()
+    if len(notes) < 25:
+        fail("--notes must record the specific visual rejection that restarts the partial proof queue.")
+    confirmations = visual_confirmation_dir(project)
+    entries = sorted(confirmations.glob("*.json")) if confirmations.is_dir() else []
+    if not entries:
+        fail("There are no partial visual confirmations to restart.")
+    manifest = validate_visual_proof(project, state)
+    _validate_blocked_clearance_report(project, state)
+    archive = control_path(project) / "history" / f"visual-rejected-{utc_now().replace(':', '-')}"
+    destination = archive / "visual" / "confirmations"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(confirmations), str(destination))
+    confirmations.mkdir(parents=True, exist_ok=True)
+    write_json(archive / "rejection.json", {
+        "schema": SCHEMA, "generator": "lookbook_gate.py:restart-visual-confirmations",
+        "session_id": state["session_id"], "created_at": utc_now(),
+        "master": identity(state_artifact(project, state, "master")),
+        "proof_manifest_sha256": digest(visual_proof_manifest_path(project)),
+        "confirmation_count": len(entries), "notes": notes,
+        "proof_looks": sorted(manifest["look_pairs"]),
+    })
+    print(f"PARTIAL VISUAL CONFIRMATIONS ARCHIVED: {len(entries)} proof records were retired for a controller-planned correction.")
+
+
 def _same_bounds(left: list[float], right: list[float], tolerance: float = 0.5) -> bool:
     return len(left) == 4 and len(right) == 4 and all(abs(a - b) <= tolerance for a, b in zip(left, right))
 
@@ -2453,7 +2497,14 @@ def command_plan_clearance_corrections(args: argparse.Namespace) -> None:
     confirmations = visual_confirmation_dir(project)
     if confirmations.exists() and any(confirmations.glob("*.json")):
         fail("Visual confirmations already exist. Begin a revision instead of changing a confirmed master.")
+    forced_looks = {item.strip() for item in str(getattr(args, "force_looks", "") or "").split(",") if item.strip()}
+    if any(not re.fullmatch(r"LOOK_\d{3}", item) for item in forced_looks):
+        fail("--force-looks must be a comma-separated list of exact LOOK_### ids.")
     report_items = _validate_blocked_clearance_report(project, state)
+    report_ids = {str(item["look_id"]) for item in report_items}
+    unknown_forced = sorted(forced_looks - report_ids)
+    if unknown_forced:
+        fail("--force-looks contains unknown visual proofs: " + ", ".join(unknown_forced))
     if any(item["status"] == CAPTION_CLEARANCE_OVERFLOW for item in report_items):
         fail("Credits overflow in the current proof. Return to captions; a horizontal image shift cannot repair missing text.")
     try:
@@ -2497,7 +2548,8 @@ def command_plan_clearance_corrections(args: argparse.Namespace) -> None:
         evidence = report_by_look.get(row["look_id"])
         if evidence is None:
             fail(f"{row['look_id']}: caption-clearance report is missing.")
-        if evidence["status"] == CAPTION_CLEARANCE_CLEAR:
+        force_correction = row["look_id"] in forced_looks
+        if evidence["status"] == CAPTION_CLEARANCE_CLEAR and not force_correction:
             continue
         if evidence["status"] not in {CAPTION_CLEARANCE_COLLISION, CAPTION_CLEARANCE_REVIEW}:
             fail(f"{row['look_id']}: unsupported clearance state {evidence['status']}.")
@@ -2543,7 +2595,8 @@ def command_plan_clearance_corrections(args: argparse.Namespace) -> None:
             ]
         proposed, predicted = _best_horizontal_clearance_shift(source, geometry, prior)
         candidate = {
-            "look_id": row["look_id"], "from_points": prior, "to_points": proposed, "status": evidence["status"],
+            "look_id": row["look_id"], "from_points": prior, "to_points": proposed,
+            "status": CAPTION_CLEARANCE_REVIEW if force_correction else evidence["status"],
             "coverage": float((evidence.get("metrics") or {}).get("coverage", 1.0)),
             "predicted_status": predicted["status"], "predicted_coverage": predicted.get("coverage"),
         }
@@ -4356,7 +4409,12 @@ def parser() -> argparse.ArgumentParser:
     restore_caption_repair.set_defaults(func=command_restore_failed_caption_repair)
     clearance_plan = commands.add_parser("plan-clearance-corrections", help="replace a blocked visual plan with bounded horizontal-only corrections")
     clearance_plan.add_argument("project")
+    clearance_plan.add_argument("--force-looks", default="", help="controller-recorded rejected LOOK ids that require a conservative correction plan")
     clearance_plan.set_defaults(func=command_plan_clearance_corrections)
+    restart_visual = commands.add_parser("restart-visual-confirmations", help="archive a partial visual-proof queue after a grounded rejection")
+    restart_visual.add_argument("project")
+    restart_visual.add_argument("--notes", required=True)
+    restart_visual.set_defaults(func=command_restart_visual_confirmations)
     reconcile_clearance_plan = commands.add_parser("reconcile-clearance-plan-priors", help="repair an unstarted visual retry plan from same-master native evidence")
     reconcile_clearance_plan.add_argument("project")
     reconcile_clearance_plan.set_defaults(func=command_reconcile_clearance_plan_priors)
