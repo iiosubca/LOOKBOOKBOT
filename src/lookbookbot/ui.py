@@ -812,23 +812,45 @@ class MainWindow(QMainWindow):
         if not isinstance(outputs, list) or not outputs:
             return
         total = len(outputs)
-        verified = sum(1 for output in outputs if isinstance(output, dict) and output.get("identity") and output.get("verified_at"))
+        required_format = "adobe-pdf-print-v1"
+        legacy_outputs = [
+            output for output in outputs
+            if isinstance(output, dict) and output.get("export_format") != required_format
+        ]
+        verified = sum(
+            1 for output in outputs
+            if isinstance(output, dict)
+            and output.get("export_format") == required_format
+            and output.get("identity")
+            and output.get("verified_at")
+        )
         written = sum(
             1
             for output in outputs
             if isinstance(output, dict)
+            and output.get("export_format") == required_format
             and (self.project.project_dir / str(output.get("path", ""))).is_file()
             and (self.project.project_dir / str(output.get("path", ""))).stat().st_size >= 512
         )
         progress_record = read_json(self.project.project_dir / "control" / "progress" / "final-export.json")
         active = progress_record.get("active") if isinstance(progress_record.get("active"), dict) else None
         complete = max(verified, written)
-        current = next((output for output in outputs if isinstance(output, dict) and not output.get("identity")), None)
+        current = next(
+            (
+                output for output in outputs
+                if isinstance(output, dict)
+                and (output.get("export_format") != required_format or not output.get("identity"))
+            ),
+            None,
+        )
         self.final_export_progress.setRange(0, total)
         self.final_export_progress.setValue(complete)
         self.final_export_progress.setFormat("%v / %m")
         self.final_export_progress.show()
         self.final_export_label.show()
+        if legacy_outputs:
+            self.final_export_label.setText("Финальные PDF требуют повторного экспорта с JPEG High…")
+            return
         if str(manifest.get("status", "")).casefold() == "complete" and complete == total:
             self.final_export_label.setText(f"Финальные PDF готовы и проверены: {complete} из {total}")
             return

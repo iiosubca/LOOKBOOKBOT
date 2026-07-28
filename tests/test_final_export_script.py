@@ -9,9 +9,9 @@ SCRIPT = Path(__file__).parents[1] / "automation-engine" / "lookbook-layout" / "
 def test_final_export_passes_gender_ranges_to_com_as_scalars() -> None:
     source = SCRIPT.read_text(encoding="utf-8")
 
-    assert "$prefs.PageRange = if ($range -eq 'ALL')" not in source
-    assert "if ($range -eq 'ALL') { $prefs.PageRange = $ALL_PAGES }" in source
-    assert "else { $prefs.PageRange = [string]$range }" in source
+    assert "$Preferences.PageRange = if ($range -eq 'ALL')" not in source
+    assert "if ([string]::IsNullOrWhiteSpace($RequestedPageRange) -or $RequestedPageRange -eq 'ALL') { $Preferences.PageRange = $ALL_PAGES }" in source
+    assert "else { $Preferences.PageRange = [string]$RequestedPageRange }" in source
 
 
 def test_final_export_writes_active_file_progress_before_exporting() -> None:
@@ -19,3 +19,15 @@ def test_final_export_writes_active_file_progress_before_exporting() -> None:
 
     assert "status = 'exporting'" in source
     assert "active = $active" in source
+
+
+def test_final_export_uses_adobe_print_pdf_jpeg_downsampling() -> None:
+    source = SCRIPT.read_text(encoding="utf-8")
+
+    assert "$app.PDFExportPreferences" in source
+    assert "$app.InteractivePDFExportPreferences" not in source
+    assert "$doc.Export($PRINT_PDF, $destination, $false)" in source
+    assert "$Preferences.ColorBitmapCompression = $BITMAP_COMPRESSION_JPEG" in source
+    assert "$Preferences.ColorBitmapQuality = $COMPRESSION_QUALITY_HIGH" in source
+    assert "$Preferences.ColorBitmapSamplingDPI = $Resolution" in source
+    assert "$Preferences.GrayscaleBitmapSamplingDPI = $Resolution" in source

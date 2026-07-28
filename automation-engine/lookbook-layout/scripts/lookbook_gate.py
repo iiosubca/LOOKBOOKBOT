@@ -72,6 +72,7 @@ CAPTION_CLEARANCE_COLLISION = "COLLISION"
 CAPTION_CLEARANCE_REVIEW = "REVIEW"
 CAPTION_CLEARANCE_OVERFLOW = "OVERFLOW"
 REFERENCE_ORDER_SCHEMA = 1
+FINAL_EXPORT_FORMAT = "adobe-pdf-print-v1"
 # The review PDF and the current-master proof use different InDesign export
 # resolutions. Their page pixels are therefore not byte-identical. The 96/120
 # ppi native-export regression is stable below 400 bits, while actual swapped
@@ -3930,11 +3931,11 @@ def final_output_specs(project: Path, state: dict[str, Any]) -> list[dict[str, A
     stem = master.stem
     expected_pages = int(state["expected_pages"])
     return [
-        {"key": "full_10mb", "path": f"{stem}_10mb.pdf", "raster_ppi": 120, "page_range": "ALL", "expected_pages": expected_pages, "image_compression": "jpeg", "jpeg_quality": "high"},
-        {"key": "full_20mb", "path": f"{stem}_20mb.pdf", "raster_ppi": 220, "page_range": "ALL", "expected_pages": expected_pages, "image_compression": "jpeg", "jpeg_quality": "high"},
-        {"key": "full_40mb", "path": f"{stem}_40mb.pdf", "raster_ppi": 300, "page_range": "ALL", "expected_pages": expected_pages, "image_compression": "jpeg", "jpeg_quality": "high"},
-        {"key": "male_300ppi", "path": f"Gender/{stem}_M.pdf", "raster_ppi": 300, "page_range": compact_page_range(gender_pages["M"]), "expected_pages": len(gender_pages["M"]), "image_compression": "jpeg", "jpeg_quality": "high"},
-        {"key": "female_300ppi", "path": f"Gender/{stem}_W.pdf", "raster_ppi": 300, "page_range": compact_page_range(gender_pages["W"]), "expected_pages": len(gender_pages["W"]), "image_compression": "jpeg", "jpeg_quality": "high"},
+        {"key": "full_10mb", "path": f"{stem}_10mb.pdf", "raster_ppi": 120, "page_range": "ALL", "expected_pages": expected_pages, "image_compression": "jpeg", "jpeg_quality": "high", "export_format": FINAL_EXPORT_FORMAT},
+        {"key": "full_20mb", "path": f"{stem}_20mb.pdf", "raster_ppi": 220, "page_range": "ALL", "expected_pages": expected_pages, "image_compression": "jpeg", "jpeg_quality": "high", "export_format": FINAL_EXPORT_FORMAT},
+        {"key": "full_40mb", "path": f"{stem}_40mb.pdf", "raster_ppi": 300, "page_range": "ALL", "expected_pages": expected_pages, "image_compression": "jpeg", "jpeg_quality": "high", "export_format": FINAL_EXPORT_FORMAT},
+        {"key": "male_300ppi", "path": f"Gender/{stem}_M.pdf", "raster_ppi": 300, "page_range": compact_page_range(gender_pages["M"]), "expected_pages": len(gender_pages["M"]), "image_compression": "jpeg", "jpeg_quality": "high", "export_format": FINAL_EXPORT_FORMAT},
+        {"key": "female_300ppi", "path": f"Gender/{stem}_W.pdf", "raster_ppi": 300, "page_range": compact_page_range(gender_pages["W"]), "expected_pages": len(gender_pages["W"]), "image_compression": "jpeg", "jpeg_quality": "high", "export_format": FINAL_EXPORT_FORMAT},
     ]
 
 
@@ -4032,6 +4033,43 @@ def command_begin_revision(args: argparse.Namespace) -> None:
     print("Apply only the recorded corrections to this new INDD, then repeat composition plan, native crop application, pair proof, visual confirmations, release, and review-PDF verification.")
 
 
+def supersede_legacy_final_exports(project: Path, manifest: dict[str, Any]) -> list[str]:
+    """Archive old interactive-PDF outputs before rebuilding them as Print PDFs.
+
+    The files are generated deliverables, but they may already have been sent
+    for review.  Never silently delete them: preserve the exact previous bytes
+    inside the controlled work area and invalidate only their final-export
+    attestations.  A rerun then writes the corrected files at the same public
+    destination and validates them normally.
+    """
+    legacy = [
+        entry for entry in manifest.get("outputs", [])
+        if entry.get("export_format") != FINAL_EXPORT_FORMAT
+    ]
+    if not legacy:
+        return []
+    archive_root = work_path(project) / "superseded-final-pdf" / utc_now().replace(":", "-")
+    archived: list[str] = []
+    for entry in legacy:
+        relative = Path(str(entry["path"]))
+        destination = child_of(project, str(relative))
+        if destination.exists():
+            backup = archive_root / relative
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(destination), str(backup))
+            archived.append(str(relative))
+        for key in ("identity", "sha256", "page_count", "rendered_samples", "verified_at"):
+            entry.pop(key, None)
+        entry["image_compression"] = "jpeg"
+        entry["jpeg_quality"] = "high"
+        entry["export_format"] = FINAL_EXPORT_FORMAT
+    manifest["status"] = "in_progress"
+    manifest.pop("completed_at", None)
+    manifest["export_format_upgraded_at"] = utc_now()
+    manifest["superseded_exports"] = archived
+    return archived
+
+
 def command_publish_final(args: argparse.Namespace) -> None:
     project = project_path(args.project)
     assert_project_root_clean(project)
@@ -4054,17 +4092,21 @@ def command_publish_final(args: argparse.Namespace) -> None:
             fail("Existing final-deliverables record belongs to another master or session.")
         if manifest.get("release_evidence_sha256") != digest(evidence_file(project, "release")):
             fail("Release evidence changed after final publishing began.")
-        # Older interrupted releases did not record compression metadata.
-        # Their page plan remains valid, so backfill the fixed export settings
-        # rather than refusing a safe resume.
+        # Older releases used Interactive PDF. Their page plan remains valid,
+        # but the output must be rebuilt because its PPI setting does not
+        # downsample placed catalogue images like Adobe PDF (Print) does.
         spec_keys = ("key", "path", "raster_ppi", "page_range", "expected_pages")
         existing_specs = [{key: entry.get(key) for key in spec_keys} for entry in manifest.get("outputs", [])]
         planned_specs = [{key: entry.get(key) for key in spec_keys} for entry in specs]
         if existing_specs != planned_specs:
             fail("Existing final-deliverables plan does not match current gender mapping or required filenames.")
+        archived = supersede_legacy_final_exports(project, manifest)
+        if archived:
+            print("FINAL EXPORT UPGRADE: archived prior interactive-PDF files and will rebuild them as Adobe PDF (Print): " + ", ".join(archived))
         for entry in manifest["outputs"]:
             entry["image_compression"] = "jpeg"
             entry["jpeg_quality"] = "high"
+            entry["export_format"] = FINAL_EXPORT_FORMAT
         write_json(manifest_path, manifest)
     else:
         for spec in specs:

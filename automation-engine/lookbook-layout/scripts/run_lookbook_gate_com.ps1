@@ -20,12 +20,14 @@ $LOC_BEFORE = 1650812527
 $FIT_FILL_PROPORTIONALLY = 1718185072
 $SAVE_NO = 1852776480
 $ALL_PAGES = 1886547553
-$INTERACTIVE_PDF = 1952409936
-# Interactive-PDF export constants from the installed InDesign COM type
-# library.  Always declare them here instead of inheriting the last setting
-# used manually in InDesign: every lookbook export must use lossy JPEG / High.
-$PDF_RASTER_COMPRESSION_JPEG = 1936878179 # PDFRasterCompression.JPEG
-$PDF_JPEG_QUALITY_HIGH = 1701726313       # PDFJPEGQuality.HIGH
+$PRINT_PDF = 1952403524 # ExportFormat.PDF_TYPE
+# Adobe PDF (Print) export constants from the installed InDesign 2026 COM
+# type library.  Interactive PDF has a separate raster path and does not
+# control the downsampling of placed catalogue photography.  The final
+# lookbook must instead use the regular Adobe PDF export preferences below.
+$BITMAP_COMPRESSION_JPEG = 1785751398 # BitmapCompression.JPEG
+$COMPRESSION_QUALITY_HIGH = 1701726313 # CompressionQuality.HIGH
+$BICUBIC_DOWNSAMPLE = 1650742125 # Sampling.BICUBIC_DOWNSAMPLE
 $MAX_COMPOSITION_SHIFT_POINTS = 36.0      # retain the centred editorial crop
 $LINK_NORMAL = 1852797549
 $TOP_ALIGN = 1953460256 # VerticalJustification.TOP_ALIGN
@@ -1541,7 +1543,25 @@ function Invoke-Gate([string]$ProjectPath, [string]$GateName) {
         throw
     }
 }
-function Export-InteractivePdf([string]$ProjectPath, [string]$PdfPath, [int]$Resolution, [string]$RequestedPageRange) {
+function Set-AdobePrintPdfPreferences($Preferences, [int]$Resolution, [string]$RequestedPageRange) {
+    # Set both colour and grayscale paths explicitly.  A fashion lookbook is
+    # normally colour, but source JPEGs or a PDF reference can contain
+    # grayscale images and must obey the same requested PPI / JPEG quality.
+    $Preferences.ColorBitmapCompression = $BITMAP_COMPRESSION_JPEG
+    $Preferences.ColorBitmapQuality = $COMPRESSION_QUALITY_HIGH
+    $Preferences.ColorBitmapSampling = $BICUBIC_DOWNSAMPLE
+    $Preferences.ColorBitmapSamplingDPI = $Resolution
+    $Preferences.GrayscaleBitmapCompression = $BITMAP_COMPRESSION_JPEG
+    $Preferences.GrayscaleBitmapQuality = $COMPRESSION_QUALITY_HIGH
+    $Preferences.GrayscaleBitmapSampling = $BICUBIC_DOWNSAMPLE
+    $Preferences.GrayscaleBitmapSamplingDPI = $Resolution
+    if ([string]::IsNullOrWhiteSpace($RequestedPageRange) -or $RequestedPageRange -eq 'ALL') { $Preferences.PageRange = $ALL_PAGES }
+    else { $Preferences.PageRange = [string]$RequestedPageRange }
+    $Preferences.ExportReaderSpreads = $false
+    $Preferences.ViewPDF = $false
+    $Preferences.OptimizePDF = $true
+}
+function Export-AdobePrintPdf([string]$ProjectPath, [string]$PdfPath, [int]$Resolution, [string]$RequestedPageRange) {
     $projectFull = [System.IO.Path]::GetFullPath($ProjectPath)
     $state = Read-Json (Join-Path $projectFull 'control\lookbook-state.json')
     $masterPath = Join-Path $projectFull ([string]$state.master)
@@ -1550,30 +1570,18 @@ function Export-InteractivePdf([string]$ProjectPath, [string]$PdfPath, [int]$Res
     $doc = $null
     try {
         $doc = Open-AutomationDocument $app $masterPath
-        $prefs = $app.InteractivePDFExportPreferences
-        # A single multi-page file with reader spreads disabled is required for
-        # controlled verification. ExportAsSinglePages=$true creates a folder
-        # of one-PDF-per-page files, which can never match the permitted path.
-        # Do not inherit a user's last export-dialog selection.  The three
-        # final variants differ only by their requested PPI; all use the same
-        # approved JPEG (lossy) / High quality setting.
-        $prefs.PDFRasterCompression = $PDF_RASTER_COMPRESSION_JPEG
-        $prefs.PDFJPEGQuality = $PDF_JPEG_QUALITY_HIGH
-        $prefs.RasterResolution = $Resolution
-        if ([string]::IsNullOrWhiteSpace($RequestedPageRange) -or $RequestedPageRange -eq 'ALL') { $prefs.PageRange = $ALL_PAGES }
-        else { $prefs.PageRange = $RequestedPageRange }
-        $prefs.ExportAsSinglePages = $false
-        $prefs.ExportReaderSpreads = $false; $prefs.ViewPDF = $false
-        $doc.Export($INTERACTIVE_PDF, $PdfPath, $false)
+        $prefs = $app.PDFExportPreferences
+        Set-AdobePrintPdfPreferences $prefs $Resolution $RequestedPageRange
+        $doc.Export($PRINT_PDF, $PdfPath, $false)
         $doc.Close($SAVE_NO); $doc = $null
-        if (-not (Test-Path -LiteralPath $PdfPath -PathType Leaf) -or (Get-Item -LiteralPath $PdfPath).Length -lt 512) { Fail 'InDesign did not create a usable interactive PDF.' }
-        Write-Output "COM_EXPORT_PASS $PdfPath jpeg=high ppi=$Resolution pages=$RequestedPageRange"
+        if (-not (Test-Path -LiteralPath $PdfPath -PathType Leaf) -or (Get-Item -LiteralPath $PdfPath).Length -lt 512) { Fail 'InDesign did not create a usable Adobe PDF.' }
+        Write-Output "COM_EXPORT_PASS $PdfPath format=adobe-print jpeg=high ppi=$Resolution pages=$RequestedPageRange"
     } catch {
         if ($null -ne $doc) { try { $doc.Close($SAVE_NO) } catch {} }
         throw
     }
 }
-function Export-InteractivePdfSet([string]$ProjectPath, [string]$PlanPath) {
+function Export-AdobePrintPdfSet([string]$ProjectPath, [string]$PlanPath) {
     # One controlled InDesign document session for the five post-approval PDFs.
     # Each completed file is checkpointed immediately; verification remains in
     # Python and an interrupted rerun exports only absent destinations.
@@ -1592,7 +1600,7 @@ function Export-InteractivePdfSet([string]$ProjectPath, [string]$PlanPath) {
     $doc = $null; $completed = @()
     try {
         $doc = Open-AutomationDocument $app $masterPath
-        $prefs = $app.InteractivePDFExportPreferences
+        $prefs = $app.PDFExportPreferences
         foreach ($entry in $entries) {
             $relative = [string]$entry.path
             if ([string]::IsNullOrWhiteSpace($relative)) { Fail 'Final export plan contains an empty destination.' }
@@ -1608,15 +1616,10 @@ function Export-InteractivePdfSet([string]$ProjectPath, [string]$PlanPath) {
                 continue
             }
             [System.IO.Directory]::CreateDirectory((Split-Path -Parent $destination)) | Out-Null
-            $prefs.PDFRasterCompression = $PDF_RASTER_COMPRESSION_JPEG
-            $prefs.PDFJPEGQuality = $PDF_JPEG_QUALITY_HIGH
-            $prefs.RasterResolution = $resolution
             # Assign a scalar in each branch.  PowerShell turns an inline
             # ``if`` expression into an Object[] when it crosses the COM
             # boundary, which InDesign rejects for non-ALL gender ranges.
-            if ($range -eq 'ALL') { $prefs.PageRange = $ALL_PAGES }
-            else { $prefs.PageRange = [string]$range }
-            $prefs.ExportAsSinglePages = $false; $prefs.ExportReaderSpreads = $false; $prefs.ViewPDF = $false
+            Set-AdobePrintPdfPreferences $prefs $resolution $range
             $active = [ordered]@{
                 path = $relative; raster_ppi = $resolution; page_range = $range; status = 'exporting'
                 started_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
@@ -1625,14 +1628,14 @@ function Export-InteractivePdfSet([string]$ProjectPath, [string]$PlanPath) {
                 schema = 1; session_id = [string]$state.session_id; master = Master-Identity $masterPath
                 completed = @($completed); active = $active; updated_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
             })
-            $doc.Export($INTERACTIVE_PDF, $destination, $false)
+            $doc.Export($PRINT_PDF, $destination, $false)
             if (-not (Test-Path -LiteralPath $destination -PathType Leaf) -or (Get-Item -LiteralPath $destination).Length -lt 512) { Fail "InDesign did not create a usable final PDF: $relative" }
             $completed += [ordered]@{ path = $relative; raster_ppi = $resolution; page_range = $range; jpeg_quality = 'high'; completed_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') }
             Write-Json (Join-Path $control 'progress\final-export.json') ([ordered]@{
                 schema = 1; session_id = [string]$state.session_id; master = Master-Identity $masterPath
                 completed = @($completed); active = $null; updated_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
             })
-            Write-Output "COM_FINAL_EXPORT_CHECKPOINT $relative jpeg=high ppi=$resolution"
+            Write-Output "COM_FINAL_EXPORT_CHECKPOINT $relative format=adobe-print jpeg=high ppi=$resolution"
         }
         $doc.Close($SAVE_NO); $doc = $null
         Write-Output "COM_FINAL_EXPORT_SET_PASS $($completed.Count)/$($entries.Count)"
@@ -1676,8 +1679,8 @@ try {
     elseif ($Action -eq 'ReapplyComposition') { Invoke-Composition $Project $BatchSize $true }
     elseif ($Action -eq 'RepairCaptions') { Invoke-CaptionRepair $Project $BatchSize }
     elseif ($Action -eq 'AuditCaptionClearance') { Export-CaptionClearanceLayout $Project }
-    elseif ($Action -eq 'ExportPdf') { Export-InteractivePdf $Project $Pdf $RasterResolution $PageRange }
-    elseif ($Action -eq 'ExportPdfSet') { Export-InteractivePdfSet $Project $ExportPlan }
+    elseif ($Action -eq 'ExportPdf') { Export-AdobePrintPdf $Project $Pdf $RasterResolution $PageRange }
+    elseif ($Action -eq 'ExportPdfSet') { Export-AdobePrintPdfSet $Project $ExportPlan }
     elseif ($Action -eq 'PrepareTemplate') { Prepare-Template $TemplateSource $TemplateDestination }
 } catch {
     # Native COM errors can be swallowed by a child PowerShell process when
