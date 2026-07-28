@@ -85,6 +85,18 @@ def test_normal_pdf_text_geometry_keeps_measured_glyph_bounds() -> None:
     assert source == "pdf-glyph-coordinates"
 
 
+def test_clearance_status_ignores_scattered_background_texture() -> None:
+    status, _reason = gate._caption_clearance_status(0.009323, 0.000065)
+
+    assert status == gate.CAPTION_CLEARANCE_CLEAR
+
+
+def test_clearance_status_keeps_a_contiguous_model_component_blocked() -> None:
+    status, _reason = gate._caption_clearance_status(0.009323, 0.009323)
+
+    assert status == gate.CAPTION_CLEARANCE_COLLISION
+
+
 def test_clearance_retry_rebases_stale_delta_baseline_to_current_master(tmp_path: Path) -> None:
     project = tmp_path / "project"
     control = project / "control" / "visual"

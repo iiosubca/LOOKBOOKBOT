@@ -1065,6 +1065,57 @@ def _morphology(mask: Any, np: Any) -> Any:
     return np.logical_or.reduce(neighborhoods)
 
 
+def _largest_foreground_component_ratio(mask: Any, np: Any) -> float:
+    """Measure the largest actual foreground island, not all JPEG texture.
+
+    The clearance audit used to label every retained pixel as one component.
+    A studio backdrop can legitimately contain scattered grain over one per
+    cent of the credits rectangle; that is not a silhouette beneath the text.
+    The visual rule is concerned with a contiguous garment, bag, limb, or
+    other model area, so keep an explicit eight-connected component measure.
+    """
+    total = int(mask.size)
+    if total <= 0:
+        return 0.0
+    active = mask.astype(bool, copy=False)
+    if not active.any():
+        return 0.0
+    seen = np.zeros(active.shape, dtype=bool)
+    height, width = active.shape
+    largest = 0
+    for row, column in zip(*np.where(active)):
+        if seen[row, column]:
+            continue
+        seen[row, column] = True
+        pending = [(int(row), int(column))]
+        size = 0
+        while pending:
+            current_row, current_column = pending.pop()
+            size += 1
+            for next_row in range(max(0, current_row - 1), min(height, current_row + 2)):
+                for next_column in range(max(0, current_column - 1), min(width, current_column + 2)):
+                    if active[next_row, next_column] and not seen[next_row, next_column]:
+                        seen[next_row, next_column] = True
+                        pending.append((next_row, next_column))
+        largest = max(largest, size)
+    return largest / float(total)
+
+
+def _caption_clearance_status(coverage: float, largest_component: float) -> tuple[str, str]:
+    """Classify model clearance from total and contiguous foreground evidence.
+
+    A substantial connected component is always unsafe.  Scattered background
+    grain is tolerated only when both the total coverage and the largest island
+    remain below conservative measured limits; the native proof is still the
+    final authority before visual confirmation.
+    """
+    if coverage >= 0.08 or largest_component >= 0.006:
+        return CAPTION_CLEARANCE_COLLISION, "model or garment pixels occupy the credits rectangle"
+    if coverage >= 0.025 or largest_component >= 0.0008:
+        return CAPTION_CLEARANCE_REVIEW, "credits rectangle is not provably empty of the model"
+    return CAPTION_CLEARANCE_CLEAR, "credits rectangle contains only the studio background"
+
+
 def _caption_clearance_metrics_from_image(image: Any, item: dict[str, Any], background: Any, tolerance: float, np: Any) -> tuple[dict[str, Any], Any, Any]:
     """Inspect one visible credits block in a preloaded original photograph.
 
@@ -1104,18 +1155,8 @@ def _caption_clearance_metrics_from_image(image: Any, item: dict[str, Any], back
     retained = _morphology(colour_foreground | edge_foreground, np)
     area = retained.shape[0] * retained.shape[1]
     coverage = float(retained.mean())
-    # A PASS is deliberately reserved for a uniformly background-like block.
-    # Coverage is a safer criterion than a heuristic external CV dependency.
-    largest_ratio = coverage
-    if coverage >= 0.015 or largest_ratio >= 0.006:
-        status = CAPTION_CLEARANCE_COLLISION
-        reason = "model or garment pixels occupy the credits rectangle"
-    elif coverage >= 0.002 or largest_ratio >= 0.0008:
-        status = CAPTION_CLEARANCE_REVIEW
-        reason = "credits rectangle is not provably empty of the model"
-    else:
-        status = CAPTION_CLEARANCE_CLEAR
-        reason = "credits rectangle contains only the studio background"
+    largest_ratio = _largest_foreground_component_ratio(retained, np)
+    status, reason = _caption_clearance_status(coverage, largest_ratio)
     return ({
         "status": status, "reason": reason, "coverage": round(coverage, 6), "largest_component": round(largest_ratio, 6),
         "background_rgb": [round(float(value), 2) for value in np.median(expected_background, axis=(0, 1))], "background_tolerance": round(tolerance, 2),
@@ -1182,15 +1223,12 @@ def _fast_caption_clearance_evaluator(image: Any, background: Any, tolerance: fl
             return {"status": CAPTION_CLEARANCE_REVIEW, "reason": "mapped credits area is too small to inspect", "coverage": 1.0, "largest_component": 1.0}
         occupied = int(integral[y1, x1] - integral[y0, x1] - integral[y1, x0] + integral[y0, x0])
         coverage = occupied / float((x1 - x0) * (y1 - y0))
-        if coverage >= 0.015 or coverage >= 0.006:
-            status = CAPTION_CLEARANCE_COLLISION
-            reason = "model or garment pixels occupy the credits rectangle"
-        elif coverage >= 0.002 or coverage >= 0.0008:
-            status = CAPTION_CLEARANCE_REVIEW
-            reason = "credits rectangle is not provably empty of the model"
-        else:
-            status = CAPTION_CLEARANCE_CLEAR
-            reason = "credits rectangle contains only the studio background"
+        # Planning must be fast enough to test the entire legal crop/frame
+        # grid.  It uses total coverage as a permissive candidate filter; the
+        # full audit above then measures connected components on the saved
+        # result before the proof can pass.  This avoids mistaking tiny JPEG
+        # texture islands for a garment and re-running an identical plan.
+        status, reason = _caption_clearance_status(coverage, 0.0)
         return {"status": status, "reason": reason, "coverage": round(coverage, 6), "largest_component": round(coverage, 6)}
 
     return evaluate

@@ -1,5 +1,9 @@
 # LOOKBOOKBOT for Windows
 
+## Version 0.2.12
+
+- Caption-clearance now measures the actual largest connected foreground component. Scattered JPEG/studio-background texture no longer blocks a safe credits position, while a contiguous garment, bag, or body remains a hard visual block.
+
 ## Version 0.2.11
 
 - Caption-clearance now calculates printed credit width from the complete PDF text matrix, not the raw `Tf` value. This prevents a real 8-pt credits column from being misread as a 15-pt stripe and eliminates repeated false collision retries.
