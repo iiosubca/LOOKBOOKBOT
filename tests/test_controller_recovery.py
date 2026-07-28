@@ -121,6 +121,7 @@ def test_safe_restart_waits_for_a_cold_indesign_launch(tmp_path: Path, monkeypat
     script = base64.b64decode(command[-1]).decode("utf-16-le")
     assert str(master) in script
     assert "function Start-NeutralInstance" in script
+    assert "Start-Process -FilePath $Executable -PassThru" in script
     assert "$afterFirstLaunch.Count -ne 0" in script
 
 

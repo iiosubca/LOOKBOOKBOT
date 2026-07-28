@@ -295,7 +295,10 @@ function Wait-NeutralStartWindow {
 }
 
 function Start-NeutralInstance([string]$Executable) {
-    Start-Process -FilePath $Executable -WindowStyle Hidden
+    # InDesign needs a normal GUI window even when no document is open.  A
+    # hidden start produces an empty window title, which is indistinguishable
+    # from an unsafe unknown document after a later COM dropout.
+    Start-Process -FilePath $Executable -PassThru | Out-Null
     return Wait-NeutralStartWindow
 }
 

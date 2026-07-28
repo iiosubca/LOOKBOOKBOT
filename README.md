@@ -1,5 +1,9 @@
 # LOOKBOOKBOT for Windows
 
+## Version 0.2.16
+
+- A recovery-started InDesign instance now retains its normal document-free start window instead of being hidden. The hidden start could later report an empty title and trigger a false safety block even though the app had launched the instance itself.
+
 ## Version 0.2.15
 
 - Windows PowerShell recovery now receives the controlled master path inside an encoded script rather than as a parameter after `-Command`. That parameter was silently lost in the packaged app, causing a false safety refusal even with one neutral, document-free InDesign instance.
