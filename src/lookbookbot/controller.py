@@ -47,13 +47,13 @@ def final_outputs_passed(project: Path) -> bool:
     complete = manifest.get("passed") is True or manifest.get("complete") is True or status in {"pass", "passed", "complete"}
     outputs = manifest.get("outputs")
     # Do not treat the legacy Interactive-PDF outputs as final: their PPI was
-    # not a placed-image downsampling setting.  A resumed final stage archives
-    # those files safely and regenerates them with Adobe PDF (Print).
+    # not a placed-image downsampling setting. A resumed final stage archives
+    # those files safely and regenerates them with Adobe PDF (Print), JPEG Medium.
     return bool(
         complete
         and isinstance(outputs, list)
         and len(outputs) == 5
-        and all(isinstance(item, dict) and item.get("export_format") == "adobe-pdf-print-v1" for item in outputs)
+        and all(isinstance(item, dict) and item.get("export_format") == "adobe-pdf-print-jpeg-medium-v1" for item in outputs)
     )
 
 

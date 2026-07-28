@@ -28,6 +28,7 @@ def test_final_export_uses_adobe_print_pdf_jpeg_downsampling() -> None:
     assert "$app.InteractivePDFExportPreferences" not in source
     assert "$doc.Export($PRINT_PDF, $destination, $false)" in source
     assert "$Preferences.ColorBitmapCompression = $BITMAP_COMPRESSION_JPEG" in source
-    assert "$Preferences.ColorBitmapQuality = $COMPRESSION_QUALITY_HIGH" in source
+    assert "$Preferences.ColorBitmapQuality = $COMPRESSION_QUALITY_MEDIUM" in source
     assert "$Preferences.ColorBitmapSamplingDPI = $Resolution" in source
     assert "$Preferences.GrayscaleBitmapSamplingDPI = $Resolution" in source
+    assert "$COMPRESSION_QUALITY_MEDIUM = 1701727588" in source

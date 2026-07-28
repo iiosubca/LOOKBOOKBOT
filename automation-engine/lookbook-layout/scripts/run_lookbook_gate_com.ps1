@@ -26,7 +26,7 @@ $PRINT_PDF = 1952403524 # ExportFormat.PDF_TYPE
 # control the downsampling of placed catalogue photography.  The final
 # lookbook must instead use the regular Adobe PDF export preferences below.
 $BITMAP_COMPRESSION_JPEG = 1785751398 # BitmapCompression.JPEG
-$COMPRESSION_QUALITY_HIGH = 1701726313 # CompressionQuality.HIGH
+$COMPRESSION_QUALITY_MEDIUM = 1701727588 # CompressionQuality.MEDIUM
 $BICUBIC_DOWNSAMPLE = 1650742125 # Sampling.BICUBIC_DOWNSAMPLE
 $MAX_COMPOSITION_SHIFT_POINTS = 36.0      # retain the centred editorial crop
 $LINK_NORMAL = 1852797549
@@ -1548,11 +1548,11 @@ function Set-AdobePrintPdfPreferences($Preferences, [int]$Resolution, [string]$R
     # normally colour, but source JPEGs or a PDF reference can contain
     # grayscale images and must obey the same requested PPI / JPEG quality.
     $Preferences.ColorBitmapCompression = $BITMAP_COMPRESSION_JPEG
-    $Preferences.ColorBitmapQuality = $COMPRESSION_QUALITY_HIGH
+    $Preferences.ColorBitmapQuality = $COMPRESSION_QUALITY_MEDIUM
     $Preferences.ColorBitmapSampling = $BICUBIC_DOWNSAMPLE
     $Preferences.ColorBitmapSamplingDPI = $Resolution
     $Preferences.GrayscaleBitmapCompression = $BITMAP_COMPRESSION_JPEG
-    $Preferences.GrayscaleBitmapQuality = $COMPRESSION_QUALITY_HIGH
+    $Preferences.GrayscaleBitmapQuality = $COMPRESSION_QUALITY_MEDIUM
     $Preferences.GrayscaleBitmapSampling = $BICUBIC_DOWNSAMPLE
     $Preferences.GrayscaleBitmapSamplingDPI = $Resolution
     if ([string]::IsNullOrWhiteSpace($RequestedPageRange) -or $RequestedPageRange -eq 'ALL') { $Preferences.PageRange = $ALL_PAGES }
@@ -1575,7 +1575,7 @@ function Export-AdobePrintPdf([string]$ProjectPath, [string]$PdfPath, [int]$Reso
         $doc.Export($PRINT_PDF, $PdfPath, $false)
         $doc.Close($SAVE_NO); $doc = $null
         if (-not (Test-Path -LiteralPath $PdfPath -PathType Leaf) -or (Get-Item -LiteralPath $PdfPath).Length -lt 512) { Fail 'InDesign did not create a usable Adobe PDF.' }
-        Write-Output "COM_EXPORT_PASS $PdfPath format=adobe-print jpeg=high ppi=$Resolution pages=$RequestedPageRange"
+        Write-Output "COM_EXPORT_PASS $PdfPath format=adobe-print jpeg=medium ppi=$Resolution pages=$RequestedPageRange"
     } catch {
         if ($null -ne $doc) { try { $doc.Close($SAVE_NO) } catch {} }
         throw
@@ -1630,12 +1630,12 @@ function Export-AdobePrintPdfSet([string]$ProjectPath, [string]$PlanPath) {
             })
             $doc.Export($PRINT_PDF, $destination, $false)
             if (-not (Test-Path -LiteralPath $destination -PathType Leaf) -or (Get-Item -LiteralPath $destination).Length -lt 512) { Fail "InDesign did not create a usable final PDF: $relative" }
-            $completed += [ordered]@{ path = $relative; raster_ppi = $resolution; page_range = $range; jpeg_quality = 'high'; completed_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') }
+            $completed += [ordered]@{ path = $relative; raster_ppi = $resolution; page_range = $range; jpeg_quality = 'medium'; completed_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') }
             Write-Json (Join-Path $control 'progress\final-export.json') ([ordered]@{
                 schema = 1; session_id = [string]$state.session_id; master = Master-Identity $masterPath
                 completed = @($completed); active = $null; updated_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
             })
-            Write-Output "COM_FINAL_EXPORT_CHECKPOINT $relative format=adobe-print jpeg=high ppi=$resolution"
+            Write-Output "COM_FINAL_EXPORT_CHECKPOINT $relative format=adobe-print jpeg=medium ppi=$resolution"
         }
         $doc.Close($SAVE_NO); $doc = $null
         Write-Output "COM_FINAL_EXPORT_SET_PASS $($completed.Count)/$($entries.Count)"

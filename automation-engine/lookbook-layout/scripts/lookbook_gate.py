@@ -72,7 +72,7 @@ CAPTION_CLEARANCE_COLLISION = "COLLISION"
 CAPTION_CLEARANCE_REVIEW = "REVIEW"
 CAPTION_CLEARANCE_OVERFLOW = "OVERFLOW"
 REFERENCE_ORDER_SCHEMA = 1
-FINAL_EXPORT_FORMAT = "adobe-pdf-print-v1"
+FINAL_EXPORT_FORMAT = "adobe-pdf-print-jpeg-medium-v1"
 # The review PDF and the current-master proof use different InDesign export
 # resolutions. Their page pixels are therefore not byte-identical. The 96/120
 # ppi native-export regression is stable below 400 bits, while actual swapped
@@ -3931,11 +3931,11 @@ def final_output_specs(project: Path, state: dict[str, Any]) -> list[dict[str, A
     stem = master.stem
     expected_pages = int(state["expected_pages"])
     return [
-        {"key": "full_10mb", "path": f"{stem}_10mb.pdf", "raster_ppi": 120, "page_range": "ALL", "expected_pages": expected_pages, "image_compression": "jpeg", "jpeg_quality": "high", "export_format": FINAL_EXPORT_FORMAT},
-        {"key": "full_20mb", "path": f"{stem}_20mb.pdf", "raster_ppi": 220, "page_range": "ALL", "expected_pages": expected_pages, "image_compression": "jpeg", "jpeg_quality": "high", "export_format": FINAL_EXPORT_FORMAT},
-        {"key": "full_40mb", "path": f"{stem}_40mb.pdf", "raster_ppi": 300, "page_range": "ALL", "expected_pages": expected_pages, "image_compression": "jpeg", "jpeg_quality": "high", "export_format": FINAL_EXPORT_FORMAT},
-        {"key": "male_300ppi", "path": f"Gender/{stem}_M.pdf", "raster_ppi": 300, "page_range": compact_page_range(gender_pages["M"]), "expected_pages": len(gender_pages["M"]), "image_compression": "jpeg", "jpeg_quality": "high", "export_format": FINAL_EXPORT_FORMAT},
-        {"key": "female_300ppi", "path": f"Gender/{stem}_W.pdf", "raster_ppi": 300, "page_range": compact_page_range(gender_pages["W"]), "expected_pages": len(gender_pages["W"]), "image_compression": "jpeg", "jpeg_quality": "high", "export_format": FINAL_EXPORT_FORMAT},
+        {"key": "full_10mb", "path": f"{stem}_10mb.pdf", "raster_ppi": 120, "page_range": "ALL", "expected_pages": expected_pages, "image_compression": "jpeg", "jpeg_quality": "medium", "export_format": FINAL_EXPORT_FORMAT},
+        {"key": "full_20mb", "path": f"{stem}_20mb.pdf", "raster_ppi": 220, "page_range": "ALL", "expected_pages": expected_pages, "image_compression": "jpeg", "jpeg_quality": "medium", "export_format": FINAL_EXPORT_FORMAT},
+        {"key": "full_40mb", "path": f"{stem}_40mb.pdf", "raster_ppi": 300, "page_range": "ALL", "expected_pages": expected_pages, "image_compression": "jpeg", "jpeg_quality": "medium", "export_format": FINAL_EXPORT_FORMAT},
+        {"key": "male_300ppi", "path": f"Gender/{stem}_M.pdf", "raster_ppi": 300, "page_range": compact_page_range(gender_pages["M"]), "expected_pages": len(gender_pages["M"]), "image_compression": "jpeg", "jpeg_quality": "medium", "export_format": FINAL_EXPORT_FORMAT},
+        {"key": "female_300ppi", "path": f"Gender/{stem}_W.pdf", "raster_ppi": 300, "page_range": compact_page_range(gender_pages["W"]), "expected_pages": len(gender_pages["W"]), "image_compression": "jpeg", "jpeg_quality": "medium", "export_format": FINAL_EXPORT_FORMAT},
     ]
 
 
@@ -4061,7 +4061,7 @@ def supersede_legacy_final_exports(project: Path, manifest: dict[str, Any]) -> l
         for key in ("identity", "sha256", "page_count", "rendered_samples", "verified_at"):
             entry.pop(key, None)
         entry["image_compression"] = "jpeg"
-        entry["jpeg_quality"] = "high"
+        entry["jpeg_quality"] = "medium"
         entry["export_format"] = FINAL_EXPORT_FORMAT
     manifest["status"] = "in_progress"
     manifest.pop("completed_at", None)
@@ -4092,9 +4092,9 @@ def command_publish_final(args: argparse.Namespace) -> None:
             fail("Existing final-deliverables record belongs to another master or session.")
         if manifest.get("release_evidence_sha256") != digest(evidence_file(project, "release")):
             fail("Release evidence changed after final publishing began.")
-        # Older releases used Interactive PDF. Their page plan remains valid,
-        # but the output must be rebuilt because its PPI setting does not
-        # downsample placed catalogue images like Adobe PDF (Print) does.
+        # Earlier releases used a different export profile. Their page plan
+        # remains valid, but each output must be rebuilt when either the PDF
+        # engine or requested JPEG quality changes.
         spec_keys = ("key", "path", "raster_ppi", "page_range", "expected_pages")
         existing_specs = [{key: entry.get(key) for key in spec_keys} for entry in manifest.get("outputs", [])]
         planned_specs = [{key: entry.get(key) for key in spec_keys} for entry in specs]
@@ -4105,7 +4105,7 @@ def command_publish_final(args: argparse.Namespace) -> None:
             print("FINAL EXPORT UPGRADE: archived prior interactive-PDF files and will rebuild them as Adobe PDF (Print): " + ", ".join(archived))
         for entry in manifest["outputs"]:
             entry["image_compression"] = "jpeg"
-            entry["jpeg_quality"] = "high"
+            entry["jpeg_quality"] = "medium"
             entry["export_format"] = FINAL_EXPORT_FORMAT
         write_json(manifest_path, manifest)
     else:
@@ -4176,7 +4176,7 @@ def command_publish_final(args: argparse.Namespace) -> None:
         entry["rendered_samples"] = samples
         entry["verified_at"] = utc_now()
         write_json(manifest_path, manifest)
-        print(f"FINAL CHECKPOINT: {entry['path']} (JPEG High, {entry['raster_ppi']} ppi, {page_count} pages)")
+        print(f"FINAL CHECKPOINT: {entry['path']} (JPEG Medium, {entry['raster_ppi']} ppi, {page_count} pages)")
     manifest["status"] = "complete"
     manifest["completed_at"] = utc_now()
     write_json(manifest_path, manifest)

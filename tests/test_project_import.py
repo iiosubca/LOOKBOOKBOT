@@ -33,11 +33,11 @@ def test_existing_project_restores_only_durable_evidence(tmp_path: Path) -> None
         (evidence / f"{gate}.json").write_text('{"passed": true}', encoding="utf-8")
     (control / "final-deliverables.json").write_text(
         '{"passed": true, "outputs": ['
-        '{"export_format": "adobe-pdf-print-v1"},'
-        '{"export_format": "adobe-pdf-print-v1"},'
-        '{"export_format": "adobe-pdf-print-v1"},'
-        '{"export_format": "adobe-pdf-print-v1"},'
-        '{"export_format": "adobe-pdf-print-v1"}'
+        '{"export_format": "adobe-pdf-print-jpeg-medium-v1"},'
+        '{"export_format": "adobe-pdf-print-jpeg-medium-v1"},'
+        '{"export_format": "adobe-pdf-print-jpeg-medium-v1"},'
+        '{"export_format": "adobe-pdf-print-jpeg-medium-v1"},'
+        '{"export_format": "adobe-pdf-print-jpeg-medium-v1"}'
         ']}',
         encoding="utf-8",
     )

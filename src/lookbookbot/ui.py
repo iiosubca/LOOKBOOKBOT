@@ -812,7 +812,7 @@ class MainWindow(QMainWindow):
         if not isinstance(outputs, list) or not outputs:
             return
         total = len(outputs)
-        required_format = "adobe-pdf-print-v1"
+        required_format = "adobe-pdf-print-jpeg-medium-v1"
         legacy_outputs = [
             output for output in outputs
             if isinstance(output, dict) and output.get("export_format") != required_format
@@ -849,7 +849,7 @@ class MainWindow(QMainWindow):
         self.final_export_progress.show()
         self.final_export_label.show()
         if legacy_outputs:
-            self.final_export_label.setText("Финальные PDF требуют повторного экспорта с JPEG High…")
+            self.final_export_label.setText("Финальные PDF требуют повторного экспорта с JPEG Medium…")
             return
         if str(manifest.get("status", "")).casefold() == "complete" and complete == total:
             self.final_export_label.setText(f"Финальные PDF готовы и проверены: {complete} из {total}")

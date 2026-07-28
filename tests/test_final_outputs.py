@@ -24,7 +24,7 @@ def test_legacy_interactive_final_outputs_are_not_accepted(tmp_path: Path) -> No
     assert final_outputs_passed(tmp_path) is False
 
 
-def test_print_pdf_final_outputs_are_accepted(tmp_path: Path) -> None:
-    _write_manifest(tmp_path, export_format="adobe-pdf-print-v1")
+def test_medium_print_pdf_final_outputs_are_accepted(tmp_path: Path) -> None:
+    _write_manifest(tmp_path, export_format="adobe-pdf-print-jpeg-medium-v1")
 
     assert final_outputs_passed(tmp_path) is True
