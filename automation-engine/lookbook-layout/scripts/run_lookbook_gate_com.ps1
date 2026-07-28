@@ -1611,12 +1611,27 @@ function Export-InteractivePdfSet([string]$ProjectPath, [string]$PlanPath) {
             $prefs.PDFRasterCompression = $PDF_RASTER_COMPRESSION_JPEG
             $prefs.PDFJPEGQuality = $PDF_JPEG_QUALITY_HIGH
             $prefs.RasterResolution = $resolution
-            $prefs.PageRange = if ($range -eq 'ALL') { $ALL_PAGES } else { $range }
+            # Assign a scalar in each branch.  PowerShell turns an inline
+            # ``if`` expression into an Object[] when it crosses the COM
+            # boundary, which InDesign rejects for non-ALL gender ranges.
+            if ($range -eq 'ALL') { $prefs.PageRange = $ALL_PAGES }
+            else { $prefs.PageRange = [string]$range }
             $prefs.ExportAsSinglePages = $false; $prefs.ExportReaderSpreads = $false; $prefs.ViewPDF = $false
+            $active = [ordered]@{
+                path = $relative; raster_ppi = $resolution; page_range = $range; status = 'exporting'
+                started_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+            }
+            Write-Json (Join-Path $control 'progress\final-export.json') ([ordered]@{
+                schema = 1; session_id = [string]$state.session_id; master = Master-Identity $masterPath
+                completed = @($completed); active = $active; updated_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+            })
             $doc.Export($INTERACTIVE_PDF, $destination, $false)
             if (-not (Test-Path -LiteralPath $destination -PathType Leaf) -or (Get-Item -LiteralPath $destination).Length -lt 512) { Fail "InDesign did not create a usable final PDF: $relative" }
             $completed += [ordered]@{ path = $relative; raster_ppi = $resolution; page_range = $range; jpeg_quality = 'high'; completed_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') }
-            Write-Json (Join-Path $control 'progress\final-export.json') ([ordered]@{ schema = 1; session_id = [string]$state.session_id; master = Master-Identity $masterPath; completed = @($completed) })
+            Write-Json (Join-Path $control 'progress\final-export.json') ([ordered]@{
+                schema = 1; session_id = [string]$state.session_id; master = Master-Identity $masterPath
+                completed = @($completed); active = $null; updated_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+            })
             Write-Output "COM_FINAL_EXPORT_CHECKPOINT $relative jpeg=high ppi=$resolution"
         }
         $doc.Close($SAVE_NO); $doc = $null

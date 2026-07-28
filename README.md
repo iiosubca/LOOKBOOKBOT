@@ -1,5 +1,10 @@
 # LOOKBOOKBOT for Windows
 
+## Version 0.2.17
+
+- Gender PDFs now assign their InDesign page range as a scalar COM value, fixing the invalid-cast failure after the three full-lookbook PDFs have been checkpointed.
+- Final-export progress now advances file by file from durable native checkpoints and names the PDF currently being written instead of staying at 0% until all five exports finish.
+
 ## Version 0.2.16
 
 - A recovery-started InDesign instance now retains its normal document-free start window instead of being hidden. The hidden start could later report an empty title and trigger a false safety block even though the app had launched the instance itself.

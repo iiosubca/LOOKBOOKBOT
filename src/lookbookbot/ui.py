@@ -811,20 +811,39 @@ class MainWindow(QMainWindow):
         if not isinstance(outputs, list) or not outputs:
             return
         total = len(outputs)
-        complete = sum(1 for output in outputs if isinstance(output, dict) and output.get("identity") and output.get("verified_at"))
+        verified = sum(1 for output in outputs if isinstance(output, dict) and output.get("identity") and output.get("verified_at"))
+        written = sum(
+            1
+            for output in outputs
+            if isinstance(output, dict)
+            and (self.project.project_dir / str(output.get("path", ""))).is_file()
+            and (self.project.project_dir / str(output.get("path", ""))).stat().st_size >= 512
+        )
+        progress_record = read_json(self.project.project_dir / "control" / "progress" / "final-export.json")
+        active = progress_record.get("active") if isinstance(progress_record.get("active"), dict) else None
+        complete = max(verified, written)
         current = next((output for output in outputs if isinstance(output, dict) and not output.get("identity")), None)
         self.final_export_progress.setRange(0, total)
         self.final_export_progress.setValue(complete)
+        self.final_export_progress.setFormat("%v / %m")
         self.final_export_progress.show()
         self.final_export_label.show()
         if str(manifest.get("status", "")).casefold() == "complete" and complete == total:
-            self.final_export_label.setText(f"Финальные PDF готовы: {complete} из {total}")
+            self.final_export_label.setText(f"Финальные PDF готовы и проверены: {complete} из {total}")
+            return
+        if active:
+            filename = Path(str(active.get("path", "PDF"))).name
+            position = min(complete + 1, total)
+            self.final_export_label.setText(f"Запись PDF {position} из {total}: {filename}")
+            return
+        if complete and complete < total:
+            self.final_export_label.setText(f"Записано {complete} из {total} PDF; готовится следующий файл…")
             return
         if isinstance(current, dict):
             filename = Path(str(current.get("path", "PDF"))).name
-            self.final_export_label.setText(f"Экспорт PDF {complete + 1} из {total}: {filename}")
+            self.final_export_label.setText(f"Подготовка PDF {complete + 1} из {total}: {filename}")
         else:
-            self.final_export_label.setText(f"Проверка финальных PDF: {complete} из {total}")
+            self.final_export_label.setText(f"Проверка финальных PDF: {verified} из {total}")
 
     def _refresh_stages(self) -> None:
         rows = self.store.stage_rows(self.project.id) if self.project else {}
