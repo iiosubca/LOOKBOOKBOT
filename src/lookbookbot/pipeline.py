@@ -624,15 +624,36 @@ class PipelineEngine:
         raise ReviewRequired("Caption clearance не удалось довести до CLEAR за шесть контролируемых итераций.")
 
     def _run_parallel_codex_visual(self, project: ProjectRecord, provider: CodexProvider) -> None:
-        """Inspect disjoint proof batches concurrently; keep InDesign and PASS single-writer."""
+        """Inspect proof cards concurrently and commit accepted checks serially.
+
+        A vision worker is intentionally read-only: it receives the actual JPG
+        proof cards and returns a JSON decision.  The coordinator is the only
+        component allowed to write a ``confirm-visual-look`` record.  This
+        avoids a fragile failure mode where an agent correctly inspects a card
+        but forgets to invoke the confirmation command afterwards.
+        """
         root = project.project_dir
         pairs = self._prepare_visual_proof(project)
         confirmations = root / "control" / "visual" / "confirmations"
         pending = [proof for proof in pairs if not (confirmations / f"{proof.stem}.json").is_file()]
-        batches = _path_batches(pending, size=5)
-        if batches:
+        decisions: dict[str, VisionDecision] = {}
+        unresolved = pending
+        diagnostics: dict[str, str] = {}
+
+        # A missing decision is a transient worker failure, not a reason to
+        # ask the operator to click Continue.  Retry only those exact proof
+        # cards with fresh, explicitly attached images.  Confirmed cards are
+        # never rendered or reviewed again.
+        for attempt in range(1, 4):
+            if not unresolved:
+                break
+            batches = _path_batches(unresolved, size=5)
             workers = min(4, len(batches))
-            self.log(f"Визуальная проверка: {len(pending)} разворотов в {len(batches)} независимых пакетах, одновременно до {workers}.")
+            self.log(
+                f"Визуальная проверка, попытка {attempt}/3: {len(unresolved)} разворотов "
+                f"в {len(batches)} независимых пакетах, одновременно до {workers}."
+            )
+            attempt_decisions: dict[str, VisionDecision] = {}
             failures: list[str] = []
             with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="lookbook-visual") as executor:
                 futures = {
@@ -643,40 +664,76 @@ class PipelineEngine:
                     batch = futures[future]
                     labels = ", ".join(proof.stem for proof in batch)
                     try:
-                        future.result()
+                        batch_decisions = future.result()
                     except (ProviderError, CommandError, OSError, ValueError) as error:
                         failures.append(f"{labels}: {error}")
+                        for proof in batch:
+                            diagnostics[proof.stem] = str(error)
                     else:
-                        self.log(f"Визуальный пакет завершён: {labels}")
-            if failures:
-                raise ReviewRequired("Не завершены независимые пакеты визуальной проверки:\n" + "\n".join(failures))
+                        attempt_decisions.update(batch_decisions)
+                        self.log(f"Визуальный пакет просмотрен: {labels}")
+
+            for look_id, decision in attempt_decisions.items():
+                decisions[look_id] = decision
+                diagnostics[look_id] = decision.note
+            unresolved = [
+                proof for proof in unresolved
+                if not attempt_decisions.get(proof.stem) or not attempt_decisions[proof.stem].accepted
+            ]
+            if unresolved:
+                labels = ", ".join(proof.stem for proof in unresolved)
+                self.log(
+                    f"Автоповтор visual-proof только для: {labels}. "
+                    + ("Ошибки пакетов: " + "; ".join(failures) if failures else "")
+                )
+
+        if unresolved:
+            details = "; ".join(
+                f"{proof.stem}: {diagnostics.get(proof.stem, 'нет решения визуальной модели')}"
+                for proof in unresolved
+            )
+            raise ReviewRequired(
+                "Автоматическая визуальная проверка трижды не смогла подтвердить только эти развороты: "
+                + details
+            )
+
+        # Keep the durable state single-writer.  A worker never calls a
+        # controller command; only accepted decisions become immutable proof
+        # confirmations here.
+        for proof in pending:
+            self.controller.gate(
+                "confirm-visual-look", root, "--look", proof.stem,
+                "--note", _safe_confirmation_note(decisions[proof.stem].note), timeout=120,
+            )
         missing = [proof.stem for proof in pairs if not (confirmations / f"{proof.stem}.json").is_file()]
         if missing:
-            raise ReviewRequired("Не подтверждены текущие visual-proof развороты: " + ", ".join(missing))
+            raise PipelineError("Контроллер не записал visual-proof подтверждения: " + ", ".join(missing))
         self.controller.gate(
             "record-visual", root,
             "--notes", "Все current-master proofs проверены в независимых пакетах; компьютерный caption clearance сохранён.",
             timeout=300,
         )
 
-    def _confirm_codex_visual_batch(self, provider: CodexProvider, root: Path, proofs: list[Path]) -> None:
+    def _confirm_codex_visual_batch(
+        self, provider: CodexProvider, root: Path, proofs: list[Path],
+    ) -> dict[str, VisionDecision]:
         look_ids = [proof.stem for proof in proofs]
         proof_lines = "\n".join(f"- {proof.stem}: {proof}" for proof in proofs)
-        prompt = f"""Выполни только свой независимый пакет визуальной проверки лукбука.
+        prompt = f"""Выполни только независимую визуальную проверку лукбука.
 
 Проект: {root}
 Тебе разрешены только эти LOOK: {", ".join(look_ids)}.
-Proof-развороты, которые нужно реально просмотреть:
+К этому запросу приложены JPG proof-развороты, которые нужно реально просмотреть:
 {proof_lines}
 
-Открой каждый proof. Для каждого проверь: full-length слева, close-up справа, видимые кредиты читаемы и не пересекают модель, находятся внутри safe area; не меняй фото, страницы, фреймы, InDesign или composition plan.
+Для каждого проверь: full-length слева, close-up справа, видимые кредиты читаемы, текст кредитов не пересекает модель и расположен внутри safe area. Не меняй фото, страницы, фреймы, InDesign или composition plan.
 
-После просмотра каждого именно назначенного LOOK выполни штатную команду `confirm-visual-look` с конкретной заметкой не короче 25 символов. Запрещено подтверждать LOOK из другого пакета, запускать arm/apply/render/record-visual, экспортировать PDF или менять InDesign. Если хотя бы один разворот нельзя честно подтвердить, не создавай для него confirmation и в финальном сообщении укажи его ID и причину.
+Ничего не записывай, не запускай команды и не открывай InDesign. Верни только JSON без Markdown:
+{{"decisions":[{{"look_id":"LOOK_001","accepted":true,"note":"не менее двух конкретных наблюдений о кадрах, кредитах и safe area"}}]}}
 
-Не выполняй `record-visual`: это делает координатор только после окончания всех пакетов."""
-        result = provider.run_agent(prompt, root)
-        if result:
-            self.log("Codex visual batch: " + result[-1200:])
+В JSON должны быть ровно эти LOOK: {", ".join(look_ids)}. Если разворот нельзя честно подтвердить, верни accepted=false и конкретную причину."""
+        raw = provider.run_readonly_agent(prompt, root, timeout=3600, images=proofs)
+        return _parse_codex_batch_decisions(raw, look_ids)
 
     def _run_local_visual(self, project: ProjectRecord, provider: ModelProvider) -> None:
         root = project.project_dir

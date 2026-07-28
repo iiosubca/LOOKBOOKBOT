@@ -6,7 +6,7 @@ from pathlib import Path
 
 from lookbookbot.domain import ProviderKind
 from lookbookbot.pipeline import PipelineEngine, _path_batches
-from lookbookbot.providers import CodexProvider
+from lookbookbot.providers import CodexProvider, VisionDecision
 from lookbookbot.state import StateStore
 
 
@@ -51,17 +51,94 @@ def test_parallel_codex_visual_records_once_after_all_batches(tmp_path: Path, mo
 
     monkeypatch.setattr(engine, "_prepare_visual_proof", lambda _project: proofs)
 
-    def fake_confirm(_provider, _root: Path, batch: list[Path]) -> None:
+    def fake_confirm(_provider, _root: Path, batch: list[Path]):
         seen.append([proof.stem for proof in batch])
-        confirmations.mkdir(parents=True, exist_ok=True)
-        for proof in batch:
-            (confirmations / f"{proof.stem}.json").write_text(json.dumps({"look_id": proof.stem}), encoding="utf-8")
+        return {
+            proof.stem: VisionDecision(
+                accepted=True,
+                note="Кадры и кредиты видимы, модель не пересекает текст в safe area.",
+            )
+            for proof in batch
+        }
+
+    def fake_gate(action: str, _root: Path, *args: str, **_kwargs) -> None:
+        records.append(action)
+        if action == "confirm-visual-look":
+            look_id = args[args.index("--look") + 1]
+            confirmations.mkdir(parents=True, exist_ok=True)
+            (confirmations / f"{look_id}.json").write_text(json.dumps({"look_id": look_id}), encoding="utf-8")
 
     monkeypatch.setattr(engine, "_confirm_codex_visual_batch", fake_confirm)
-    monkeypatch.setattr(engine.controller, "gate", lambda action, *_args, **_kwargs: records.append(action))
+    monkeypatch.setattr(engine.controller, "gate", fake_gate)
 
     engine._run_parallel_codex_visual(project, CodexProvider())
 
     assert sorted(look for batch in seen for look in batch) == [proof.stem for proof in proofs]
     assert all(len(batch) <= 5 for batch in seen)
-    assert records == ["record-visual"]
+    assert records == ["confirm-visual-look"] * 6 + ["record-visual"]
+
+
+def test_parallel_codex_visual_retries_only_unconfirmed_proof(tmp_path: Path, monkeypatch) -> None:
+    store = StateStore(tmp_path / "state.db")
+    project = _project(store, tmp_path)
+    engine = PipelineEngine(store)
+    proof = project.project_dir / "control" / "visual" / "proof" / "pairs" / "LOOK_041.jpg"
+    proof.parent.mkdir(parents=True, exist_ok=True)
+    proof.write_bytes(b"proof")
+    confirmations = project.project_dir / "control" / "visual" / "confirmations"
+    attempts: list[str] = []
+    records: list[str] = []
+
+    monkeypatch.setattr(engine, "_prepare_visual_proof", lambda _project: [proof])
+
+    def fake_confirm(_provider, _root: Path, batch: list[Path]):
+        attempts.append(batch[0].stem)
+        accepted = len(attempts) == 2
+        return {
+            "LOOK_041": VisionDecision(
+                accepted=accepted,
+                note="Кадры корректны, кредиты читаемы и остаются в безопасной зоне страницы.",
+            )
+        }
+
+    def fake_gate(action: str, _root: Path, *args: str, **_kwargs) -> None:
+        records.append(action)
+        if action == "confirm-visual-look":
+            confirmations.mkdir(parents=True, exist_ok=True)
+            (confirmations / "LOOK_041.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(engine, "_confirm_codex_visual_batch", fake_confirm)
+    monkeypatch.setattr(engine.controller, "gate", fake_gate)
+
+    engine._run_parallel_codex_visual(project, CodexProvider())
+
+    assert attempts == ["LOOK_041", "LOOK_041"]
+    assert records == ["confirm-visual-look", "record-visual"]
+
+
+def test_codex_visual_batch_receives_explicit_proof_attachments(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    engine = PipelineEngine(store)
+    proofs = [tmp_path / "LOOK_041.jpg", tmp_path / "LOOK_042.jpg"]
+    for proof in proofs:
+        proof.write_bytes(b"proof")
+    received: list[Path] = []
+
+    class FakeProvider:
+        def run_readonly_agent(self, _prompt: str, _root: Path, **kwargs) -> str:
+            received.extend(kwargs["images"])
+            return json.dumps({
+                "decisions": [
+                    {
+                        "look_id": proof.stem,
+                        "accepted": True,
+                        "note": "Кадры корректны, кредиты читаемы и остаются в безопасной зоне страницы.",
+                    }
+                    for proof in proofs
+                ],
+            })
+
+    decisions = engine._confirm_codex_visual_batch(FakeProvider(), tmp_path, proofs)  # type: ignore[arg-type]
+
+    assert received == proofs
+    assert all(decision.accepted for decision in decisions.values())

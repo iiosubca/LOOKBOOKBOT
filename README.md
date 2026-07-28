@@ -1,5 +1,10 @@
 # LOOKBOOKBOT for Windows
 
+## Version 0.2.5
+
+- Visual-proof workers now receive the actual attached proof images in read-only mode and return strict decisions instead of being asked to write controller records themselves.
+- The coordinator records accepted visual confirmations serially, then automatically retries only missing or declined proof cards up to three times before continuing to the review-PDF export.
+
 ## Version 0.2.4
 
 - A stopped visual stage now resumes its saved composition plan instead of attempting to create it again. Before an unstarted retry, the app can recover the prior signed credits-frame position from native delta evidence without opening InDesign.
