@@ -99,7 +99,7 @@ class LookbookController:
         self.runner = runner
 
     def script(self, name: str, *args: str | Path, timeout: int = 1800, check: bool = True) -> CommandResult:
-        return self.runner.run([self.tools.python, self.tools.scripts / name, *args], timeout=timeout, check=check)
+        return self.runner.run([self.tools.python, self.tools.engine_scripts / name, *args], timeout=timeout, check=check)
 
     def gate(self, action: str, project: Path, *args: str | Path, timeout: int = 1800, check: bool = True) -> CommandResult:
         return self.runner.run([self.tools.python, self.tools.gate, action, project, *args], cwd=project, timeout=timeout, check=check)

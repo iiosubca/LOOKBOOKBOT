@@ -8,7 +8,6 @@ from pathlib import Path
 
 
 APP_NAME = "LOOKBOOKBOT"
-DEFAULT_SKILL_ROOT = Path.home() / ".codex" / "skills" / "lookbook-layout"
 DEFAULT_TEMPLATE = Path(
     r"C:\Users\vdiza\Desktop\TSUM\2026\Lookbook\SOURCES\TSUM_FS-0260712_LB_LLM_01_AUTOMATION.indd"
 )
@@ -17,18 +16,18 @@ DEFAULT_RUNTIME = Path(
 )
 
 
-def bundled_skill_root() -> Path:
-    """Return the versioned automation engine shipped with LOOKBOOKBOT.
+def bundled_engine_scripts() -> Path:
+    """Return the internal, versioned LOOKBOOKBOT automation scripts.
 
-    The global Codex skill remains a fallback for developer use, but release
-    jobs must not silently change behaviour because another session updated a
-    file under ``~/.codex`` after this application was tested.
+    Release jobs deliberately have no fallback to ``~/.codex/skills``.  The
+    application ships the exact controller version it was tested with, so an
+    unrelated Codex session cannot alter a running production pipeline.
     """
     if getattr(sys, "frozen", False):
-        candidate = Path(getattr(sys, "_MEIPASS")) / "automation-engine" / "lookbook-layout"
+        candidate = Path(getattr(sys, "_MEIPASS")) / "automation-engine" / "core" / "scripts"
     else:
-        candidate = Path(__file__).resolve().parents[2] / "automation-engine" / "lookbook-layout"
-    return candidate if candidate.is_dir() else DEFAULT_SKILL_ROOT
+        candidate = Path(__file__).resolve().parents[2] / "automation-engine" / "lookbook-layout" / "scripts"
+    return candidate
 
 
 def app_data_dir() -> Path:
@@ -64,20 +63,18 @@ def codex_binary() -> Path | None:
 @dataclass(frozen=True)
 class ToolPaths:
     python: Path
-    skill_root: Path
-    scripts: Path
+    engine_scripts: Path
     gate: Path
     template: Path
 
     @classmethod
     def defaults(cls) -> "ToolPaths":
-        root = Path(os.environ.get("LOOKBOOKBOT_SKILL_ROOT", bundled_skill_root()))
+        scripts = Path(os.environ.get("LOOKBOOKBOT_ENGINE_SCRIPTS", bundled_engine_scripts()))
         template = Path(os.environ.get("LOOKBOOKBOT_TEMPLATE", DEFAULT_TEMPLATE))
         return cls(
             python=bundled_python(),
-            skill_root=root,
-            scripts=root / "scripts",
-            gate=root / "scripts" / "lookbook_gate.py",
+            engine_scripts=scripts,
+            gate=scripts / "lookbook_gate.py",
             template=template,
         )
 
@@ -85,7 +82,7 @@ class ToolPaths:
         missing: list[str] = []
         for label, path in (
             ("Python runtime", self.python),
-            ("lookbook skill", self.skill_root / "SKILL.md"),
+            ("LOOKBOOKBOT engine", self.engine_scripts / "lookbook_gate.py"),
             ("controller", self.gate),
             ("automation template", self.template),
         ):

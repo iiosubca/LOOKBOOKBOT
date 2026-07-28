@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from .ai_policy import read_only_vision_prompt, targeted_credit_rematch_prompt
 from .config import ToolPaths
 from .controller import CommandError, CommandRunner, LookbookController, evidence_passed, final_outputs_passed
 from .discovery import discover_sources
@@ -267,7 +268,11 @@ class PipelineEngine:
             "--map", "control/work/caption-map.tsv", "--hires", "control/work/_mat/hires", timeout=1800,
         )
         if isinstance(provider, CodexProvider):
-            self._delegate_codex(project, provider, "credits_rematch")
+            result = provider.run_agent(
+                targeted_credit_rematch_prompt(str(root), targets), root, timeout=7200,
+            )
+            if result:
+                self.log("Codex: " + result[-4000:])
         else:
             self._confirm_local_credit_proofs(project, provider, only_looks=set(targets))
 
@@ -380,10 +385,10 @@ class PipelineEngine:
 
     def _delegate_codex(self, project: ProjectRecord, provider: CodexProvider, stage: str) -> None:
         prompts = {
-            "credits_map": """Заверши только визуальное сопоставление кредитов текущего проекта. Используй lookbook-layout skill. PDF-порядок уже находится в control/work/look-register.tsv. Если существует control/work/ui-overrides/caption-overrides.json, это вручную подтверждённые оператором выборы Excel: каждый такой LOOK_### обязан получить exact alternative proof, быть реально просмотрен на нём, затем выбран только через штатный select-alternatives в безопасной группе не более пяти связанных LOOK_###. Никогда не заменяй этот выбор автоматическим seed. После выбора перерисуй обычные трёхпанельные proof cards, просмотри их партиями не более пяти и подтверди только реально просмотренные совпадения. Закончи с нулём PENDING. Не переходи к init или InDesign.""",
+            "credits_map": """Заверши только визуальное сопоставление кредитов текущего проекта по встроенному протоколу LOOKBOOKBOT. PDF-порядок уже находится в control/work/look-register.tsv. Если существует control/work/ui-overrides/caption-overrides.json, это вручную подтверждённые оператором выборы Excel: каждый такой LOOK_### обязан получить exact alternative proof, быть реально просмотрен на нём, затем выбран только через штатный select-alternatives в безопасной группе не более пяти связанных LOOK_###. Никогда не заменяй этот выбор автоматическим seed. После выбора перерисуй обычные трёхпанельные proof cards, просмотри их партиями не более пяти и подтверди только реально просмотренные совпадения. Закончи с нулём PENDING. Не переходи к init или InDesign.""",
             "credits_rematch": """Выполни только точечную повторную сверку кредитов. Список единственных разрешённых LOOK_### находится в control/work/ui-overrides/targeted-credit-rematch.json. Все остальные строки caption-map.tsv заморожены: не открывай для них proof cards, не подтверждай, не меняй лист/номер/статус и не запускай seed или reset-visual-review. Для каждого target LOOK визуально сравни его PDF-пару с контролируемыми Excel previews и выбери карту по одежде, цвету, аксессуарам, обуви, сумке, позе и модели — никогда по порядковому номеру. Если подходящая карта уже назначена другому target LOOK, выполни полный обмен только внутри этой связанной группы (максимум пять LOOK) через alternative-proofs и select-alternatives; карту у неотмеченного LOOK брать запрещено. Для каждого нового или оставленного выбора создай/просмотри точную proof-card и подтверди только этот target через confirm-review с конкретными визуальными признаками. Закончи, когда все и только target LOOK получат CONFIRMED. Не переходи к init, InDesign или следующим этапам.""",
-            "map": """Заверши только текущий gate map этого проекта по lookbook-layout skill. Просмотри все reference-order cards партиями не более пяти, в той же итерации запиши immutable confirm-reference-look для просмотренных LOOK_### и доведи счётчик до N/N, затем выполни validate-map. Не начинай structure.""",
-            "visual": """Заверши только gate visual текущего проекта по lookbook-layout skill. Не меняй страницы и фреймы. Проверь full-left/close-right, ссылки, CREDiTs, overflow, safe area с внутренним отступом 12 pt и caption clearance. Разрешены только горизонтальный сдвиг изображения и, если он не помогает, перенос того же кредитного фрейма вниз/вправо/вниз-вправо. Для единичной проблемы используй targeted calibration. Подтверди каждый реально просмотренный current-master proof и запиши PASS visual; не экспортируй review PDF.""",
+            "map": """Заверши только текущий gate map этого проекта по встроенному протоколу LOOKBOOKBOT. Просмотри все reference-order cards партиями не более пяти, в той же итерации запиши immutable confirm-reference-look для просмотренных LOOK_### и доведи счётчик до N/N, затем выполни validate-map. Не начинай structure.""",
+            "visual": """Заверши только gate visual текущего проекта по встроенному протоколу LOOKBOOKBOT. Не меняй страницы и фреймы. Проверь full-left/close-right, ссылки, CREDiTs, overflow, safe area с внутренним отступом 12 pt и caption clearance. Разрешены только горизонтальный сдвиг изображения и, если он не помогает, перенос того же кредитного фрейма вниз/вправо/вниз-вправо. Для единичной проблемы используй targeted calibration. Подтверди каждый реально просмотренный current-master proof и запиши PASS visual; не экспортируй review PDF.""",
         }
         prompt = (
             "Ты выполняешь один ограниченный этап приложения LOOKBOOKBOT. Не спрашивай пользователя и не сообщай частичный успех.\n"

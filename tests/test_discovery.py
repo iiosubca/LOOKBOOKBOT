@@ -16,13 +16,11 @@ def test_discovers_standard_sources(tmp_path: Path) -> None:
     template.write_bytes(b"indd")
     fake_python = tmp_path / "python.exe"
     fake_python.write_bytes(b"exe")
-    skill = tmp_path / "skill"
-    scripts = skill / "scripts"
+    scripts = tmp_path / "engine" / "scripts"
     scripts.mkdir(parents=True)
-    (skill / "SKILL.md").write_text("skill", encoding="utf-8")
     gate = scripts / "lookbook_gate.py"
     gate.write_text("", encoding="utf-8")
-    tools = ToolPaths(fake_python, skill, scripts, gate, template)
+    tools = ToolPaths(fake_python, scripts, gate, template)
 
     report = discover_sources(sources, tools)
 
@@ -41,10 +39,9 @@ def test_rejects_multiple_reference_pdfs(tmp_path: Path) -> None:
     (tmp_path / "a.xlsx").write_bytes(b"x")
     template = tmp_path / "x_AUTOMATION.indd"
     template.write_bytes(b"x")
-    tools = ToolPaths(tmp_path / "python.exe", tmp_path, tmp_path, tmp_path / "gate.py", template)
+    tools = ToolPaths(tmp_path / "python.exe", tmp_path, tmp_path / "gate.py", template)
 
     report = discover_sources(tmp_path, tools)
 
     assert report.bundle is None
     assert "ровно один PDF" in report.messages[0]
-

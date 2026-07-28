@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .ai_policy import read_only_vision_prompt
 from .config import codex_binary
 from .domain import ProviderKind
 
@@ -102,7 +103,7 @@ class CodexProvider(ModelProvider):
         if missing:
             raise ProviderError("Не найдены карточки для визуальной сверки: " + ", ".join(missing))
         return self._run_agent(
-            prompt, workspace, timeout=timeout, sandbox="read-only", images=attachments,
+            read_only_vision_prompt(prompt), workspace, timeout=timeout, sandbox="read-only", images=attachments,
         )
 
     def _run_agent(
@@ -233,6 +234,7 @@ class GoogleAiStudioProvider(ModelProvider):
         )
 
     def inspect_proof(self, prompt: str, images: list[Path]) -> VisionDecision:
+        prompt = read_only_vision_prompt(prompt)
         content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
         for path in images:
             mime = "image/png" if path.suffix.casefold() == ".png" else "image/jpeg"
@@ -300,6 +302,7 @@ class OllamaProvider(HttpVisionProvider):
         return str(body.get("message", {}).get("content", "")).strip()
 
     def inspect_proof(self, prompt: str, images: list[Path]) -> VisionDecision:
+        prompt = read_only_vision_prompt(prompt)
         if not self.model:
             raise ProviderError("Не выбрана модель Ollama.")
         encoded = [base64.b64encode(path.read_bytes()).decode("ascii") for path in images]
@@ -347,6 +350,7 @@ class LlamaCppProvider(HttpVisionProvider):
         return self._chat([{"role": "user", "content": prompt}], timeout)
 
     def inspect_proof(self, prompt: str, images: list[Path]) -> VisionDecision:
+        prompt = read_only_vision_prompt(prompt)
         content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
         for path in images:
             mime = "image/png" if path.suffix.casefold() == ".png" else "image/jpeg"

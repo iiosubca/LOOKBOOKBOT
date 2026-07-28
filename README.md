@@ -1,5 +1,10 @@
 # LOOKBOOKBOT for Windows
 
+## Version 0.2.21
+
+- LOOKBOOKBOT no longer resolves, packages, or depends on a Codex Skill. It ships only its own versioned automation scripts and embeds the visual-verification policy for Codex, Google AI Studio, Ollama, and llama.cpp.
+- Codex proof workers are explicitly read-only and prohibited from loading external skill instructions; the application controller remains the sole writer of project evidence and InDesign actions.
+
 ## Version 0.2.18
 
 - The final-PDF indicator now starts with an explicit preparation state instead of a misleading static `0%`, then switches to durable `written / total` checkpoints as each file completes.

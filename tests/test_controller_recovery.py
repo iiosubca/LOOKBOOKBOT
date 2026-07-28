@@ -12,8 +12,7 @@ from lookbookbot.controller import CommandError, CommandResult, CommandRunner, L
 def _tools(tmp_path: Path) -> ToolPaths:
     return ToolPaths(
         python=tmp_path / "python.exe",
-        skill_root=tmp_path,
-        scripts=tmp_path,
+        engine_scripts=tmp_path,
         gate=tmp_path / "lookbook_gate.py",
         template=tmp_path / "template.indd",
     )
