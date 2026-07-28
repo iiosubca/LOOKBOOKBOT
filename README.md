@@ -1,5 +1,9 @@
 # LOOKBOOKBOT for Windows
 
+## Version 0.2.18
+
+- The final-PDF indicator now starts with an explicit preparation state instead of a misleading static `0%`, then switches to durable `written / total` checkpoints as each file completes.
+
 ## Version 0.2.17
 
 - Gender PDFs now assign their InDesign page range as a scalar COM value, fixing the invalid-cast failure after the three full-lookbook PDFs have been checkpointed.

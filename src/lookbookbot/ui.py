@@ -797,6 +797,7 @@ class MainWindow(QMainWindow):
     def _begin_final_export_progress(self) -> None:
         self.final_export_progress.setRange(0, 5)
         self.final_export_progress.setValue(0)
+        self.final_export_progress.setFormat("Подготовка…")
         self.final_export_progress.show()
         self.final_export_label.setText("Финальные PDF: подготовка экспорта…")
         self.final_export_label.show()
