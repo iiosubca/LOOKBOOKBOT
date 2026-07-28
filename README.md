@@ -1,5 +1,10 @@
 # LOOKBOOKBOT for Windows
 
+## Version 0.2.22
+
+- Credit-proof notes now recognise concrete visual cues in Russian and English, including explicit labels such as `garment=...; bag=...`.
+- If a controller rejects a single credit proof because its note is too generic, the app re-opens only that exact proof card, requests a structured observation, and retries the same safe batch without resetting confirmed looks.
+
 ## Version 0.2.21
 
 - LOOKBOOKBOT no longer resolves, packages, or depends on a Codex Skill. It ships only its own versioned automation scripts and embeds the visual-verification policy for Codex, Google AI Studio, Ollama, and llama.cpp.

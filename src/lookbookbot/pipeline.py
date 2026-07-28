@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -470,13 +471,42 @@ class PipelineEngine:
         if failures:
             raise ReviewRequired("Не завершены независимые пакеты сверки кредитов:\n" + "\n".join(failures))
 
+        rows_by_look = {str(row["look_id"]): row for row in pending}
         accepted = [
             (str(row["look_id"]), _safe_confirmation_note(decisions[str(row["look_id"])].note))
             for row in pending
             if decisions.get(str(row["look_id"])) and decisions[str(row["look_id"])].accepted
         ]
         for batch in _pair_batches(accepted, size=5):
-            self._confirm_credit_batch(root, batch)
+            try:
+                self._confirm_credit_batch(root, batch)
+            except CommandError as error:
+                # The map writer has not changed the TSV when it rejects a
+                # batch of proof notes, so it is safe to re-inspect only the
+                # named cards and retry the same batch.  This bridges wording
+                # differences between models without weakening visual proof.
+                if "visual observation is not specific enough" not in str(error).casefold():
+                    raise
+                failed_looks = [
+                    look_id for look_id in _look_ids_in_text(str(error))
+                    if look_id in rows_by_look and any(look_id == item[0] for item in batch)
+                ]
+                if not failed_looks:
+                    raise
+                self.log(
+                    "Уточняю визуальные признаки только для: " + ", ".join(failed_looks)
+                )
+                repaired = self._inspect_codex_credit_batch(
+                    provider, root, [rows_by_look[look_id] for look_id in failed_looks], strict_notes=True,
+                )
+                decisions.update(repaired)
+                retry_batch = [
+                    (look_id, _safe_confirmation_note(decisions[look_id].note))
+                    for look_id, _note in batch
+                    if decisions.get(look_id) and decisions[look_id].accepted
+                ]
+                if retry_batch:
+                    self._confirm_credit_batch(root, retry_batch)
         rejected = [
             str(row["look_id"]) for row in pending
             if not decisions.get(str(row["look_id"])) or not decisions[str(row["look_id"])].accepted
@@ -484,7 +514,7 @@ class PipelineEngine:
         return rejected
 
     def _inspect_codex_credit_batch(
-        self, provider: CodexProvider, root: Path, rows: list[dict[str, str]],
+        self, provider: CodexProvider, root: Path, rows: list[dict[str, str]], *, strict_notes: bool = False,
     ) -> dict[str, VisionDecision]:
         expected = [str(row["look_id"]) for row in rows]
         cards = []
@@ -507,7 +537,18 @@ class PipelineEngine:
 {{"decisions":[{{"look_id":"LOOK_001","accepted":true,"note":"не менее двух конкретных видимых признаков"}}]}}
 
 В JSON должны быть ровно эти LOOK: {", ".join(expected)}. Если карточка не совпадает, верни accepted=false и укажи конкретную причину."""
-        raw = provider.run_readonly_agent(prompt, root, timeout=3600, images=attachments)
+        note_contract = (
+            "\nFor every accepted decision, write note as at least two explicit, visible labels with values: "
+            "`garment=<item and colour>; bag=<item>` or `garment=<item>; shoes=<item>; accessory=<item>`. "
+            "Use only what is visibly present in the supplied card. The note must be at least 28 characters; "
+            "never write a generic phrase such as 'the images match'."
+        )
+        if strict_notes:
+            note_contract += (
+                " This is a recovery pass after a note-format rejection: comply with the label format exactly "
+                "for every accepted LOOK."
+            )
+        raw = provider.run_readonly_agent(prompt + note_contract, root, timeout=3600, images=attachments)
         return _parse_codex_batch_decisions(raw, expected)
 
     def _confirm_codex_reference_proofs_parallel(self, project: ProjectRecord, provider: CodexProvider) -> None:
@@ -1039,6 +1080,11 @@ def _safe_confirmation_note(note: str) -> str:
     if len(cleaned) < 25:
         raise ValueError("Визуальное подтверждение должно содержать конкретное наблюдение не короче 25 символов.")
     return cleaned
+
+
+def _look_ids_in_text(value: str) -> list[str]:
+    """Return de-duplicated LOOK IDs in the order reported by a controller."""
+    return list(dict.fromkeys(re.findall(r"\bLOOK_\d{3,}\b", str(value).upper())))
 
 
 def _parse_codex_batch_decisions(raw: str, expected_looks: list[str]) -> dict[str, VisionDecision]:

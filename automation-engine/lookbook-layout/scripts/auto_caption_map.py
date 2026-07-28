@@ -21,6 +21,8 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw, ImageOps
 
+from credit_note_rules import visible_identity_cue_categories
+
 
 REGISTRY_FIELDS = [
     "look_id", "spread_order", "pdf_spread", "left_filename", "right_filename",
@@ -37,7 +39,6 @@ ALTERNATIVE_FIELDS = [
     "look_id", "excel_sheet", "excel_look_number", "excel_image",
     "left_filename", "right_filename", "evidence_file", "evidence_sha256",
 ]
-
 
 def fail(message: str) -> None:
     raise SystemExit(f"BLOCKED: {message}")
@@ -337,17 +338,13 @@ def parse_observations(value: str, requested: list[str]) -> dict[str, str]:
         observations[look_id] = note
     if set(observations) != set(requested):
         fail("--notes must provide one visual observation for every requested LOOK_### and no others.")
-    cues = (
-        "модель", "муж", "жен", "пальто", "плащ", "пухов", "жилет", "пидж", "костюм", "рубаш",
-        "топ", "плать", "юбк", "брюк", "джинс", "шорт", "сумк", "очк", "туф", "обув", "ботин",
-        "куртк", "комбинез", "цвет", "чёр", "бел", "сер", "корич", "розов", "син", "крас",
-    )
     for look_id, note in observations.items():
-        lowered = note.casefold()
-        if len(note) < 28 or sum(1 for cue in cues if cue in lowered) < 2:
+        cue_categories = visible_identity_cue_categories(note)
+        if len(note) < 28 or len(cue_categories) < 2:
             fail(
                 f"{look_id}: visual observation is not specific enough. Describe at least two visible identity cues "
-                "(model, garment, colour, bag, shoes, accessories)."
+                "(model, garment, colour, bag, shoes, accessories). Use explicit labels such as "
+                "'garment=white blazer; bag=black tote' when possible."
             )
     return observations
 

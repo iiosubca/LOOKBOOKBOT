@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from lookbookbot.pipeline import _parse_codex_batch_decisions, _safe_confirmation_note
+from lookbookbot.pipeline import _look_ids_in_text, _parse_codex_batch_decisions, _safe_confirmation_note
 from lookbookbot.providers import ProviderError
 
 
@@ -37,3 +37,9 @@ def test_rejects_missing_or_unassigned_batch_decision() -> None:
 
 def test_confirmation_note_cannot_break_controller_batch_transport() -> None:
     assert _safe_confirmation_note("  Платье||сумка\nи обувь совпадают с PDF-луком.  ") == "Платье;сумка и обувь совпадают с PDF-луком."
+
+
+def test_reads_only_the_controller_named_looks_from_a_note_failure() -> None:
+    assert _look_ids_in_text("BLOCKED: LOOK_008 and LOOK_041 need another visual observation.") == [
+        "LOOK_008", "LOOK_041",
+    ]
