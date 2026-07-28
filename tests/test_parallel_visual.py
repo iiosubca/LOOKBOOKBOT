@@ -142,3 +142,26 @@ def test_codex_visual_batch_receives_explicit_proof_attachments(tmp_path: Path) 
 
     assert received == proofs
     assert all(decision.accepted for decision in decisions.values())
+
+
+def test_partial_visual_confirmation_reuses_current_proof_without_native_work(tmp_path: Path, monkeypatch) -> None:
+    store = StateStore(tmp_path / "state.db")
+    project = _project(store, tmp_path)
+    engine = PipelineEngine(store)
+    proof_root = project.project_dir / "control" / "visual" / "proof" / "pairs" / "session-current"
+    proof_root.mkdir(parents=True, exist_ok=True)
+    proofs = [proof_root / "LOOK_001.jpg", proof_root / "LOOK_002.jpg"]
+    for proof in proofs:
+        proof.write_bytes(b"proof")
+    confirmations = project.project_dir / "control" / "visual" / "confirmations"
+    confirmations.mkdir(parents=True)
+    (confirmations / "LOOK_001.json").write_text("{}", encoding="utf-8")
+
+    def unexpected_native_call(*_args, **_kwargs):
+        raise AssertionError("Partially confirmed proof must not re-arm or re-render InDesign.")
+
+    monkeypatch.setattr(engine.controller, "gate", unexpected_native_call)
+
+    resumed = engine._prepare_visual_proof(project)
+
+    assert resumed == proofs

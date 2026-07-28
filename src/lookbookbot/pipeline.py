@@ -591,8 +591,29 @@ class PipelineEngine:
             )
 
     def _prepare_visual_proof(self, project: ProjectRecord) -> list[Path]:
-        """Run the single-writer InDesign portion of the visual gate."""
+        """Run native visual work, or reuse the current proof being confirmed.
+
+        Once even one immutable visual confirmation exists, the saved proof
+        session is already the object under review.  Re-arming composition,
+        reconciling a clearance plan, or rendering a new proof session at that
+        point could invalidate the 49 confirmations which are already bound to
+        the current master.  Resume the exact proof queue instead.
+        """
         root = project.project_dir
+        confirmations = root / "control" / "visual" / "confirmations"
+        current_pairs = _latest_cards(root / "control" / "visual" / "proof" / "pairs")
+        confirmed = list(confirmations.glob("*.json")) if confirmations.is_dir() else []
+        if confirmed:
+            if not current_pairs:
+                raise PipelineError(
+                    "Есть visual-proof подтверждения, но отсутствуют их текущие proof-развороты; "
+                    "для сохранности подтверждённого master нужна новая ревизия."
+                )
+            self.log(
+                f"Возобновляю текущую visual-proof сессию: {len(confirmed)} подтверждений сохранены; "
+                "InDesign, composition plan и proof-рендер не запускаются повторно."
+            )
+            return current_pairs
         arm = self.controller.gate("arm", root, "--gate", "visual", timeout=120, check=False)
         if arm.returncode and "armed" not in arm.text.casefold():
             self.log(arm.text)
@@ -737,34 +758,7 @@ class PipelineEngine:
 
     def _run_local_visual(self, project: ProjectRecord, provider: ModelProvider) -> None:
         root = project.project_dir
-        arm = self.controller.gate("arm", root, "--gate", "visual", timeout=120, check=False)
-        if arm.returncode and "armed" not in arm.text.casefold():
-            self.log(arm.text)
-        self._prepare_or_resume_visual_composition(root)
-        for _ in range(100):
-            result = self.controller.gate("apply-composition", root, timeout=1800, check=False)
-            if result.returncode:
-                raise PipelineError(result.text)
-            if "PASS composition" in result.text or "PASS COMPOSITION" in result.text.upper():
-                break
-            if "CHECKPOINT" not in result.text.upper():
-                break
-        for _ in range(6):
-            rendered = self.controller.gate("render-visual-proof", root, timeout=1800, check=False)
-            if rendered.returncode == 0:
-                break
-            plan = self.controller.gate("plan-clearance-corrections", root, timeout=900, check=False)
-            if plan.returncode:
-                raise ReviewRequired(plan.text or rendered.text)
-            for _batch in range(100):
-                applied = self.controller.gate("apply-composition", root, timeout=1800, check=False)
-                if applied.returncode:
-                    raise PipelineError(applied.text)
-                if "PASS composition" in applied.text or "CHECKPOINT" not in applied.text.upper():
-                    break
-        else:
-            raise ReviewRequired("Caption clearance не удалось довести до CLEAR за шесть контролируемых итераций.")
-        pairs = _latest_cards(root / "control" / "visual" / "proof" / "pairs")
+        pairs = self._prepare_visual_proof(project)
         for proof in pairs:
             decision = provider.inspect_proof(
                 "Проверь разворот лукбука. Ответь JSON {\"match\":true/false,\"note\":\"конкретное наблюдение\"}. "
@@ -792,6 +786,12 @@ class PipelineEngine:
             return
         correction = root / "control" / "visual" / "clearance-correction-plan.json"
         if correction.is_file():
+            confirmations = root / "control" / "visual" / "confirmations"
+            if confirmations.is_dir() and any(confirmations.glob("*.json")):
+                self.log(
+                    "Пропускаю reconciliation: текущий visual master уже имеет подтверждённые proof-развороты."
+                )
+                return
             reconciled = self.controller.gate(
                 "reconcile-clearance-plan-priors", root, timeout=180, check=False,
             )

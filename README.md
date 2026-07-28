@@ -1,5 +1,9 @@
 # LOOKBOOKBOT for Windows
 
+## Version 0.2.6
+
+- A partially confirmed visual-proof session now resumes its exact existing proof cards. LOOKBOOKBOT no longer re-arms InDesign, reconciles a clearance plan, or rerenders proofs after confirmations have started.
+
 ## Version 0.2.5
 
 - Visual-proof workers now receive the actual attached proof images in read-only mode and return strict decisions instead of being asked to write controller records themselves.
