@@ -1,5 +1,10 @@
 # LOOKBOOKBOT for Windows
 
+## Version 0.2.8
+
+- If a nested InDesign PDF form reports every credit row at one baseline, the clearance audit recognises that impossible geometry and uses the real existing credits-frame area for safe correction planning.
+- Visual rejection recovery can also continue when the failed batch has not yet written any individual confirmations.
+
 ## Version 0.2.7
 
 - Caption-clearance now composes nested PDF text coordinates correctly, so all rendered credit rows participate in collision detection rather than only their first apparent line.

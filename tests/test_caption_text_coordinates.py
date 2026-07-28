@@ -35,9 +35,28 @@ def test_visible_caption_bounds_use_page_space_for_nested_pdf_forms() -> None:
     assert bounds[1] == 98.0
 
 
+def test_degenerate_pdf_text_geometry_falls_back_to_existing_credits_frame() -> None:
+    bounds, source = gate._reliable_visible_caption_bounds(
+        [66.0, 90.0, 80.9, 350.0], 24, 24, [66.0, 66.0, 186.5, 356.5],
+    )
+
+    assert bounds == [66.0, 66.0, 186.5, 356.5]
+    assert source == "native-frame-fallback-degenerate-pdf-text-coordinates"
+
+
+def test_normal_pdf_text_geometry_keeps_measured_glyph_bounds() -> None:
+    bounds, source = gate._reliable_visible_caption_bounds(
+        [66.0, 90.0, 150.0, 350.0], 24, 24, [66.0, 66.0, 186.5, 356.5],
+    )
+
+    assert bounds == [66.0, 90.0, 150.0, 350.0]
+    assert source == "pdf-glyph-coordinates"
+
+
 def test_controller_exposes_grounded_rejection_recovery_commands() -> None:
     source = GATE_PATH.read_text(encoding="utf-8")
 
     assert "def command_restart_visual_confirmations" in source
     assert 'restart-visual-confirmations' in source
     assert '--force-looks' in source
+    assert "if entries:" in source

@@ -1284,6 +1284,27 @@ def _visible_caption_text_bounds(reader: Any, page_number: int, caption_bounds: 
     return [max(top, min(baselines) - 2.0), text_left, min(bottom, max(baselines) + 2.0), text_right], len(baselines)
 
 
+def _reliable_visible_caption_bounds(
+    visible_bounds: list[float], visible_field_count: int, expected_field_count: int, frame_bounds: list[float],
+) -> tuple[list[float], str]:
+    """Reject a degenerate PDF visitor result before planning a correction.
+
+    InDesign may emit all text fields from a nested form with one reported
+    baseline even though the rendered credits occupy several rows.  A 24-field
+    block with a one-line height is impossible visual evidence.  In that exact
+    case the existing fixed credits frame is more conservative and truthful
+    than allowing the audit to inspect only its first apparent line.
+    """
+    visible = _finite_bounds(visible_bounds, "visible credits bounds")
+    frame = _finite_bounds(frame_bounds, "credits frame bounds")
+    height = visible[2] - visible[0]
+    frame_height = frame[2] - frame[0]
+    minimum_height = max(8.0, min(frame_height * 0.5, float(expected_field_count) * 1.5))
+    if expected_field_count >= 4 and visible_field_count >= expected_field_count and height < minimum_height:
+        return frame, "native-frame-fallback-degenerate-pdf-text-coordinates"
+    return visible, "pdf-glyph-coordinates"
+
+
 def _status_rank(status: str) -> int:
     return {
         CAPTION_CLEARANCE_CLEAR: 0,
@@ -1326,6 +1347,9 @@ def build_caption_clearance_audit(project: Path, state: dict[str, Any], manifest
             proof_document, int(row["indd_left_page"]), caption_bounds
         )
         expected_field_count = products_by_look.get(look_id, 0) * 4
+        visible_text_bounds, visible_bounds_source = _reliable_visible_caption_bounds(
+            visible_text_bounds, visible_field_count, expected_field_count, caption_bounds,
+        )
         image = _load_caption_clearance_source(source, np, Image, ImageOps)
         background, tolerance = _dominant_studio_background(image, np)
         inspected = dict(layout_items[look_id])
@@ -1334,6 +1358,7 @@ def build_caption_clearance_audit(project: Path, state: dict[str, Any], manifest
         metrics = dict(metrics)
         metrics["visible_text_bounds"] = visible_text_bounds
         metrics["selected_text_block_bounds"] = visible_text_bounds
+        metrics["visible_text_bounds_source"] = visible_bounds_source
         metrics["visible_text_field_count"] = visible_field_count
         metrics["expected_text_field_count"] = expected_field_count
         if layout_items[look_id]["credits_overflow"] or visible_field_count < expected_field_count:
@@ -2362,14 +2387,13 @@ def command_restart_visual_confirmations(args: argparse.Namespace) -> None:
         fail("--notes must record the specific visual rejection that restarts the partial proof queue.")
     confirmations = visual_confirmation_dir(project)
     entries = sorted(confirmations.glob("*.json")) if confirmations.is_dir() else []
-    if not entries:
-        fail("There are no partial visual confirmations to restart.")
     manifest = validate_visual_proof(project, state)
     _validate_blocked_clearance_report(project, state)
     archive = control_path(project) / "history" / f"visual-rejected-{utc_now().replace(':', '-')}"
     destination = archive / "visual" / "confirmations"
     destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(confirmations), str(destination))
+    if entries:
+        shutil.move(str(confirmations), str(destination))
     confirmations.mkdir(parents=True, exist_ok=True)
     write_json(archive / "rejection.json", {
         "schema": SCHEMA, "generator": "lookbook_gate.py:restart-visual-confirmations",
