@@ -44,6 +44,15 @@ def test_degenerate_pdf_text_geometry_falls_back_to_existing_credits_frame() -> 
     assert source == "native-frame-fallback-degenerate-pdf-text-coordinates"
 
 
+def test_degenerate_pdf_text_width_also_uses_existing_credits_frame() -> None:
+    bounds, source = gate._reliable_visible_caption_bounds(
+        [66.0, 66.0, 186.5, 80.9], 24, 24, [66.0, 66.0, 186.5, 186.5],
+    )
+
+    assert bounds == [66.0, 66.0, 186.5, 186.5]
+    assert source == "native-frame-fallback-degenerate-pdf-text-coordinates"
+
+
 def test_normal_pdf_text_geometry_keeps_measured_glyph_bounds() -> None:
     bounds, source = gate._reliable_visible_caption_bounds(
         [66.0, 90.0, 150.0, 350.0], 24, 24, [66.0, 66.0, 186.5, 356.5],

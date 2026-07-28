@@ -1298,9 +1298,16 @@ def _reliable_visible_caption_bounds(
     visible = _finite_bounds(visible_bounds, "visible credits bounds")
     frame = _finite_bounds(frame_bounds, "credits frame bounds")
     height = visible[2] - visible[0]
+    width = visible[3] - visible[1]
     frame_height = frame[2] - frame[0]
+    frame_width = frame[3] - frame[1]
     minimum_height = max(8.0, min(frame_height * 0.5, float(expected_field_count) * 1.5))
-    if expected_field_count >= 4 and visible_field_count >= expected_field_count and height < minimum_height:
+    minimum_width = max(20.0, min(frame_width * 0.5, float(expected_field_count) * 1.5))
+    if (
+        expected_field_count >= 4
+        and visible_field_count >= expected_field_count
+        and (height < minimum_height or width < minimum_width)
+    ):
         return frame, "native-frame-fallback-degenerate-pdf-text-coordinates"
     return visible, "pdf-glyph-coordinates"
 

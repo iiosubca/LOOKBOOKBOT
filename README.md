@@ -1,5 +1,9 @@
 # LOOKBOOKBOT for Windows
 
+## Version 0.2.10
+
+- The PDF-text geometry guard now also detects the nested-form failure mode where many credit rows are collapsed to one narrow horizontal coordinate.
+
 ## Version 0.2.9
 
 - An unstarted clearance retry now automatically rebinds its delta baseline to the current same-master native composition evidence, preventing a stale archived identity from blocking InDesign before the correction starts.
