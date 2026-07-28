@@ -1243,11 +1243,25 @@ def _visible_caption_text_bounds(reader: Any, page_number: int, caption_bounds: 
                 # local to that form, so it can place every printed row at the
                 # same apparent coordinate.  Compose it with the current
                 # graphics matrix to obtain real proof-page coordinates.
-                a, b, c, _d, e, f = (float(value) for value in cm[:6])
-                text_x = float(tm[4])
-                text_y = float(tm[5])
+                a, b, c, d, e, f = (float(value) for value in cm[:6])
+                ta, tb, tc, td, text_x, text_y = (float(value) for value in tm[:6])
+                # ``font_size`` alone is not the rendered point size in an
+                # InDesign PDF.  Credits are commonly emitted as ``Tf 1``
+                # with an 8x text matrix.  Using the raw value made a full
+                # column of credits look only 15 pt wide and caused the
+                # clearance planner to inspect the whole text frame instead
+                # of the actual printed lines.  Compose both matrices and
+                # retain their effective scale for the line-width estimate.
+                combined_a = a * ta + c * tb
+                combined_b = b * ta + d * tb
+                combined_c = a * tc + c * td
+                combined_d = b * tc + d * td
                 x = a * text_x + c * text_y + e
-                y = b * text_x + _d * text_y + f
+                y = b * text_x + d * text_y + f
+                matrix_scale = max(
+                    math.hypot(combined_a, combined_b),
+                    math.hypot(combined_c, combined_d),
+                )
             except (TypeError, ValueError, IndexError):
                 return
             converted = page_height - y
@@ -1260,7 +1274,7 @@ def _visible_caption_text_bounds(reader: Any, page_number: int, caption_bounds: 
                 # deliberately wide, then add padding. This remains conservative
                 # while no longer treating empty frame space as visible text.
                 try:
-                    font_size = max(1.0, float(_font_size))
+                    font_size = max(1.0, float(_font_size) * max(1.0, matrix_scale))
                 except (TypeError, ValueError):
                     font_size = 6.0
                 for line in text.replace("\r", "\n").split("\n"):

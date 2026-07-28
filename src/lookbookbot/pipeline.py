@@ -626,6 +626,7 @@ class PipelineEngine:
                 break
             if "CHECKPOINT" not in result.text.upper():
                 break
+        seen_clearance_plans: set[str] = set()
         for _ in range(6):
             rendered = self.controller.gate("render-visual-proof", root, timeout=1800, check=False)
             if rendered.returncode == 0:
@@ -636,13 +637,42 @@ class PipelineEngine:
             plan = self.controller.gate("plan-clearance-corrections", root, timeout=900, check=False)
             if plan.returncode:
                 raise ReviewRequired(plan.text or rendered.text)
+            plan_path = root / "control" / "visual" / "clearance-correction-plan.json"
+            if not plan_path.is_file():
+                raise PipelineError("Контроллер не сохранил план caption-clearance после блокировки visual-proof.")
+            plan_data = json.loads(plan_path.read_text(encoding="utf-8"))
+            # The controller archives every retry with a fresh timestamp, so
+            # hashing the file itself would make an identical no-op plan look
+            # new. Compare only the executable content before spending another
+            # full InDesign proof export.
+            plan_digest = json.dumps(
+                {
+                    "corrections": plan_data.get("corrections", []),
+                    "caption_corrections": plan_data.get("caption_corrections", []),
+                    "unresolved": plan_data.get("unresolved", []),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            unresolved = [
+                str(item.get("look_id"))
+                for item in plan_data.get("unresolved", [])
+                if isinstance(item, dict) and isinstance(item.get("look_id"), str)
+            ]
+            if unresolved and plan_digest in seen_clearance_plans:
+                raise PipelineError(
+                    "Контроллер повторил неизменный план caption-clearance без допустимой коррекции: "
+                    + ", ".join(unresolved)
+                )
+            seen_clearance_plans.add(plan_digest)
             for _batch in range(100):
                 applied = self.controller.gate("apply-composition", root, timeout=1800, check=False)
                 if applied.returncode:
                     raise PipelineError(applied.text)
                 if "PASS composition" in applied.text or "CHECKPOINT" not in applied.text.upper():
                     break
-        raise ReviewRequired("Caption clearance не удалось довести до CLEAR за шесть контролируемых итераций.")
+        raise PipelineError("Caption-clearance не сошёлся после контролируемых исправлений; журнал содержит последний план.")
 
     def _run_parallel_codex_visual(
         self, project: ProjectRecord, provider: CodexProvider, *, repair_attempts: int = 0,

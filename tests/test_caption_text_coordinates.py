@@ -26,6 +26,20 @@ class _FakeReader:
     pages = [_FakePage()]
 
 
+class _ScaledTextMatrixPage:
+    mediabox = type("MediaBox", (), {"top": 600.0, "bottom": 0.0})()
+
+    def extract_text(self, *, visitor_text) -> None:
+        # InDesign frequently uses a one-point ``Tf`` with the real 8-pt
+        # character size stored in the text matrix.  The visual planner must
+        # use that effective scale rather than collapse the printed line.
+        visitor_text("BOTTEGA VENETA", [1, 0, 0, 1, 0, 0], [8, 0, 0, 8, 66, 500], None, 1)
+
+
+class _ScaledTextMatrixReader:
+    pages = [_ScaledTextMatrixPage()]
+
+
 def test_visible_caption_bounds_use_page_space_for_nested_pdf_forms() -> None:
     bounds, count = gate._visible_caption_text_bounds(_FakeReader(), 1, [0, 0, 600, 600])
 
@@ -33,6 +47,15 @@ def test_visible_caption_bounds_use_page_space_for_nested_pdf_forms() -> None:
     assert bounds[0] == 98.0
     assert bounds[2] == 202.0
     assert bounds[1] == 98.0
+
+
+def test_visible_caption_bounds_use_effective_text_matrix_scale() -> None:
+    bounds, count = gate._visible_caption_text_bounds(_ScaledTextMatrixReader(), 1, [0, 0, 600, 600])
+
+    assert count == 1
+    # 14 characters at 8 pt cannot be represented by the old 15-pt-wide
+    # fallback column.  Its calculated extent must retain the matrix scale.
+    assert bounds[3] > 150.0
 
 
 def test_degenerate_pdf_text_geometry_falls_back_to_existing_credits_frame() -> None:

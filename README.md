@@ -1,5 +1,10 @@
 # LOOKBOOKBOT for Windows
 
+## Version 0.2.11
+
+- Caption-clearance now calculates printed credit width from the complete PDF text matrix, not the raw `Tf` value. This prevents a real 8-pt credits column from being misread as a 15-pt stripe and eliminates repeated false collision retries.
+- The visual correction loop no longer treats an unchanged, unresolved plan as productive work; it reports the exact controller limitation rather than repeating a full proof cycle.
+
 ## Version 0.2.10
 
 - The PDF-text geometry guard now also detects the nested-form failure mode where many credit rows are collapsed to one narrow horizontal coordinate.
