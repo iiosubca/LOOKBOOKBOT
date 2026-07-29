@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import hashlib
+import re
 from datetime import date
 from pathlib import Path
 
@@ -491,7 +492,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(18, 18, 18, 18)
         hint = QLabel(
             "После проверки PDF исправьте только нужный лук. Один товар — четыре строки: тип, бренд, цена, артикул. "
-            "При выпуске новой версии InDesign сам применит подготовленный стиль CREDiTs, интервалы и начертания."
+            "При переходе между луками правки автоматически складываются в единый черновик; новая версия InDesign создаётся только по кнопке выпуска."
         )
         hint.setObjectName("Muted")
         hint.setWordWrap(True)
@@ -523,10 +524,14 @@ class MainWindow(QMainWindow):
         self.correction_editor.textChanged.connect(self._correction_text_changed)
         editor_layout.addWidget(self.correction_title)
         editor_layout.addWidget(self.correction_editor, 1)
+        self.correction_draft_status = QLabel()
+        self.correction_draft_status.setObjectName("Muted")
+        self.correction_draft_status.setWordWrap(True)
+        editor_layout.addWidget(self.correction_draft_status)
         buttons = QHBoxLayout()
-        self.save_correction_button = QPushButton("СОХРАНИТЬ ПРАВКИ")
+        self.save_correction_button = QPushButton("СОХРАНИТЬ В ЧЕРНОВИК")
         self.save_correction_button.clicked.connect(self._save_caption_correction)
-        self.export_correction_button = QPushButton("СОХРАНИТЬ И НАПИСАТЬ PDF НА ПРОВЕРКУ")
+        self.export_correction_button = QPushButton("СОЗДАТЬ НОВУЮ ВЕРСИЮ И PDF НА ПРОВЕРКУ")
         self.export_correction_button.setObjectName("Primary")
         self.export_correction_button.clicked.connect(self._save_and_export_caption_corrections)
         buttons.addWidget(self.save_correction_button)
@@ -1191,6 +1196,43 @@ class MainWindow(QMainWindow):
             return None
         return self.project.project_dir / "control" / "work" / "manual-caption-revisions" / "draft.json"
 
+    def _next_caption_revision_names(self) -> tuple[str, str] | None:
+        """Return the one future INDD/review-PDF pair without creating either."""
+        if not self.project:
+            return None
+        state = read_json(self.project.project_dir / "control" / "lookbook-state.json")
+        master = str(state.get("master", "")).strip()
+        match = re.fullmatch(r"(.+)_(\d{2,})\.indd", master, flags=re.IGNORECASE)
+        if not match:
+            return None
+        prefix, raw_revision = match.groups()
+        next_revision = int(raw_revision) + 1
+        suffix = f"{next_revision:0{len(raw_revision)}d}"
+        return f"{prefix}_{suffix}.indd", f"{prefix}_{suffix}_review.pdf"
+
+    def _refresh_caption_draft_status(self) -> None:
+        if not hasattr(self, "correction_draft_status"):
+            return
+        future = self._next_caption_revision_names()
+        if not self.project or future is None:
+            self.correction_draft_status.setText("")
+            return
+        draft = self._caption_draft_path()
+        payload = read_json(draft) if draft and draft.is_file() else {}
+        look_ids = payload.get("look_ids") if isinstance(payload.get("look_ids"), list) else []
+        upcoming = f"{future[0]} → {future[1]}"
+        if not look_ids:
+            self.correction_draft_status.setText(
+                f"Новая ревизия ещё не создана. После всех правок будет создана одна версия: {upcoming}."
+            )
+            return
+        listed = ", ".join(str(value) for value in look_ids[:8])
+        if len(look_ids) > 8:
+            listed += f" и ещё {len(look_ids) - 8}"
+        self.correction_draft_status.setText(
+            f"Черновик: {listed}. При выпуске будет создана одна новая версия: {upcoming}."
+        )
+
     def _load_corrections(self) -> None:
         if not hasattr(self, "correction_look_list"):
             return
@@ -1204,6 +1246,7 @@ class MainWindow(QMainWindow):
                 self.correction_editor.clear()
                 self.correction_left_preview.set_image(None)
                 self.correction_right_preview.set_image(None)
+                self._refresh_caption_draft_status()
                 return
             try:
                 self._correction_rows = read_caption_rows(self.project.project_dir / "control" / "work" / "caption-data.tsv")
@@ -1212,6 +1255,7 @@ class MainWindow(QMainWindow):
                 self.correction_title.setText("ПРАВКИ ДОСТУПНЫ ПОСЛЕ PDF НА ПРОВЕРКУ")
                 self.correction_left_preview.set_image(None)
                 self.correction_right_preview.set_image(None)
+                self._refresh_caption_draft_status()
                 return
             current = previous
             for row in self.store.looks(self.project.id):
@@ -1228,6 +1272,7 @@ class MainWindow(QMainWindow):
                     break
         finally:
             self._loading_corrections = False
+        self._refresh_caption_draft_status()
         if self.correction_look_list.currentItem() is not None:
             self._load_correction_look(self.correction_look_list.currentItem())
 
@@ -1235,18 +1280,10 @@ class MainWindow(QMainWindow):
         if self._loading_corrections or current is None:
             return
         if self._correction_dirty and previous is not None:
-            answer = QMessageBox.question(
-                self,
-                "Сохранить правки?",
-                "В текущем луке есть несохранённые изменения кредитов.",
-                QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
-                QMessageBox.StandardButton.Save,
-            )
-            if answer == QMessageBox.StandardButton.Save:
-                if self._save_caption_correction() is None:
-                    self._restore_correction_selection(previous)
-                    return
-            elif answer == QMessageBox.StandardButton.Cancel:
+            # Every look is a draft contribution to one future revision.
+            # Navigating the list must not create an INDD or interrupt the
+            # operator with 50 identical save dialogs.
+            if self._save_caption_correction() is None:
                 self._restore_correction_selection(previous)
                 return
         self._load_correction_look(current)
@@ -1313,6 +1350,7 @@ class MainWindow(QMainWindow):
         self.approved.blockSignals(True)
         self.approved.setChecked(False)
         self.approved.blockSignals(False)
+        self._refresh_caption_draft_status()
         self._append_log(f"Сохранены правки кредитов: {self._correction_look_id}. Черновик новой ревизии: {draft.relative_to(self.project.project_dir)}")
         return draft
 
@@ -1325,7 +1363,9 @@ class MainWindow(QMainWindow):
                 "Измените кредиты и сохраните их. Затем программа создаст новую версию InDesign и PDF на проверку.",
             )
             return
-        self._append_log("Создаётся новая ревизия InDesign из сохранённых правок кредитов…")
+        future = self._next_caption_revision_names()
+        label = future[0] if future else "следующая версия"
+        self._append_log(f"Создаётся одна новая ревизия InDesign: {label}. После неё будет записан PDF на проверку той же версии…")
         self._start_pipeline(None, True, caption_revision_audit=str(audit))
 
     def _load_visual_audit(self) -> None:
@@ -1390,6 +1430,12 @@ class MainWindow(QMainWindow):
                 QMessageBox.StandardButton.Yes,
             )
             if answer == QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+        if self._correction_dirty and not (self.worker_thread and self.worker_thread.isRunning()):
+            # Persist the last edited look into the same draft; this never
+            # creates a new INDD and therefore does not consume a revision.
+            if self._save_caption_correction() is None:
                 event.ignore()
                 return
         super().closeEvent(event)

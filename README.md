@@ -1,5 +1,10 @@
 # LOOKBOOKBOT for Windows
 
+## Version 0.2.28
+
+- Credit corrections now accumulate automatically in one revision draft while moving between looks. Only "Create new version and review PDF" creates the next sequential INDD and its matching review PDF.
+- The corrections panel shows the exact upcoming INDD/PDF names before release; final PDFs always derive their names from the current approved master revision.
+
 ## Version 0.2.27
 
 - Fixed release-stage COM stability: all InDesign page items are now read through indexed collection access instead of the unstable COM enumerator.
