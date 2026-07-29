@@ -38,9 +38,12 @@ VISUAL_PROOF_TIMEOUT_SECONDS = 720
 # Full-length images are fitted 800 pt wide into a 600 pt fixed frame, leaving
 # exactly 100 pt of safe horizontal crop travel on either side.
 # A crop is an editorial correction, not a way to push a full-length model to
-# an edge. Keep it within half an inch of the standard centered fill. If that
-# is insufficient, the existing credits frame must use the down/right fallback.
+# an edge. Keep ordinary adjustments within half an inch of the standard
+# centered fill. The wider recovery band is available only after the normal
+# crop and both existing-credits-frame fallbacks are proven impossible, and is
+# always followed by a fresh visual proof.
 MAX_CLEARANCE_SHIFT_POINTS = 36.0
+MAX_RECOVERY_CLEARANCE_SHIFT_POINTS = 72.0
 # A credits block is permitted to move only inside its existing left page, after
 # every possible horizontal photo crop has been ruled out.  These are planner
 # bounds, not a licence to create or resize a text frame.
@@ -1090,8 +1093,8 @@ def validate_composition_plan(project: Path, state: dict[str, Any]) -> list[dict
             fail(f"{look_id}: photo_adjustment_points must be a number of horizontal points.")
         if not math.isfinite(shift):
             fail(f"{look_id}: photo_adjustment_points must be finite.")
-        if abs(shift) > MAX_CLEARANCE_SHIFT_POINTS:
-            fail(f"{look_id}: photo_adjustment_points exceeds the 36-pt centred-crop limit.")
+        if abs(shift) > MAX_RECOVERY_CLEARANCE_SHIFT_POINTS:
+            fail(f"{look_id}: photo_adjustment_points exceeds the 72-pt recovery crop limit.")
     return rows
 
 
@@ -1495,7 +1498,7 @@ def _morphology(mask: Any, np: Any) -> Any:
     return np.logical_or.reduce(neighborhoods)
 
 
-def _largest_foreground_component_ratio(mask: Any, np: Any) -> float:
+def _largest_foreground_component_ratio(mask: Any, np: Any, *, area: int | None = None) -> float:
     """Measure the largest actual foreground island, not all JPEG texture.
 
     The clearance audit used to label every retained pixel as one component.
@@ -1504,7 +1507,10 @@ def _largest_foreground_component_ratio(mask: Any, np: Any) -> float:
     The visual rule is concerned with a contiguous garment, bag, limb, or
     other model area, so keep an explicit eight-connected component measure.
     """
-    total = int(mask.size)
+    # ``mask`` can be the union rectangle of separate printed credit lines.
+    # When that happens, pixels in the empty gaps are deliberately excluded
+    # from the clearance decision; use the active text area as denominator.
+    total = int(mask.size if area is None else area)
     if total <= 0:
         return 0.0
     active = mask.astype(bool, copy=False)
@@ -1558,6 +1564,41 @@ def _planning_clearance_status(coverage: float) -> tuple[str, str]:
     return _caption_clearance_status(coverage, coverage)
 
 
+def _caption_text_regions(value: Any, label: str) -> list[list[float]]:
+    """Return the actual printed text regions, or one conservative rectangle.
+
+    The credit frame itself is an object-layout constraint.  It may contain
+    harmless white space between rows and around short lines.  Clearance is
+    about printed glyphs, so callers can provide the per-line regions captured
+    from the proof PDF.  Legacy callers still pass a single four-coordinate
+    rectangle and retain the original conservative behaviour.
+    """
+    if isinstance(value, list) and len(value) == 4 and not any(isinstance(item, (list, tuple)) for item in value):
+        return [_finite_bounds(value, label)]
+    if not isinstance(value, list) or not value:
+        fail(f"{label} must contain one or more caption regions.")
+    regions: list[list[float]] = []
+    for index, item in enumerate(value, start=1):
+        regions.append(_finite_bounds(item, f"{label} region {index}"))
+    return regions
+
+
+def _caption_regions_for_item(item: dict[str, Any], caption_bounds: list[float]) -> list[list[float]]:
+    raw = item.get("caption_text_regions")
+    if raw is None:
+        return [caption_bounds]
+    return _caption_text_regions(raw, f"{item.get('look_id', 'look')} visible credits")
+
+
+def _union_bounds(regions: list[list[float]]) -> list[float]:
+    if not regions:
+        fail("Caption regions cannot be empty.")
+    return [
+        min(region[0] for region in regions), min(region[1] for region in regions),
+        max(region[2] for region in regions), max(region[3] for region in regions),
+    ]
+
+
 def _caption_clearance_metrics_from_image(image: Any, item: dict[str, Any], background: Any, tolerance: float, np: Any) -> tuple[dict[str, Any], Any, Any]:
     """Inspect one visible credits block in a preloaded original photograph.
 
@@ -1569,18 +1610,29 @@ def _caption_clearance_metrics_from_image(image: Any, item: dict[str, Any], back
     height, width = image.shape[:2]
     graphic = _finite_bounds(item.get("graphic_bounds"), f"{item.get('look_id', 'look')} graphic_bounds")
     caption = _finite_bounds(item.get("caption_bounds"), f"{item.get('look_id', 'look')} caption_bounds")
+    regions = _caption_regions_for_item(item, caption)
     top, left, bottom, right = graphic
-    caption_top, caption_left, caption_bottom, caption_right = caption
     graphic_width = right - left
     graphic_height = bottom - top
     # The crop must sit inside the image's visible page-space extent.  If it
     # does not, a detector cannot prove a clean background and must block.
-    if caption_left < left - 0.05 or caption_right > right + 0.05 or caption_top < top - 0.05 or caption_bottom > bottom + 0.05:
-        return ({"status": CAPTION_CLEARANCE_REVIEW, "reason": "credits frame is outside the mapped left graphic", "coverage": 1.0, "largest_component": 1.0}, image, np.zeros((1, 1), dtype=np.uint8))
-    x0 = max(0, int(math.floor((caption_left - left) * width / graphic_width)))
-    x1 = min(width, int(math.ceil((caption_right - left) * width / graphic_width)))
-    y0 = max(0, int(math.floor((caption_top - top) * height / graphic_height)))
-    y1 = min(height, int(math.ceil((caption_bottom - top) * height / graphic_height)))
+    mapped_regions: list[tuple[int, int, int, int]] = []
+    for caption_top, caption_left, caption_bottom, caption_right in regions:
+        if caption_left < left - 0.05 or caption_right > right + 0.05 or caption_top < top - 0.05 or caption_bottom > bottom + 0.05:
+            return ({"status": CAPTION_CLEARANCE_REVIEW, "reason": "visible credits text is outside the mapped left graphic", "coverage": 1.0, "largest_component": 1.0}, image, np.zeros((1, 1), dtype=np.uint8))
+        region_x0 = max(0, int(math.floor((caption_left - left) * width / graphic_width)))
+        region_x1 = min(width, int(math.ceil((caption_right - left) * width / graphic_width)))
+        region_y0 = max(0, int(math.floor((caption_top - top) * height / graphic_height)))
+        region_y1 = min(height, int(math.ceil((caption_bottom - top) * height / graphic_height)))
+        if region_x1 - region_x0 < 2 or region_y1 - region_y0 < 2:
+            continue
+        mapped_regions.append((region_x0, region_y0, region_x1, region_y1))
+    if not mapped_regions:
+        return ({"status": CAPTION_CLEARANCE_REVIEW, "reason": "mapped visible credits text is too small to inspect", "coverage": 1.0, "largest_component": 1.0}, image, np.zeros((1, 1), dtype=np.uint8))
+    x0 = min(region[0] for region in mapped_regions)
+    y0 = min(region[1] for region in mapped_regions)
+    x1 = max(region[2] for region in mapped_regions)
+    y1 = max(region[3] for region in mapped_regions)
     if x1 - x0 < 12 or y1 - y0 < 12:
         return ({"status": CAPTION_CLEARANCE_REVIEW, "reason": "mapped credits area is too small to inspect", "coverage": 1.0, "largest_component": 1.0}, image, np.zeros((1, 1), dtype=np.uint8))
     crop = image[y0:y1, x0:x1]
@@ -1595,9 +1647,15 @@ def _caption_clearance_metrics_from_image(image: Any, item: dict[str, Any], back
     # allowed only where the pixel is at least mildly distinct from background.
     edge_foreground = (gradient > max(34.0, tolerance * 1.25)) & (distance > tolerance * 0.32)
     retained = _morphology(colour_foreground | edge_foreground, np)
-    area = retained.shape[0] * retained.shape[1]
-    coverage = float(retained.mean())
-    largest_ratio = _largest_foreground_component_ratio(retained, np)
+    active = np.zeros(retained.shape, dtype=bool)
+    for region_x0, region_y0, region_x1, region_y1 in mapped_regions:
+        active[region_y0 - y0:region_y1 - y0, region_x0 - x0:region_x1 - x0] = True
+    active_area = int(active.sum())
+    if active_area <= 0:
+        return ({"status": CAPTION_CLEARANCE_REVIEW, "reason": "mapped visible credits text has no inspectable pixels", "coverage": 1.0, "largest_component": 1.0}, crop, np.zeros((1, 1), dtype=np.uint8))
+    retained = np.logical_and(retained, active)
+    coverage = float(retained.sum()) / float(active_area)
+    largest_ratio = _largest_foreground_component_ratio(retained, np, area=active_area)
     status, reason = _caption_clearance_status(coverage, largest_ratio)
     return ({
         "status": status, "reason": reason, "coverage": round(coverage, 6), "largest_component": round(largest_ratio, 6),
@@ -1650,21 +1708,27 @@ def _fast_caption_clearance_evaluator(image: Any, background: Any, tolerance: fl
     np.cumsum(integral, axis=0, dtype=np.int32, out=integral)
     np.cumsum(integral, axis=1, dtype=np.int32, out=integral)
 
-    def evaluate(graphic_bounds: list[float], caption_bounds: list[float]) -> dict[str, Any]:
+    def evaluate(graphic_bounds: list[float], caption_geometry: list[float] | list[list[float]]) -> dict[str, Any]:
         top, left, bottom, right = graphic_bounds
-        caption_top, caption_left, caption_bottom, caption_right = caption_bounds
         graphic_width = right - left
         graphic_height = bottom - top
-        if caption_left < left - 0.05 or caption_right > right + 0.05 or caption_top < top - 0.05 or caption_bottom > bottom + 0.05:
-            return {"status": CAPTION_CLEARANCE_REVIEW, "reason": "credits frame is outside the mapped left graphic", "coverage": 1.0, "largest_component": 1.0}
-        x0 = max(0, int(math.floor((caption_left - left) * width / graphic_width)))
-        x1 = min(width, int(math.ceil((caption_right - left) * width / graphic_width)))
-        y0 = max(0, int(math.floor((caption_top - top) * height / graphic_height)))
-        y1 = min(height, int(math.ceil((caption_bottom - top) * height / graphic_height)))
-        if x1 - x0 < 12 or y1 - y0 < 12:
-            return {"status": CAPTION_CLEARANCE_REVIEW, "reason": "mapped credits area is too small to inspect", "coverage": 1.0, "largest_component": 1.0}
-        occupied = int(integral[y1, x1] - integral[y0, x1] - integral[y1, x0] + integral[y0, x0])
-        coverage = occupied / float((x1 - x0) * (y1 - y0))
+        regions = _caption_text_regions(caption_geometry, "planned visible credits")
+        occupied = 0
+        area = 0
+        for caption_top, caption_left, caption_bottom, caption_right in regions:
+            if caption_left < left - 0.05 or caption_right > right + 0.05 or caption_top < top - 0.05 or caption_bottom > bottom + 0.05:
+                return {"status": CAPTION_CLEARANCE_REVIEW, "reason": "visible credits text is outside the mapped left graphic", "coverage": 1.0, "largest_component": 1.0}
+            x0 = max(0, int(math.floor((caption_left - left) * width / graphic_width)))
+            x1 = min(width, int(math.ceil((caption_right - left) * width / graphic_width)))
+            y0 = max(0, int(math.floor((caption_top - top) * height / graphic_height)))
+            y1 = min(height, int(math.ceil((caption_bottom - top) * height / graphic_height)))
+            if x1 - x0 < 2 or y1 - y0 < 2:
+                continue
+            occupied += int(integral[y1, x1] - integral[y0, x1] - integral[y1, x0] + integral[y0, x0])
+            area += (x1 - x0) * (y1 - y0)
+        if area <= 0:
+            return {"status": CAPTION_CLEARANCE_REVIEW, "reason": "mapped visible credits text is too small to inspect", "coverage": 1.0, "largest_component": 1.0}
+        coverage = occupied / float(area)
         # Planning must be fast enough to test the entire legal crop/frame
         # grid, but it must never claim CLEAR more readily than the final
         # exact audit.  A compact model edge can have a low total coverage and
@@ -1697,22 +1761,21 @@ def _write_caption_clearance_overlay(crop: Any, mask: Any, status: str, destinat
         fail(f"Cannot write caption-clearance proof image {destination}: {error}")
 
 
-def _visible_caption_text_bounds(reader: Any, page_number: int, caption_bounds: list[float]) -> tuple[list[float], int]:
-    """Read the actual printed credit rows and return their proof-page bounds.
+def _visible_caption_text_regions(reader: Any, page_number: int, caption_bounds: list[float]) -> tuple[list[list[float]], int]:
+    """Read individual printed credit-row regions in proof-page coordinates.
 
     Pypdf exposes text baselines through the visitor callback.  On these
     unrotated look pages the PDF bottom-origin baseline maps directly to the
     InDesign top-origin page coordinate.  The fixed credits frame can contain
     deliberate empty space, so collision detection must use these printed rows
-    rather than treating the entire container as visible typography.
+    rather than treating the entire container—or the empty gaps between
+    rows—as visible typography.
     """
     try:
         page = reader.pages[page_number - 1]
         page_height = float(page.mediabox.top) - float(page.mediabox.bottom)
         top, left, bottom, right = caption_bounds
-        baselines: list[float] = []
-        glyph_lefts: list[float] = []
-        glyph_rights: list[float] = []
+        regions: list[list[float]] = []
 
         def visit(text: str, cm: Any, tm: Any, _font: Any, _font_size: Any) -> None:
             if not text.strip():
@@ -1747,34 +1810,42 @@ def _visible_caption_text_bounds(reader: Any, page_number: int, caption_bounds: 
             # The captions gate has established that only intended credit text
             # lives in this frame.  A one-point allowance absorbs PDF rounding.
             if left - 1 <= x <= right + 1 and top - 1 <= converted <= bottom + 1:
-                baselines.append(converted)
                 # Pypdf exposes reliable text origins but not a portable glyph
                 # box for every embedded InDesign font. Estimate the line end
                 # deliberately wide, then add padding. This remains conservative
-                # while no longer treating empty frame space as visible text.
+                # while no longer treating empty frame space or interline gaps
+                # as visible text.
                 try:
                     font_size = max(1.0, float(_font_size) * max(1.0, matrix_scale))
                 except (TypeError, ValueError):
                     font_size = 6.0
-                for line in text.replace("\r", "\n").split("\n"):
-                    printed = line.strip()
-                    if not printed:
-                        continue
-                    glyph_lefts.append(max(left, x - 2.0))
+                printed_lines = [line.strip() for line in text.replace("\r", "\n").split("\n") if line.strip()]
+                line_step = max(4.0, min(16.0, font_size * 1.2))
+                for line_index, printed in enumerate(printed_lines):
+                    baseline = converted + line_index * line_step
+                    glyph_left = max(left, x - 2.0)
                     estimated_right = x + max(font_size, len(printed) * font_size * 0.85) + 3.0
-                    glyph_rights.append(min(right, estimated_right))
+                    glyph_right = min(right, estimated_right)
+                    region_top = max(top, baseline - 2.0)
+                    region_bottom = min(bottom, baseline + 2.0)
+                    if glyph_right - glyph_left >= 1.0 and region_bottom - region_top >= 1.0:
+                        regions.append([region_top, glyph_left, region_bottom, glyph_right])
 
         page.extract_text(visitor_text=visit)
     except Exception as error:
         fail(f"Cannot read visible credits from proof PDF page {page_number}: {error}")
-    if not baselines:
+    return regions, len(regions)
+
+
+def _visible_caption_text_bounds(reader: Any, page_number: int, caption_bounds: list[float]) -> tuple[list[float], int]:
+    """Return a compatibility union rectangle for callers needing one block."""
+    regions, count = _visible_caption_text_regions(reader, page_number, caption_bounds)
+    if not regions:
         return caption_bounds, 0
     # Credit text is an unrotated single column. Use the actual printed block
     # on both axes. The former frame-width approximation could push a model to
     # the page edge merely because its credits frame had empty space.
-    text_left = max(left, min(glyph_lefts) if glyph_lefts else left)
-    text_right = min(right, max(glyph_rights) if glyph_rights else right)
-    return [max(top, min(baselines) - 2.0), text_left, min(bottom, max(baselines) + 2.0), text_right], len(baselines)
+    return _union_bounds(regions), count
 
 
 def _reliable_visible_caption_bounds(
@@ -1856,18 +1927,25 @@ def build_caption_clearance_audit(project: Path, state: dict[str, Any], manifest
         caption_bounds = _finite_bounds(layout_items[look_id]["caption_bounds"], f"{look_id} caption_bounds")
         proof_item = pairs[look_id]
         proof_left_page = int(proof_item.get("proof_left_page", row["indd_left_page"]))
-        visible_text_bounds, visible_field_count = _visible_caption_text_bounds(proof_document, proof_left_page, caption_bounds)
+        visible_text_regions, visible_field_count = _visible_caption_text_regions(proof_document, proof_left_page, caption_bounds)
+        visible_text_bounds = _union_bounds(visible_text_regions) if visible_text_regions else caption_bounds
         expected_field_count = products_by_look.get(look_id, 0) * 4
         visible_text_bounds, visible_bounds_source = _reliable_visible_caption_bounds(
             visible_text_bounds, visible_field_count, expected_field_count, caption_bounds,
         )
+        # When the PDF text visitor is unreliable, retain the conservative
+        # single-frame fallback. Otherwise check only the actual printed rows.
+        if visible_bounds_source != "pdf-glyph-coordinates":
+            visible_text_regions = [visible_text_bounds]
         image = _load_caption_clearance_source(source, np, Image, ImageOps)
         background, tolerance = _dominant_studio_background(image, np)
         inspected = dict(layout_items[look_id])
         inspected["caption_bounds"] = visible_text_bounds
+        inspected["caption_text_regions"] = visible_text_regions
         metrics, crop, mask = _caption_clearance_metrics_from_image(image, inspected, background, tolerance, np)
         metrics = dict(metrics)
         metrics["visible_text_bounds"] = visible_text_bounds
+        metrics["visible_text_regions"] = visible_text_regions
         metrics["selected_text_block_bounds"] = visible_text_bounds
         metrics["visible_text_bounds_source"] = visible_bounds_source
         metrics["visible_text_field_count"] = visible_field_count
@@ -2579,7 +2657,9 @@ def _validate_blocked_clearance_report(project: Path, state: dict[str, Any]) -> 
     return checked
 
 
-def _best_horizontal_clearance_shift(source: Path, layout_item: dict[str, Any], current_shift: float) -> tuple[float, dict[str, Any]]:
+def _best_horizontal_clearance_shift(
+    source: Path, layout_item: dict[str, Any], current_shift: float, *, max_shift_points: float = MAX_CLEARANCE_SHIFT_POINTS,
+) -> tuple[float, dict[str, Any]]:
     """Test both crop directions against the original photo before changing it.
 
     The required blank space can be on either side of a model depending on pose,
@@ -2601,12 +2681,13 @@ def _best_horizontal_clearance_shift(source: Path, layout_item: dict[str, Any], 
     graphic = _finite_bounds(layout_item["graphic_bounds"], f"{layout_item.get('look_id', 'look')} graphic_bounds")
     baseline = [graphic[0], graphic[1] - current_shift, graphic[2], graphic[3] - current_shift]
     evaluate = _fast_caption_clearance_evaluator(image, background, tolerance, np)
+    caption_geometry = layout_item.get("caption_text_regions", layout_item["caption_bounds"])
     candidates: list[tuple[tuple[Any, ...], float, dict[str, Any]]] = []
 
     def score_candidate(candidate: float) -> None:
         metrics = evaluate(
             [baseline[0], baseline[1] + candidate, baseline[2], baseline[3] + candidate],
-            _finite_bounds(layout_item["caption_bounds"], f"{layout_item.get('look_id', 'look')} caption_bounds"),
+            caption_geometry,
         )
         candidates.append((
             (_status_rank(metrics["status"]), metrics.get("coverage", 1.0), metrics.get("largest_component", 1.0), abs(candidate), candidate),
@@ -2614,8 +2695,8 @@ def _best_horizontal_clearance_shift(source: Path, layout_item: dict[str, Any], 
             metrics,
         ))
 
-    candidate_points = set(range(-int(MAX_CLEARANCE_SHIFT_POINTS), int(MAX_CLEARANCE_SHIFT_POINTS) + 1, 10))
-    if abs(current_shift) <= MAX_CLEARANCE_SHIFT_POINTS:
+    candidate_points = set(range(-int(max_shift_points), int(max_shift_points) + 1, 10))
+    if abs(current_shift) <= max_shift_points:
         candidate_points.add(int(round(current_shift)))
     for points in sorted(candidate_points):
         score_candidate(float(points))
@@ -2624,7 +2705,7 @@ def _best_horizontal_clearance_shift(source: Path, layout_item: dict[str, Any], 
     # before declaring the fixed-frame rule physically impossible.  This avoids
     # overlooking a narrow clean strip next to a hand, bag, or garment edge.
     if min(candidates, key=lambda candidate: candidate[0])[2]["status"] != CAPTION_CLEARANCE_CLEAR:
-        for points in range(-int(MAX_CLEARANCE_SHIFT_POINTS), int(MAX_CLEARANCE_SHIFT_POINTS) + 1):
+        for points in range(-int(max_shift_points), int(max_shift_points) + 1):
             if points not in candidate_points:
                 score_candidate(float(points))
     del image, background, evaluate
@@ -2637,6 +2718,7 @@ def _best_caption_frame_clearance(
     layout_item: dict[str, Any],
     visible_bounds: list[float],
     *,
+    visible_regions: list[list[float]] | None = None,
     graphic_override: list[float] | None = None,
     evaluator_override: Any | None = None,
     exhaustive: bool = True,
@@ -2659,6 +2741,7 @@ def _best_caption_frame_clearance(
         fail(f"Caption-clearance planner dependencies are unavailable: {error}")
     frame = _finite_bounds(layout_item.get("caption_bounds"), f"{layout_item.get('look_id', 'look')} caption_bounds")
     visible = _finite_bounds(visible_bounds, f"{layout_item.get('look_id', 'look')} visible_text_bounds")
+    regions = _caption_text_regions(visible_regions if visible_regions else visible, f"{layout_item.get('look_id', 'look')} visible_text_regions")
     page = _finite_bounds(layout_item.get("page_bounds"), f"{layout_item.get('look_id', 'look')} page_bounds")
     safe = _finite_bounds(layout_item.get("safe_bounds"), f"{layout_item.get('look_id', 'look')} safe_bounds")
     graphic = _finite_bounds(
@@ -2689,20 +2772,19 @@ def _best_caption_frame_clearance(
         image = background = None
         evaluate = evaluator_override
 
-    def visible_after_move(delta_x: float, delta_y: float, right_aligned: bool) -> list[float]:
-        """Predict the rendered ink rectangle, not the full text-frame bounds."""
-        height = visible[2] - visible[0]
-        width = visible[3] - visible[1]
-        top = visible[0] + delta_y
-        bottom = top + height
+    def visible_after_move(delta_x: float, delta_y: float, right_aligned: bool) -> list[list[float]]:
+        """Predict the actual printed rows, not their enclosing frame."""
         if right_aligned:
             right_inset = frame[3] - visible[3]
-            right = frame[3] + delta_x - right_inset
-            left = right - width
-        else:
-            left = visible[1] + delta_x
-            right = left + width
-        return [top, left, bottom, right]
+            target_right = frame[3] + delta_x - right_inset
+            return [
+                [region[0] + delta_y, target_right - (region[3] - region[1]), region[2] + delta_y, target_right]
+                for region in regions
+            ]
+        return [
+            [region[0] + delta_y, region[1] + delta_x, region[2] + delta_y, region[3] + delta_x]
+            for region in regions
+        ]
 
     def metrics_for(delta_x: float, delta_y: float, right_aligned: bool) -> dict[str, Any]:
         return evaluate(graphic, visible_after_move(delta_x, delta_y, right_aligned))
@@ -2800,6 +2882,8 @@ def _best_combined_caption_clearance(
     visible_bounds: list[float],
     current_shift: float,
     preferred_shift: float,
+    *,
+    visible_regions: list[list[float]] | None = None,
 ) -> dict[str, Any] | None:
     """Find a clear lower/right credits position *with* a photo crop.
 
@@ -2843,7 +2927,7 @@ def _best_combined_caption_clearance(
     for shift in ordered_coarse:
         candidate = _best_caption_frame_clearance(
             source, layout_item, visible_bounds,
-            graphic_override=graphic_at(float(shift)), evaluator_override=evaluate, exhaustive=False,
+            visible_regions=visible_regions, graphic_override=graphic_at(float(shift)), evaluator_override=evaluate, exhaustive=False,
         )
         if candidate is not None:
             found.append(attach(candidate, float(shift)))
@@ -2854,7 +2938,7 @@ def _best_combined_caption_clearance(
         # combined placement unavailable.
         candidate = _best_caption_frame_clearance(
             source, layout_item, visible_bounds,
-            graphic_override=graphic_at(preferred_shift), evaluator_override=evaluate, exhaustive=True,
+            visible_regions=visible_regions, graphic_override=graphic_at(preferred_shift), evaluator_override=evaluate, exhaustive=True,
         )
         if candidate is not None:
             found.append(attach(candidate, preferred_shift))
@@ -3172,7 +3256,17 @@ def command_plan_clearance_corrections(args: argparse.Namespace) -> None:
         visible_bounds = (evidence.get("metrics") or {}).get("visible_text_bounds")
         if isinstance(visible_bounds, list) and len(visible_bounds) == 4:
             geometry["caption_bounds"] = visible_bounds
+        raw_visible_regions = (evidence.get("metrics") or {}).get("visible_text_regions")
+        try:
+            visible_regions = _caption_text_regions(
+                raw_visible_regions if raw_visible_regions else geometry["caption_bounds"],
+                f"{row['look_id']} visible_text_regions",
+            )
+        except GateError:
+            visible_regions = [_finite_bounds(geometry["caption_bounds"], f"{row['look_id']} visible_text_bounds")]
+        geometry["caption_text_regions"] = visible_regions
         planning_visible_bounds = visible_bounds if isinstance(visible_bounds, list) else geometry["caption_bounds"]
+        planning_visible_regions = [list(region) for region in visible_regions]
         if planning_frame_bounds != current_frame_bounds:
             delta_y = planning_frame_bounds[0] - current_frame_bounds[0]
             delta_x = planning_frame_bounds[1] - current_frame_bounds[1]
@@ -3181,6 +3275,10 @@ def command_plan_clearance_corrections(args: argparse.Namespace) -> None:
                 float(planning_visible_bounds[1]) + delta_x,
                 float(planning_visible_bounds[2]) + delta_y,
                 float(planning_visible_bounds[3]) + delta_x,
+            ]
+            planning_visible_regions = [
+                [region[0] + delta_y, region[1] + delta_x, region[2] + delta_y, region[3] + delta_x]
+                for region in planning_visible_regions
             ]
         proposed, predicted = _best_horizontal_clearance_shift(source, geometry, prior)
         candidate = {
@@ -3198,7 +3296,7 @@ def command_plan_clearance_corrections(args: argparse.Namespace) -> None:
             caption_candidate = _best_caption_frame_clearance(source, planning_frame_geometry, _finite_bounds(
                 planning_visible_bounds,
                 f"{row['look_id']} visible_text_bounds",
-            ))
+            ), visible_regions=planning_visible_regions)
             if caption_candidate is None:
                 caption_candidate = _best_combined_caption_clearance(
                     source,
@@ -3209,9 +3307,32 @@ def command_plan_clearance_corrections(args: argparse.Namespace) -> None:
                     ),
                     prior,
                     proposed,
+                    visible_regions=planning_visible_regions,
                 )
             if caption_candidate is None:
-                candidate["reason"] = "no permissible horizontal crop, credits move, or combined photo-and-credits move clears the existing page"
+                # The ordinary 36-pt centred crop and both safe-area credits
+                # positions have been exhausted.  Before declaring a spread
+                # impossible, inspect one wider but still bounded recovery
+                # crop.  It is not a generic preference: the signed plan marks
+                # it explicitly and a complete native visual proof follows.
+                recovery_shift, recovery_metrics = _best_horizontal_clearance_shift(
+                    source, geometry, prior, max_shift_points=MAX_RECOVERY_CLEARANCE_SHIFT_POINTS,
+                )
+                if (
+                    recovery_metrics["status"] == CAPTION_CLEARANCE_CLEAR
+                    and abs(recovery_shift - prior) > 0.001
+                    and abs(recovery_shift) > MAX_CLEARANCE_SHIFT_POINTS
+                ):
+                    row["photo_adjustment_points"] = f"{recovery_shift:.2f}".rstrip("0").rstrip(".")
+                    corrections.append({
+                        **candidate,
+                        "to_points": recovery_shift,
+                        "predicted_status": CAPTION_CLEARANCE_CLEAR,
+                        "predicted_coverage": recovery_metrics.get("coverage"),
+                        "reason": "extended bounded horizontal recovery crop after normal photo and credits-frame options were exhausted",
+                    })
+                    continue
+                candidate["reason"] = "no permissible standard or bounded recovery crop, credits move, or combined photo-and-credits move clears the existing page"
                 unresolved.append(candidate)
                 continue
             candidate["reason"] = "photo crop does not safely resolve the rendered collision; use the approved existing-frame fallback"
@@ -3317,6 +3438,11 @@ def command_calibrate_safe_area(args: argparse.Namespace) -> None:
     visible = (archived.get("metrics") or {}).get("visible_text_bounds")
     if not isinstance(visible, list) or len(visible) != 4:
         fail(f"{look_id}: archived proof has no visible credits bounds.")
+    raw_visible_regions = (archived.get("metrics") or {}).get("visible_text_regions")
+    try:
+        visible_regions = _caption_text_regions(raw_visible_regions if raw_visible_regions else visible, f"{look_id} archived visible credits")
+    except GateError:
+        visible_regions = [_finite_bounds(visible, f"{look_id} archived visible credits bounds")]
     plan_path = composition_plan_path(project)
     with plan_path.open(newline="", encoding="utf-8-sig") as source:
         reader = csv.DictReader(source, delimiter="\t")
@@ -3342,7 +3468,17 @@ def command_calibrate_safe_area(args: argparse.Namespace) -> None:
         float(visible[2]) + original_frame[0] - current_frame[0],
         float(visible[3]) + original_frame[1] - current_frame[1],
     ]
+    visible_regions_base = [
+        [
+            region[0] + original_frame[0] - current_frame[0],
+            region[1] + original_frame[1] - current_frame[1],
+            region[2] + original_frame[0] - current_frame[0],
+            region[3] + original_frame[1] - current_frame[1],
+        ]
+        for region in visible_regions
+    ]
     geometry = dict(current_item); geometry["caption_bounds"] = original_frame
+    geometry["caption_text_regions"] = visible_regions_base
     native_item = _current_master_composition_item(project, state, look_id)
     if native_item is None:
         fail(f"{look_id}: no same-master native composition record is available for safe-area calibration.")
@@ -3355,10 +3491,14 @@ def command_calibrate_safe_area(args: argparse.Namespace) -> None:
         fail(f"{look_id}: native composition record has an inconsistent horizontal image shift.")
     prior = native_after[1] - native_before[1]
     source_image = child_of(state_artifact(project, state, "hires"), str(archived["source_filename"]))
-    proposed, _predicted = _best_horizontal_clearance_shift(source_image, {**current_item, "caption_bounds": visible}, prior)
-    candidate = _best_caption_frame_clearance(source_image, geometry, visible_base)
+    proposed, _predicted = _best_horizontal_clearance_shift(
+        source_image, {**current_item, "caption_bounds": visible, "caption_text_regions": visible_regions}, prior,
+    )
+    candidate = _best_caption_frame_clearance(source_image, geometry, visible_base, visible_regions=visible_regions_base)
     if candidate is None:
-        candidate = _best_combined_caption_clearance(source_image, geometry, visible_base, prior, proposed)
+        candidate = _best_combined_caption_clearance(
+            source_image, geometry, visible_base, prior, proposed, visible_regions=visible_regions_base,
+        )
     if candidate is None:
         fail(f"{look_id}: no clear credits position exists inside the page safe area.")
     target_shift = float(candidate.get("photo_adjustment_points", prior))
@@ -3496,14 +3636,21 @@ def command_render_safe_area_preview(args: argparse.Namespace) -> None:
     ):
         fail(f"{look_id}: saved calibration sits outside its interior safe area.")
     reader = PdfReader(str(pdf), strict=True)
-    visible_bounds, visible_fields = _visible_caption_text_bounds(reader, 1, caption_bounds)
+    visible_regions, visible_fields = _visible_caption_text_regions(reader, 1, caption_bounds)
+    visible_bounds = _union_bounds(visible_regions) if visible_regions else caption_bounds
     products = sum(1 for item in csv_rows(state_artifact(project, state, "captions"), CAPTION_FIELDS) if item["look_id"] == look_id)
     if visible_fields < products * 4:
         fail(f"{look_id}: targeted preview is missing rendered credit fields.")
+    visible_bounds, visible_bounds_source = _reliable_visible_caption_bounds(
+        visible_bounds, visible_fields, products * 4, caption_bounds,
+    )
+    if visible_bounds_source != "pdf-glyph-coordinates":
+        visible_regions = [visible_bounds]
     inspection = {
         "look_id": look_id,
         "graphic_bounds": _finite_bounds(record["after_left_graphic_bounds"], f"{look_id} calibrated graphic bounds"),
         "caption_bounds": visible_bounds,
+        "caption_text_regions": visible_regions,
     }
     source = child_of(state_artifact(project, state, "hires"), row["left_filename"])
     metrics, _crop, _mask = _caption_clearance_metrics(source, inspection, np, Image, ImageOps)

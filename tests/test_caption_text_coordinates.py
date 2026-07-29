@@ -49,6 +49,16 @@ def test_visible_caption_bounds_use_page_space_for_nested_pdf_forms() -> None:
     assert bounds[1] == 98.0
 
 
+def test_visible_caption_regions_do_not_turn_interline_whitespace_into_text() -> None:
+    regions, count = gate._visible_caption_text_regions(_FakeReader(), 1, [0, 0, 600, 600])
+
+    assert count == 2
+    assert regions == [[98.0, 98.0, 102.0, regions[0][3]], [198.0, 98.0, 202.0, regions[1][3]]]
+    # The union rectangle remains available for legacy callers, but the audit
+    # must keep the 96-point gap between visible rows transparent.
+    assert regions[0][2] < regions[1][0]
+
+
 def test_visible_caption_bounds_use_effective_text_matrix_scale() -> None:
     bounds, count = gate._visible_caption_text_bounds(_ScaledTextMatrixReader(), 1, [0, 0, 600, 600])
 
