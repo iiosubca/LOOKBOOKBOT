@@ -67,6 +67,7 @@ class PipelineEngine:
         start_key = start_key or self.store.first_incomplete_stage(project.id)
         if start_key not in keys:
             raise PipelineError(f"Неизвестный этап: {start_key}")
+        self._bind_copied_revision_structure(project, start_key)
         provider = self._provider(project)
         completed: list[str] = []
         for stage in STAGES[keys.index(start_key) :]:
@@ -97,6 +98,28 @@ class PipelineEngine:
             if not continue_after:
                 break
         return PipelineResult(tuple(completed), None, "Все доступные этапы завершены.")
+
+    def _bind_copied_revision_structure(self, project: ProjectRecord, start_key: str) -> None:
+        """Refresh copied-INDD object IDs before the first captions pass.
+
+        InDesign preserves the visible layout when it copies a reviewed INDD,
+        but gives every page item a new internal ID. The native controller
+        rebinds its read-only geometry profile before it can alter CREDiTs.
+        """
+        if start_key != "captions":
+            return
+        state = read_json(project.project_dir / "control" / "lookbook-state.json")
+        try:
+            revision = int(state.get("current_revision", 1))
+            bound_revision = int(state.get("structure_revision", 0))
+        except (TypeError, ValueError) as error:
+            raise PipelineError(f"Некорректный маркер структуры ревизии: {error}") from error
+        if revision <= 1 or bound_revision == revision:
+            return
+        self.log(
+            f"Ревизия {revision:02}: привязываю профиль существующих фреймов к новой копии INDD перед применением кредитов."
+        )
+        self.controller.gate("rebind-revision-structure", project.project_dir, timeout=300)
 
     def begin_caption_revision(self, project: ProjectRecord, audit: Path) -> None:
         """Copy the reviewed master and return the new revision to captions."""

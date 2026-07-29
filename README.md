@@ -1,5 +1,10 @@
 # LOOKBOOKBOT for Windows
 
+## Version 0.2.30
+
+- Creating a corrected `_02` revision now automatically rebinds the native structure profile to that exact copied INDD before credits are applied. InDesign regenerates internal frame IDs when a document is copied; the rebind verifies the existing structure and frames without changing the layout, preventing a false “credits frame moved” stop.
+- This rebind is also applied automatically when reopening an interrupted older revision that has not yet begun the captions transaction.
+
 ## Version 0.2.29
 
 - Caption corrections are now a non-destructive draft: saving any number of LOOK edits never modifies the reviewed `caption-data.tsv` or the current INDD.

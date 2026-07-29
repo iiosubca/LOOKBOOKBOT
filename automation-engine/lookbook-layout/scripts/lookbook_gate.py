@@ -4375,6 +4375,10 @@ def command_begin_revision(args: argparse.Namespace) -> None:
         write_json(evidence_file(project, "map"), prior_map)
     state["master"] = target.name
     state["current_revision"] = revision
+    # A copied INDD receives new native page-item IDs.  The structure proof is
+    # deliberately marked stale until the native worker has rebound its
+    # read-only geometry profile to this exact revision, before captions run.
+    state["structure_revision"] = revision - 1
     if caption_audit is not None:
         state["manual_caption_revision"] = str(archived_audit.relative_to(project))
     write_json(state_file(project), state)
@@ -4390,6 +4394,42 @@ def command_begin_revision(args: argparse.Namespace) -> None:
         print("Manual credits are bound to this new INDD revision. Reformat existing CREDiTs frames, then repeat visual proof, release, and review-PDF verification.")
     else:
         print("Apply only the recorded corrections to this new INDD, then repeat composition plan, native crop application, pair proof, visual confirmations, release, and review-PDF verification.")
+
+
+def command_rebind_revision_structure(args: argparse.Namespace) -> None:
+    """Bind structure geometry to a copied INDD before its first captions pass.
+
+    InDesign object IDs are document-local.  A `SaveACopy` revision retains
+    the visible layout but replaces those IDs, so comparing a revision to the
+    source proof by ID would falsely report moved CREDiTs frames.  The native
+    command performs an exact read-only structural/frames audit, then refreshes
+    only the controller's geometry evidence for the new master.
+    """
+    project = project_path(args.project)
+    state = load_state(project)
+    try:
+        revision = int(state.get("current_revision", 1))
+        structure_revision = int(state.get("structure_revision", 0))
+    except (TypeError, ValueError) as error:
+        fail(f"Revision structure marker is invalid: {error}")
+    if revision <= 1 or structure_revision == revision:
+        print("STRUCTURE REBIND: current geometry is already bound to this master.")
+        return
+    if current_gate(project, state) != "captions":
+        fail("Revision structure can be rebound only before the captions gate starts.")
+    if evidence_file(project, "captions").exists() or progress_file(project, "captions").exists():
+        fail("Revision structure cannot be rebound after native captions work has started.")
+    run_com_driver([
+        "-Action", "RebindRevisionStructureEvidence", "-Project", str(project),
+    ], timeout_seconds=300)
+    rebound = load_state(project)
+    if int(rebound.get("structure_revision", 0)) != revision:
+        fail("Native revision-structure rebind finished without a durable current-revision marker.")
+    proof = read_json(evidence_file(project, "structure"))
+    master = state_artifact(project, rebound, "master")
+    if not isinstance(proof.get("master"), dict) or not same_identity(proof["master"], identity(master)):
+        fail("Native revision-structure rebind did not bind geometry to the current INDD master.")
+    print(f"STRUCTURE REBIND PASS: revision {revision:02} geometry is bound to {master.name}.")
 
 
 def supersede_legacy_final_exports(project: Path, manifest: dict[str, Any]) -> list[str]:
@@ -4916,6 +4956,7 @@ def command_self_test(_: argparse.Namespace) -> None:
         if (
             revised_state["master"] != "master_02.indd" or not (project / "master_02.indd").exists()
             or current_gate(project, revised_state) != "captions" or not revised_state.get("manual_caption_revision")
+            or int(revised_state.get("structure_revision", 0)) != 1
         ):
             fail("Self-test failure: caption revision did not safely return to native CREDiTs formatting.")
         if digest(captions) != read_json(child_of(project, revised_state["manual_caption_revision"]))["after_caption_data_sha256"]:
@@ -5049,6 +5090,9 @@ def parser() -> argparse.ArgumentParser:
     prepare_revision.add_argument("project")
     prepare_revision.add_argument("--caption-audit", required=True, help="current LOOKBOOKBOT draft correction manifest")
     prepare_revision.set_defaults(func=command_prepare_caption_revision)
+    rebind_structure = commands.add_parser("rebind-revision-structure", help="refresh copied-INDD frame IDs and geometry before captions")
+    rebind_structure.add_argument("project")
+    rebind_structure.set_defaults(func=command_rebind_revision_structure)
     publish = commands.add_parser("publish-final", help="after explicit user approval, write the five final PDF variants")
     publish.add_argument("project")
     publish.add_argument("--approval-note", required=True, help="the user's explicit approval, for example: согласовано")

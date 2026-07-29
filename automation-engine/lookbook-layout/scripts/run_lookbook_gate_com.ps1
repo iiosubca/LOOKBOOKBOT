@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)][ValidateSet('ApplyGate', 'ApplyComposition', 'ApplyCompositionDelta', 'ApplyLookCalibration', 'ReapplyComposition', 'RepairCaptions', 'AuditCaptionClearance', 'ExportPdf', 'ExportPdfSet', 'PrepareTemplate')][string]$Action,
+    [Parameter(Mandatory = $true)][ValidateSet('ApplyGate', 'ApplyComposition', 'ApplyCompositionDelta', 'ApplyLookCalibration', 'ReapplyComposition', 'RepairCaptions', 'AuditCaptionClearance', 'RebindRevisionStructureEvidence', 'ExportPdf', 'ExportPdfSet', 'PrepareTemplate')][string]$Action,
     [string]$Project,
     [ValidateSet('structure', 'dates', 'frames', 'images', 'captions', 'release')][string]$Gate,
     [string]$Pdf,
@@ -741,6 +741,11 @@ function Write-Evidence($Control, $State, $Arm, [string]$GateName, [string]$Mast
         $geometry = @(Get-LockedFrameGeometry $Document)
         if ($geometry.Count -ne (3 * [int]$State.look_count)) { Fail "Structure geometry profile has $($geometry.Count) frames, expected $(3 * [int]$State.look_count)." }
         $evidence.frame_geometry = $geometry
+        # InDesign assigns fresh internal object IDs when an INDD is copied to
+        # the next correction revision.  Record the revision separately from
+        # the saved-master identity, which naturally changes after later
+        # native gates save dates, links and captions.
+        $evidence.structure_revision = if ($null -ne $State.PSObject.Properties['structure_revision']) { [int]$State.structure_revision } else { [int]$(if ($null -ne $State.PSObject.Properties['current_revision']) { $State.current_revision } else { 1 }) }
     }
     Write-Json (Join-Path $Control "evidence\$GateName.json") $evidence
 }
@@ -1484,6 +1489,67 @@ function Export-CaptionClearanceLayout([string]$ProjectPath) {
         throw
     }
 }
+function Rebind-RevisionStructureEvidence([string]$ProjectPath) {
+    # SaveACopy creates a new INDD with new internal page-item IDs.  The
+    # structural proof from the reviewed source must therefore be rebound to
+    # the untouched copy before the first CREDiTs transaction.  This action is
+    # read-only for the document: it only validates the copied structure and
+    # replaces the controller's ID/geometry snapshot.
+    $projectFull = [System.IO.Path]::GetFullPath($ProjectPath)
+    $control = Join-Path $projectFull 'control'
+    $statePath = Join-Path $control 'lookbook-state.json'
+    $state = Read-Json $statePath
+    $revision = if ($null -ne $state.PSObject.Properties['current_revision']) { [int]$state.current_revision } else { 1 }
+    if ($revision -le 1) {
+        Write-Output 'COM_STRUCTURE_REBIND_NOT_NEEDED initial-revision'
+        return
+    }
+    $boundRevision = if ($null -ne $state.PSObject.Properties['structure_revision']) { [int]$state.structure_revision } else { 0 }
+    if ($boundRevision -eq $revision) {
+        Write-Output "COM_STRUCTURE_REBIND_NOT_NEEDED revision=$revision"
+        return
+    }
+    $structurePath = Join-Path $control 'evidence\structure.json'
+    $prior = Read-Json $structurePath
+    if ($prior.schema -ne 1 -or $prior.gate -ne 'structure' -or -not $prior.passed -or $prior.session_id -ne $state.session_id -or $null -eq $prior.frame_geometry) {
+        Fail 'Cannot rebind revision structure: the accepted source structure proof is missing or invalid.'
+    }
+    $captionEvidence = Join-Path $control 'evidence\captions.json'
+    $captionProgress = Join-Path $control 'progress\captions.json'
+    if ((Test-Path -LiteralPath $captionEvidence -PathType Leaf) -or (Test-Path -LiteralPath $captionProgress -PathType Leaf)) {
+        Fail 'Cannot rebind revision structure after native captions work has begun.'
+    }
+    $masterPath = Join-Path $projectFull ([string]$state.master)
+    $registry = @(Read-Tsv (Join-Path $projectFull ([string]$state.registry)) @('look_id','spread_order','pdf_spread','left_filename','right_filename','indd_left_page','indd_right_page'))
+    $app = New-Object -ComObject InDesign.Application
+    Close-SavedAutomationMaster $app $masterPath 'Revision structure rebind'
+    $doc = $null
+    try {
+        $doc = Open-AutomationDocument $app $masterPath
+        if (-not $doc.Saved) { Fail 'Revision master opened with unsaved/recovered state.' }
+        Assert-Structure $doc $state $registry
+        Assert-Frames $doc $registry
+        $geometry = @(Get-LockedFrameGeometry $doc)
+        if ($geometry.Count -ne (3 * [int]$state.look_count)) { Fail "Revision structure geometry has $($geometry.Count) frames, expected $(3 * [int]$state.look_count)." }
+        $evidence = [ordered]@{
+            schema = 1; session_id = [string]$state.session_id; gate = 'structure'; passed = $true
+            nonce = [string]$prior.nonce; created_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+            master = Master-Identity $masterPath; page_item_count = (Get-DocumentPageItemCount $doc)
+            text_frame_count = [int]$doc.TextFrames.Count; checks = @('structure', 'revision-identity-rebind')
+            frame_geometry = $geometry; structure_revision = $revision; rebound_from_master = $prior.master
+        }
+        Write-Json $structurePath $evidence
+        if ($null -ne $state.PSObject.Properties['structure_revision']) { $state.structure_revision = $revision }
+        else { $state | Add-Member -NotePropertyName structure_revision -NotePropertyValue $revision }
+        Write-Json $statePath $state
+        $doc.Close($SAVE_NO); $doc = $null
+        Write-Output "COM_STRUCTURE_REBIND_PASS revision=$revision frames=$($geometry.Count)"
+    } catch {
+        try { $_ | Out-File -LiteralPath (Join-Path $control 'progress\structure-rebind-last-error.txt') -Encoding utf8 -Force } catch {}
+        if ($null -ne $doc) { try { $doc.Close($SAVE_NO) } catch {} }
+        throw
+    }
+}
 function Invoke-Gate([string]$ProjectPath, [string]$GateName) {
     $projectFull = [System.IO.Path]::GetFullPath($ProjectPath)
     $control = Join-Path $projectFull 'control'
@@ -1705,6 +1771,7 @@ try {
     elseif ($Action -eq 'ReapplyComposition') { Invoke-Composition $Project $BatchSize $true }
     elseif ($Action -eq 'RepairCaptions') { Invoke-CaptionRepair $Project $BatchSize }
     elseif ($Action -eq 'AuditCaptionClearance') { Export-CaptionClearanceLayout $Project }
+    elseif ($Action -eq 'RebindRevisionStructureEvidence') { Rebind-RevisionStructureEvidence $Project }
     elseif ($Action -eq 'ExportPdf') { Export-AdobePrintPdf $Project $Pdf $RasterResolution $PageRange }
     elseif ($Action -eq 'ExportPdfSet') { Export-AdobePrintPdfSet $Project $ExportPlan }
     elseif ($Action -eq 'PrepareTemplate') { Prepare-Template $TemplateSource $TemplateDestination }
