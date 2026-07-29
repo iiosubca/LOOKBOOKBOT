@@ -8,7 +8,7 @@ from datetime import date
 from pathlib import Path
 
 from PySide6.QtCore import QDate, QObject, QSize, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QPixmap
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -61,15 +61,6 @@ from .state import StateStore
 from .visual_audit import load_visual_audit
 
 
-STATUS_ICON = {
-    StageStatus.PENDING.value: "○",
-    StageStatus.RUNNING.value: "◌",
-    StageStatus.PASSED.value: "✓",
-    StageStatus.REVIEW.value: "!",
-    StageStatus.FAILED.value: "×",
-    StageStatus.BLOCKED.value: "■",
-}
-
 STATUS_COLOR = {
     StageStatus.PENDING.value: "#7c8798",
     StageStatus.RUNNING.value: "#f59e0b",
@@ -78,6 +69,23 @@ STATUS_COLOR = {
     StageStatus.FAILED.value: "#ef4444",
     StageStatus.BLOCKED.value: "#ef4444",
 }
+
+
+def _stage_status_square(status: str) -> QIcon:
+    """Render the release-stage state with the same square language as checks."""
+    fill = {
+        StageStatus.PASSED.value: "#111111",
+        StageStatus.FAILED.value: "#e84b16",
+        StageStatus.BLOCKED.value: "#e84b16",
+    }.get(status, "#ffffff")
+    pixmap = QPixmap(14, 14)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setPen(QPen(QColor("#111111"), 1))
+    painter.setBrush(QColor(fill))
+    painter.drawRect(1, 1, 11, 11)
+    painter.end()
+    return QIcon(pixmap)
 
 
 def _asset_path(filename: str) -> Path:
@@ -337,7 +345,8 @@ class MainWindow(QMainWindow):
         self.stage_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.stage_list.itemSelectionChanged.connect(self._stage_selected)
         for stage in STAGES:
-            item = QListWidgetItem(f"○  {stage.title}")
+            item = QListWidgetItem(stage.title)
+            item.setIcon(_stage_status_square(StageStatus.PENDING.value))
             item.setData(Qt.ItemDataRole.UserRole, stage.key)
             item.setToolTip(stage.description)
             item.setSizeHint(QSize(280, 44))
@@ -1040,7 +1049,8 @@ class MainWindow(QMainWindow):
         for stage in STAGES:
             status = rows.get(stage.key, {}).get("status", StageStatus.PENDING.value)
             item = self.stage_items[stage.key]
-            item.setText(f"{STATUS_ICON.get(status, '○')}  {stage.title}")
+            item.setText(stage.title)
+            item.setIcon(_stage_status_square(status))
             item.setForeground(QColor(STATUS_COLOR.get(status, "#e8edf5")))
             error = rows.get(stage.key, {}).get("error", "")
             item.setToolTip(error or stage.description)
