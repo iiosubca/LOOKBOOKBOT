@@ -1,5 +1,11 @@
 # LOOKBOOKBOT for Windows
 
+## Version 0.2.29
+
+- Caption corrections are now a non-destructive draft: saving any number of LOOK edits never modifies the reviewed `caption-data.tsv` or the current INDD.
+- Before creating `_02`, the app automatically finishes the missing release and review-PDF proof for `_01`; only then does it copy the master and apply the saved draft to the new revision.
+- Projects created by older builds are recovered automatically: if a legacy draft had already altered `caption-data.tsv`, its audited baseline is restored before the original review PDF is released, while the intended corrections remain preserved for `_02`.
+
 ## Version 0.2.28
 
 - Credit corrections now accumulate automatically in one revision draft while moving between looks. Only "Create new version and review PDF" creates the next sequential INDD and its matching review PDF.

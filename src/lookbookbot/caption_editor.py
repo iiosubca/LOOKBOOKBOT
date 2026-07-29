@@ -7,6 +7,7 @@ applies the prepared CREDiTs paragraph style and its nested character styles.
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 from dataclasses import dataclass, asdict
@@ -100,6 +101,19 @@ def replace_look_products(rows: list[dict[str, str]], look_id: str, products: It
 
 
 def write_caption_rows(path: Path, rows: Iterable[dict[str, str]]) -> None:
+    content = _caption_rows_content(rows)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(content, encoding="utf-8")
+    temporary.replace(path)
+
+
+def caption_rows_sha256(rows: Iterable[dict[str, str]]) -> str:
+    """Hash a prospective TSV without changing the reviewed source file."""
+    return hashlib.sha256(_caption_rows_content(rows).encode("utf-8")).hexdigest()
+
+
+def _caption_rows_content(rows: Iterable[dict[str, str]]) -> str:
     content = io.StringIO(newline="")
     writer = csv.DictWriter(content, fieldnames=CAPTION_FIELDS, delimiter="\t", lineterminator="\n")
     writer.writeheader()
@@ -108,9 +122,36 @@ def write_caption_rows(path: Path, rows: Iterable[dict[str, str]]) -> None:
         if any(not value for value in clean.values()):
             raise CaptionEditorError("У каждого товара должны быть заполнены тип, бренд, цена и артикул.")
         writer.writerow(clean)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(content.getvalue(), encoding="utf-8")
-    temporary.replace(path)
+    return content.getvalue()
+
+
+def apply_caption_draft(rows: list[dict[str, str]], draft: dict) -> list[dict[str, str]]:
+    """Overlay saved draft corrections for display, never touching caption-data.tsv."""
+    changes = draft.get("changes") if isinstance(draft, dict) else None
+    if not isinstance(changes, list):
+        return rows
+    result = list(rows)
+    for change in changes:
+        if not isinstance(change, dict):
+            raise CaptionEditorError("Черновик правок имеет неверную структуру.")
+        look_id = _clean(str(change.get("look_id", ""))).upper()
+        products = change.get("after")
+        if not look_id or not isinstance(products, list):
+            raise CaptionEditorError("Черновик правок не содержит корректный лук и кредиты.")
+        replacement: list[CaptionProduct] = []
+        for product in products:
+            if not isinstance(product, dict):
+                raise CaptionEditorError(f"Черновик {look_id} содержит неверный товар.")
+            replacement.append(
+                CaptionProduct(
+                    _clean(str(product.get("type", ""))),
+                    _clean(str(product.get("brand", ""))),
+                    _clean(str(product.get("price", ""))),
+                    _clean(str(product.get("article", ""))),
+                )
+            )
+        result = replace_look_products(result, look_id, replacement)
+    return result
 
 
 def write_caption_audit(

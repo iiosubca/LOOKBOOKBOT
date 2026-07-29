@@ -41,18 +41,19 @@ from PySide6.QtWidgets import (
 from .config import ToolPaths
 from .caption_editor import (
     CaptionEditorError,
+    apply_caption_draft,
+    caption_rows_sha256,
     format_caption_editor,
     parse_caption_editor,
     products_for_look,
     read_caption_rows,
     replace_look_products,
     write_caption_audit,
-    write_caption_rows,
 )
 from .controller import read_json
 from .discovery import discover_sources, infer_output_root
 from .domain import ProviderKind, STAGES, StageStatus, project_code
-from .pipeline import PipelineEngine
+from .pipeline import PipelineEngine, PipelineError
 from .project_import import ExistingProjectError, open_existing_project
 from .providers import ProviderError, make_provider
 from .secrets import get_google_api_key, save_google_api_key
@@ -120,6 +121,13 @@ class PipelineWorker(QObject):
                 progress=lambda key, status, message: self.stage.emit(key, status.value, message),
             )
             if self.caption_revision_audit:
+                engine.prepare_caption_revision(project, Path(self.caption_revision_audit))
+                baseline = engine.finish_review_before_caption_revision(project)
+                if baseline.stopped_at:
+                    raise PipelineError(
+                        "Исходная версия не прошла обязательный выпуск PDF на проверку перед созданием новой ревизии: "
+                        + baseline.message
+                    )
                 engine.begin_caption_revision(project, Path(self.caption_revision_audit))
                 result = engine.run(project, "captions", continue_after=True, stop_after="review")
             else:
@@ -1250,6 +1258,9 @@ class MainWindow(QMainWindow):
                 return
             try:
                 self._correction_rows = read_caption_rows(self.project.project_dir / "control" / "work" / "caption-data.tsv")
+                draft = self._caption_draft_path()
+                if draft and draft.is_file():
+                    self._correction_rows = apply_caption_draft(self._correction_rows, read_json(draft))
             except CaptionEditorError:
                 self.correction_editor.clear()
                 self.correction_title.setText("ПРАВКИ ДОСТУПНЫ ПОСЛЕ PDF НА ПРОВЕРКУ")
@@ -1331,8 +1342,10 @@ class MainWindow(QMainWindow):
             before = products_for_look(self._correction_rows, self._correction_look_id)
             before_sha = self._file_sha256(caption_path)
             replacement = replace_look_products(self._correction_rows, self._correction_look_id, products)
-            write_caption_rows(caption_path, replacement)
-            after_sha = self._file_sha256(caption_path)
+            # Keep the reviewed caption-data.tsv pristine until the baseline
+            # release has passed.  The draft is applied atomically only after
+            # the next INDD revision has been copied.
+            after_sha = caption_rows_sha256(replacement)
             draft = write_caption_audit(
                 self.project.project_dir,
                 self._correction_look_id,

@@ -119,6 +119,33 @@ class PipelineEngine:
         self.store.set_approved(project.id, False)
         self.store.reset_from(project.id, "captions")
 
+    def prepare_caption_revision(self, project: ProjectRecord, audit: Path) -> None:
+        """Keep the reviewed source pristine before completing its release/PDF."""
+        root = project.project_dir
+        try:
+            relative_audit = audit.resolve().relative_to(root.resolve())
+        except ValueError as error:
+            raise PipelineError("Файл правок должен находиться внутри папки проекта.") from error
+        self.controller.gate(
+            "prepare-caption-revision", root,
+            "--caption-audit", str(relative_audit),
+            timeout=120,
+        )
+
+    def finish_review_before_caption_revision(self, project: ProjectRecord) -> PipelineResult:
+        """Finish the unedited master before copying a caption revision.
+
+        A correction draft may be saved while the original review PDF still
+        lacks its release evidence.  The draft itself is deliberately outside
+        the reviewed TSV, so it is safe to resume only the release/PDF stage
+        here.  Resetting the local stage marker prevents an old failed or
+        falsely-completed desktop status from skipping the controller proof.
+        """
+        if evidence_passed(project.project_dir, "pdf"):
+            return PipelineResult((), None, "Исходный PDF на проверку уже подтверждён контроллером.")
+        self.store.reset_from(project.id, "review")
+        return self.run(project, "review", continue_after=False, stop_after="review")
+
     def _provider(self, project: ProjectRecord) -> ModelProvider:
         return make_provider(
             project.provider,
