@@ -1,5 +1,9 @@
 # LOOKBOOKBOT for Windows
 
+## Version 0.2.34
+
+- Fixed revision continuity after a verified review PDF: a current `_NN_review.pdf` that is present **and** accepted by controller evidence now unlocks creation of the next `_NN+1.indd`. A merely similarly named or stale PDF never does.
+
 ## Version 0.2.33
 
 - Credit-correction release is now split into two deliberate actions: **Create new version** creates and formats the next sequential INDD only; **Write PDF of selected version** runs the remaining release path and writes that revision's review PDF.
