@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from lookbookbot.domain import ProviderKind
 from lookbookbot.pipeline import PipelineEngine
 from lookbookbot.state import StateStore
+from lookbookbot.ui import MainWindow
 
 
 def _project(store: StateStore, tmp_path: Path):
@@ -56,3 +57,19 @@ def test_scope_only_visual_route_runs_scope_audit_without_rendering_pairs(tmp_pa
 
     assert actions == ["arm", "audit-caption-revision-scope", "record-caption-revision-scope-visual"]
     assert "render-revision-visual-proof" not in actions
+
+
+def test_next_revision_is_allowed_after_the_current_review_pdf_is_controller_confirmed(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    (root / "control" / "evidence").mkdir(parents=True)
+    master = "TSUM_FS-0261112_LB_WA_03.indd"
+    pdf = "TSUM_FS-0261112_LB_WA_03_review.pdf"
+    (root / pdf).write_bytes(b"review PDF")
+    (root / "control" / "lookbook-state.json").write_text(json.dumps({"master": master}), encoding="utf-8")
+    (root / "control" / "evidence" / "pdf.json").write_text(
+        json.dumps({"passed": True, "master": {"name": master}, "pdf": {"name": pdf}}), encoding="utf-8"
+    )
+
+    window_stub = SimpleNamespace(project=SimpleNamespace(project_dir=root))
+
+    assert MainWindow._current_caption_revision_review_pdf_passed(window_stub) is True
