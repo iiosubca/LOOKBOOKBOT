@@ -477,22 +477,37 @@ def restore_caption_revision_draft_baseline(project: Path, state: dict[str, Any]
     changes = manual_caption_changes(payload)
     captions = state_artifact(project, state, "captions")
     before_hash = str(payload.get("before_caption_data_sha256", ""))
-    after_hash = str(payload.get("after_caption_data_sha256", ""))
     current_hash = digest(captions)
     if current_hash == before_hash:
         validate_caption_revision_draft_baseline(project, state, audit)
         return False
-    if not after_hash or current_hash != after_hash:
-        fail("Manual caption draft differs from both its reviewed baseline and saved draft target; automatic recovery is unsafe.")
-    current = csv_rows(captions, CAPTION_FIELDS)
-    grouped = caption_rows_by_look(current)
-    restored = current
+
+    # A legacy desktop build could save one correction directly to the TSV,
+    # then a later draft save could replace its global ``after`` hash without
+    # touching that TSV.  The working file is therefore not trustworthy as a
+    # recovery source.  Rebuild the reviewed base from the map and workbook
+    # already bound to the accepted map evidence instead.
+    map_evidence = read_json(evidence_file(project, "map"))
+    if map_evidence.get("caption_data_sha256") != before_hash:
+        fail("Manual caption draft does not identify the caption source bound to the accepted map evidence.")
+    registry = validate_registry(
+        state_artifact(project, state, "registry"), int(state["look_count"]), state_artifact(project, state, "hires"),
+    )
+    caption_map = validate_caption_map(
+        project,
+        state_artifact(project, state, "caption_map"),
+        registry,
+        state_artifact(project, state, "hires"),
+        int(state["look_count"]),
+    )
+    restored = workbook_caption_rows(state_artifact(project, state, "caption_workbook"), caption_map)
+    restored_by_look = caption_rows_by_look(restored)
     for look_id, change in changes.items():
-        if grouped.get(look_id) != manual_caption_rows(look_id, change["after"]):
-            fail(f"{look_id}: legacy draft no longer matches the saved correction target.")
-        restored = replace_caption_look(restored, look_id, manual_caption_rows(look_id, change["before"]))
+        if restored_by_look.get(look_id) != manual_caption_rows(look_id, change["before"]):
+            fail(f"{look_id}: saved correction does not start from the Excel-and-map-verified caption source.")
+
     # The Excel builder historically emits CRLF while legacy UI corrections
-    # emitted LF.  Controller evidence binds the *reviewed bytes*, therefore
+    # emitted LF. Controller evidence binds the *reviewed bytes*, therefore
     # reconstruct the source in the one byte form that matches its signed
     # baseline rather than assuming the current draft's line ending.
     restored_bytes: bytes | None = None
@@ -505,9 +520,17 @@ def restore_caption_revision_draft_baseline(project: Path, state: dict[str, Any]
         if restored_bytes is not None:
             break
     if restored_bytes is None:
-        fail("Legacy caption draft has the right products but its reviewed TSV byte format cannot be reconstructed safely.")
+        fail("Verified caption source was rebuilt but its signed TSV byte format cannot be reconstructed safely.")
     original = captions.read_bytes()
     try:
+        # Do not discard an old direct-edit artefact. It is not allowed to
+        # govern the next revision, but is retained under control/work for a
+        # forensic comparison if needed.
+        recovery = work_path(project) / "manual-caption-revisions" / "recovered-legacy"
+        recovery.mkdir(parents=True, exist_ok=True)
+        backup = recovery / f"caption-data-{hashlib.sha256(original).hexdigest()[:16]}.tsv"
+        if not backup.exists():
+            backup.write_bytes(original)
         temporary = captions.with_suffix(captions.suffix + ".tmp")
         temporary.write_bytes(restored_bytes)
         os.replace(temporary, captions)
@@ -4868,7 +4891,10 @@ def command_self_test(_: argparse.Namespace) -> None:
         write_json(caption_audit, {
             "schema": "lookbookbot-caption-revision-v1", "created_at": utc_now(),
             "look_ids": ["LOOK_001"], "before_caption_data_sha256": before_caption_hash,
-            "after_caption_data_sha256": digest(captions), "changes": [{
+            # Simulate a later UI draft save that correctly retains the
+            # semantic correction but carries a new prospective full-TSV
+            # digest while the old direct edit still remains on disk.
+            "after_caption_data_sha256": "stale-prospective-draft-hash", "changes": [{
                 "look_id": "LOOK_001", "before": [{"type": "TYPE", "brand": "BRAND", "price": "1 000 ₽", "article": "A"}],
                 "after": [{"type": "MANUAL TYPE", "brand": "BRAND", "price": "1 000 ₽", "article": "A"}],
             }],
