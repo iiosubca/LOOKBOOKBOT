@@ -1,5 +1,9 @@
 # LOOKBOOKBOT for Windows
 
+## Version 0.2.37
+
+Every new project now freezes a project-local source snapshot before the INDD master is created: the PDF reference, Excel catalogue, all hires and the automation template live under `control/work/_mat`. On resume, LOOKBOOKBOT verifies and uses only that snapshot; it neither reads nor overwrites from the currently selected SOURCES folder. Legacy projects gain the same protection as soon as their preparation step is opened again.
+
 ## Version 0.2.36
 
 Correction revisions are now explicitly two-phase: the copied INDD is marked as being built until the native CREDiTs pass has written and verified every saved edit. LOOKBOOKBOT shows “Версия готова к просмотру” only after the verified draft hash and exact current-master captions evidence agree, so a just-copied or subsequently overwritten source file cannot be mistaken for the finished correction version.

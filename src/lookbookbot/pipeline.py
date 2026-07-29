@@ -33,6 +33,109 @@ class PipelineError(RuntimeError):
     pass
 
 
+SOURCE_SNAPSHOT_SCHEMA = 1
+SOURCE_SNAPSHOT_RELATIVE = Path("control/work/source-snapshot.json")
+SOURCE_SNAPSHOT_REQUIRED = {
+    "control/work/_mat/reference.pdf",
+    "control/work/_mat/caption-source.xlsx",
+    "control/work/_mat/automation-template.indd",
+}
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _snapshot_entry(root: Path, path: Path, *, original: Path | None = None) -> dict[str, str | int]:
+    relative = path.resolve().relative_to(root.resolve()).as_posix()
+    entry: dict[str, str | int] = {
+        "path": relative,
+        "sha256": _sha256(path),
+        "bytes": path.stat().st_size,
+    }
+    if original is not None:
+        entry["source_name"] = original.name
+    return entry
+
+
+def _validate_source_snapshot(root: Path) -> dict:
+    """Validate the project's immutable local source snapshot.
+
+    Source folders are living input folders.  Once a project is prepared, its
+    PDF, Excel, hires and automation template must be read only from the
+    project-local work area, even if the selected SOURCES folder later changes
+    or disappears.
+    """
+    manifest = root / SOURCE_SNAPSHOT_RELATIVE
+    payload = read_json(manifest)
+    entries = payload.get("files") if isinstance(payload.get("files"), list) else []
+    if payload.get("schema") != SOURCE_SNAPSHOT_SCHEMA or not entries:
+        raise PipelineError("Повреждён снимок исходных материалов проекта. Нельзя безопасно продолжить с изменёнными SOURCES.")
+    expected_paths: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise PipelineError("Снимок исходных материалов содержит некорректную запись.")
+        relative = str(entry.get("path", "")).replace("\\", "/")
+        candidate = (root / relative).resolve()
+        try:
+            candidate.relative_to(root.resolve())
+        except ValueError as error:
+            raise PipelineError("Снимок исходных материалов ссылается за пределы папки проекта.") from error
+        if not relative or not candidate.is_file():
+            raise PipelineError(f"В проекте отсутствует зафиксированный исходник: {relative or 'без имени'}.")
+        if entry.get("sha256") != _sha256(candidate) or int(entry.get("bytes", -1)) != candidate.stat().st_size:
+            raise PipelineError(f"Зафиксированный исходник был изменён: {relative}. Восстановите его из резервной копии проекта.")
+        expected_paths.add(relative)
+    missing = SOURCE_SNAPSHOT_REQUIRED - expected_paths
+    if missing:
+        raise PipelineError("Снимок исходных материалов неполный: " + ", ".join(sorted(missing)))
+    return payload
+
+
+def _freeze_source_snapshot(root: Path, bundle) -> dict:
+    """Copy all live inputs once, then record exact local identities."""
+    controlled = root / "control" / "work" / "_mat"
+    controlled.mkdir(parents=True, exist_ok=True)
+    pinned = (
+        (bundle.reference_pdf, controlled / "reference.pdf"),
+        (bundle.workbook, controlled / "caption-source.xlsx"),
+        (bundle.template, controlled / "automation-template.indd"),
+    )
+    for source, target in pinned:
+        # Never overwrite a local file. A resumed/legacy project must keep its
+        # own historical inputs rather than silently receiving newer SOURCES.
+        if not target.exists():
+            shutil.copy2(source, target)
+    hires = controlled / "hires"
+    hires.mkdir(parents=True, exist_ok=True)
+    for image in sorted((*bundle.hires.glob("*.jpg"), *bundle.hires.glob("*.jpeg")), key=lambda p: p.name.casefold()):
+        target = hires / image.name
+        if not target.exists():
+            shutil.copy2(image, target)
+    local_files = [controlled / "reference.pdf", controlled / "caption-source.xlsx", controlled / "automation-template.indd"]
+    local_files.extend(sorted((*hires.glob("*.jpg"), *hires.glob("*.jpeg")), key=lambda p: p.name.casefold()))
+    if not any(path.parent == hires for path in local_files):
+        raise PipelineError("Не удалось скопировать hires в локальный снимок проекта.")
+    original_by_target = {
+        controlled / "reference.pdf": bundle.reference_pdf,
+        controlled / "caption-source.xlsx": bundle.workbook,
+        controlled / "automation-template.indd": bundle.template,
+    }
+    original_by_target.update({hires / path.name: path for path in (*bundle.hires.glob("*.jpg"), *bundle.hires.glob("*.jpeg"))})
+    payload = {
+        "schema": SOURCE_SNAPSHOT_SCHEMA,
+        "selected_source_folder": str(bundle.selected_root),
+        "files": [
+            _snapshot_entry(root, path, original=original_by_target.get(path))
+            for path in local_files
+        ],
+    }
+    snapshot = root / SOURCE_SNAPSHOT_RELATIVE
+    snapshot.parent.mkdir(parents=True, exist_ok=True)
+    snapshot.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return payload
+
+
 @dataclass(frozen=True)
 class PipelineResult:
     completed: tuple[str, ...]
@@ -271,27 +374,31 @@ class PipelineEngine:
         missing = self.tools.validate()
         if missing:
             raise PipelineError("Не найдены обязательные инструменты:\n" + "\n".join(missing))
+        root = project.project_dir
+        root.mkdir(parents=True, exist_ok=True)
+        self.controller.script("create_lookbook_work_area.py", root, timeout=120)
+        snapshot = root / SOURCE_SNAPSHOT_RELATIVE
+        if snapshot.is_file():
+            _validate_source_snapshot(root)
+            template = root / "control" / "work" / "_mat" / "automation-template.indd"
+            master = root / master_filename(project.show_date)
+            if not master.exists():
+                shutil.copy2(template, master)
+            return (
+                f"Проект подготовлен: {root.name}. Используется сохранённый снимок PDF, Excel, hires и шаблона "
+                "из control/work/_mat; текущая папка SOURCES не читается."
+            )
         report = discover_sources(project.source_dir, self.tools)
         if report.bundle is None:
             raise PipelineError("\n".join(report.messages))
-        bundle = report.bundle
-        root = project.project_dir
-        root.mkdir(parents=True, exist_ok=True)
+        _freeze_source_snapshot(root, report.bundle)
         master = root / master_filename(project.show_date)
         if not master.exists():
-            shutil.copy2(bundle.template, master)
-        self.controller.script("create_lookbook_work_area.py", root, timeout=120)
-        controlled = root / "control" / "work" / "_mat"
-        controlled.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(bundle.reference_pdf, controlled / "reference.pdf")
-        shutil.copy2(bundle.workbook, controlled / "caption-source.xlsx")
-        target_hires = controlled / "hires"
-        target_hires.mkdir(parents=True, exist_ok=True)
-        for image in sorted((*bundle.hires.glob("*.jpg"), *bundle.hires.glob("*.jpeg")), key=lambda p: p.name.casefold()):
-            target = target_hires / image.name
-            if not target.exists() or target.stat().st_size != image.stat().st_size:
-                shutil.copy2(image, target)
-        return f"Проект подготовлен: {root.name}. Все рабочие файлы находятся в control/work."
+            shutil.copy2(root / "control" / "work" / "_mat" / "automation-template.indd", master)
+        return (
+            f"Проект подготовлен: {root.name}. PDF, Excel, hires и шаблон скопированы в control/work/_mat; "
+            "InDesign будет работать только с локальными копиями проекта."
+        )
 
     def _looks(self, project: ProjectRecord) -> str:
         self._require_prepared(project)
