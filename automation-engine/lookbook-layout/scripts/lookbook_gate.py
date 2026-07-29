@@ -312,26 +312,39 @@ def load_evidence(project: Path, state: dict[str, Any], gate: str) -> dict[str, 
         return evidence
     if gate == "visual":
         try:
-            plan = composition_plan_path(project)
-            applied = composition_applied_path(project)
             proof = visual_proof_manifest_path(project)
-            validate_composition_plan(project, state)
-            validate_composition_applied(project, state)
-            validate_visual_proof(project, state)
+            manifest = validate_visual_proof(project, state)
             clearance = validate_caption_clearance(project, state)
             validate_visual_confirmations(project, state)
             clearance_fingerprint = hashlib.sha256(
                 "\n".join(f"{item['look_id']}:{_caption_clearance_item_fingerprint(item)}" for item in clearance["items"]).encode("utf-8")
             ).hexdigest()
-            if (
-                evidence.get("composition_plan_sha256") != digest(plan)
-                or evidence.get("composition_applied_sha256") != digest(applied)
-                or evidence.get("visual_proof_manifest_sha256") != digest(proof)
-                or evidence.get("caption_clearance_sha256") != digest(caption_clearance_report_path(project))
-                or evidence.get("caption_clearance_fingerprint") != clearance_fingerprint
-                or evidence.get("visual_confirmation_fingerprint") != visual_confirmation_fingerprint(project, state)
-            ):
+            common_matches = (
+                evidence.get("visual_proof_manifest_sha256") == digest(proof)
+                and evidence.get("caption_clearance_sha256") == digest(caption_clearance_report_path(project))
+                and evidence.get("caption_clearance_fingerprint") == clearance_fingerprint
+                and evidence.get("visual_confirmation_fingerprint") == visual_confirmation_fingerprint(project, state)
+            )
+            if not common_matches:
                 return None
+            if targeted_visual_mode(project, state, manifest):
+                record = caption_revision_record(project, state)
+                scope_path = control_path(project) / "revisions" / f"revision-{int(state['current_revision']):02}-scope-audit.json"
+                if (
+                    record is None
+                    or evidence.get("mode") != "caption-revision-targeted"
+                    or not scope_path.is_file()
+                    or evidence.get("revision_scope_sha256") != digest(scope_path)
+                    or evidence.get("source_visual_evidence_sha256") != record.get("source_visual_evidence_sha256")
+                ):
+                    return None
+            else:
+                plan = composition_plan_path(project)
+                applied = composition_applied_path(project)
+                validate_composition_plan(project, state)
+                validate_composition_applied(project, state)
+                if evidence.get("composition_plan_sha256") != digest(plan) or evidence.get("composition_applied_sha256") != digest(applied):
+                    return None
         except (GateError, OSError):
             return None
     master = state_artifact(project, state, "master")
@@ -934,6 +947,48 @@ def visual_confirmation_dir(project: Path) -> Path:
     return control_path(project) / "visual" / "confirmations"
 
 
+def revision_record_path(project: Path, state: dict[str, Any]) -> Path:
+    """Return the immutable record for the revision currently being worked on."""
+    try:
+        revision = int(state.get("current_revision", 1))
+    except (TypeError, ValueError) as error:
+        fail(f"Current revision number is invalid: {error}")
+    return control_path(project) / "revisions" / f"revision-{revision:02}.json"
+
+
+def caption_revision_record(project: Path, state: dict[str, Any]) -> dict[str, Any] | None:
+    """Load the scoped record only for a manual credits-only revision."""
+    if not state.get("manual_caption_revision"):
+        return None
+    path = revision_record_path(project, state)
+    if not path.is_file():
+        fail("Manual caption revision is missing its immutable revision record.")
+    record = read_json(path)
+    if record.get("schema") != SCHEMA or record.get("kind") != "captions":
+        fail("Manual caption revision record is malformed or belongs to another revision type.")
+    current_master = state_artifact(project, state, "master")
+    if not isinstance(record.get("master"), dict) or record["master"].get("name") != current_master.name:
+        # A native captions pass legitimately saves the copy and changes file
+        # length/mtime. The immutable record binds the target by its unique
+        # revision filename; current identity is checked by every later proof.
+        fail("Manual caption revision record does not belong to the current INDD revision filename.")
+    targets = record.get("changed_looks")
+    if not isinstance(targets, list) or not targets or any(not re.fullmatch(r"LOOK_\d{3}", str(item)) for item in targets):
+        fail("Manual caption revision record has no valid changed LOOK IDs.")
+    if len(set(targets)) != len(targets):
+        fail("Manual caption revision record contains duplicated changed LOOK IDs.")
+    return record
+
+
+def targeted_visual_mode(project: Path, state: dict[str, Any], manifest: dict[str, Any] | None = None) -> bool:
+    if manifest is None:
+        path = visual_proof_manifest_path(project)
+        if not path.is_file():
+            return False
+        manifest = read_json(path)
+    return manifest.get("generator") == "lookbook_gate.py:render-revision-visual-proof"
+
+
 def caption_clearance_layout_path(project: Path) -> Path:
     """Read-only InDesign coordinate snapshot for the credit-clearance audit."""
     return control_path(project) / "visual" / "caption-clearance-layout.json"
@@ -1134,6 +1189,8 @@ def validate_visual_proof(project: Path, state: dict[str, Any]) -> dict[str, Any
     applied = composition_applied_path(project)
     manifest_path = visual_proof_manifest_path(project)
     manifest = read_json(manifest_path)
+    if targeted_visual_mode(project, state, manifest):
+        return validate_targeted_revision_visual_proof(project, state, manifest)
     if manifest.get("schema") != SCHEMA or manifest.get("generator") != "lookbook_gate.py:render-visual-proof":
         fail("Visual proof manifest was not generated from the current native InDesign PDF proof.")
     if manifest.get("session_id") != state["session_id"]:
@@ -1174,6 +1231,87 @@ def validate_visual_proof(project: Path, state: dict[str, Any]) -> dict[str, Any
         image = child_of(project, item.get("image", ""))
         if not image.is_file() or image.stat().st_size < 1024 or item.get("sha256") != digest(image):
             fail("Visual proof overview render is missing or changed.")
+    return manifest
+
+
+def validate_targeted_revision_visual_proof(project: Path, state: dict[str, Any], manifest: dict[str, Any]) -> dict[str, Any]:
+    """Validate a credits-only revision proof without re-rendering unchanged looks.
+
+    The previous revision already has a complete visual proof.  A manual credits
+    revision may inherit that proof only when native COM has recorded that every
+    unedited look kept its two image frames, crop geometry and credits text.
+    The new proof therefore contains exactly the changed looks, never a silent
+    sample of the book.
+    """
+    record = caption_revision_record(project, state)
+    if record is None:
+        fail("Targeted visual proof is allowed only for a manual credits revision.")
+    scope_path = control_path(project) / "revisions" / f"revision-{int(state['current_revision']):02}-scope-audit.json"
+    if not scope_path.is_file():
+        fail("Targeted visual proof is missing the native unchanged-look scope audit.")
+    scope = read_json(scope_path)
+    master = state_artifact(project, state, "master")
+    if (
+        scope.get("schema") != SCHEMA
+        or scope.get("generator") != "run_lookbook_gate_com.ps1:AuditCaptionRevisionScope"
+        or scope.get("session_id") != state["session_id"]
+        or scope.get("passed") is not True
+        or not isinstance(scope.get("master"), dict)
+        or not same_identity(scope["master"], identity(master))
+        or sorted(scope.get("changed_looks", [])) != sorted(record["changed_looks"])
+    ):
+        fail("Targeted visual proof has no valid native audit of the inherited unchanged looks.")
+    source_evidence = child_of(project, str(record.get("source_visual_evidence", "")))
+    source_manifest = child_of(project, str(record.get("source_visual_manifest", "")))
+    source_proof = child_of(project, str(record.get("source_visual_proof", "")))
+    if (
+        not source_evidence.is_file() or not source_manifest.is_file() or not source_proof.is_file()
+        or record.get("source_visual_evidence_sha256") != digest(source_evidence)
+        or record.get("source_visual_manifest_sha256") != digest(source_manifest)
+        or record.get("source_visual_proof_sha256") != digest(source_proof)
+    ):
+        fail("The inherited approved visual-proof bundle is missing or has changed.")
+    prior = read_json(source_evidence)
+    if prior.get("gate") != "visual" or prior.get("passed") is not True:
+        fail("The inherited visual evidence was not an accepted prior visual release.")
+    if (
+        manifest.get("schema") != SCHEMA
+        or manifest.get("generator") != "lookbook_gate.py:render-revision-visual-proof"
+        or manifest.get("session_id") != state["session_id"]
+        or not isinstance(manifest.get("master"), dict)
+        or not same_identity(manifest["master"], identity(master))
+        or manifest.get("revision_scope_sha256") != digest(scope_path)
+        or manifest.get("source_visual_proof_sha256") != digest(source_proof)
+    ):
+        fail("Targeted visual proof does not belong to the current revision scope.")
+    proof_pdf = child_of(project, str(manifest.get("proof_pdf", "")))
+    expected_pages = len(record["changed_looks"]) * 2
+    if (
+        not proof_pdf.is_file() or proof_pdf.stat().st_size < 512
+        or manifest.get("proof_pdf_sha256") != digest(proof_pdf)
+        or manifest.get("expected_pages") != expected_pages
+    ):
+        fail("Targeted visual-proof PDF is missing or has changed.")
+    registry = validate_registry(state_artifact(project, state, "registry"), int(state["look_count"]), state_artifact(project, state, "hires"))
+    by_look = {row["look_id"]: row for row in registry}
+    pairs = manifest.get("look_pairs")
+    if not isinstance(pairs, dict) or set(pairs) != set(record["changed_looks"]):
+        fail("Targeted visual proof must contain exactly the manually changed looks.")
+    for position, look_id in enumerate(record["changed_looks"], start=1):
+        row = by_look.get(look_id)
+        item = pairs.get(look_id)
+        if row is None or not isinstance(item, dict):
+            fail(f"{look_id}: targeted visual proof pair is missing.")
+        if (
+            item.get("left_page") != int(row["indd_left_page"])
+            or item.get("right_page") != int(row["indd_right_page"])
+            or item.get("proof_left_page") != (position * 2 - 1)
+            or item.get("proof_right_page") != position * 2
+        ):
+            fail(f"{look_id}: targeted proof page mapping is not exact.")
+        image = child_of(project, str(item.get("image", "")))
+        if not image.is_file() or image.stat().st_size < 1024 or item.get("sha256") != digest(image):
+            fail(f"{look_id}: targeted rendered pair is missing or changed.")
     return manifest
 
 
@@ -1627,7 +1765,12 @@ def _status_rank(status: str) -> int:
 
 
 def build_caption_clearance_audit(project: Path, state: dict[str, Any], manifest: dict[str, Any]) -> dict[str, Any]:
-    """Create the non-negotiable computer-vision evidence for every credit block."""
+    """Create computer-vision evidence for all current proof pairs.
+
+    A normal proof contains every look. A manual credits-only revision contains
+    only the changed pairs; a native scope audit proves the remaining looks are
+    inherited byte-for-layout from the reviewed master.
+    """
     try:
         import numpy as np
         from PIL import Image, ImageDraw, ImageOps
@@ -1636,6 +1779,12 @@ def build_caption_clearance_audit(project: Path, state: dict[str, Any], manifest
         fail(f"Caption-clearance dependencies are unavailable: {error}")
     layout, layout_items = _validate_caption_clearance_layout(project, state)
     registry = validate_registry(state_artifact(project, state, "registry"), int(state["look_count"]), state_artifact(project, state, "hires"))
+    pairs = manifest.get("look_pairs")
+    if not isinstance(pairs, dict):
+        fail("Caption-clearance audit needs a visual proof pair manifest.")
+    target_registry = [row for row in registry if row["look_id"] in pairs]
+    if len(target_registry) != len(pairs):
+        fail("Caption-clearance audit received a proof pair for an unknown LOOK.")
     hires = state_artifact(project, state, "hires")
     proof_pdf = child_of(project, manifest["proof_pdf"])
     try:
@@ -1649,15 +1798,15 @@ def build_caption_clearance_audit(project: Path, state: dict[str, Any], manifest
     stamp = utc_now().replace(":", "-")
     proof_folder = caption_clearance_proof_dir(project) / stamp
     items: list[dict[str, Any]] = []
-    for row in registry:
+    for row in target_registry:
         look_id = row["look_id"]
         source = child_of(hires, row["left_filename"])
         if not source.is_file():
             fail(f"{look_id}: required left source is missing for caption-clearance audit.")
         caption_bounds = _finite_bounds(layout_items[look_id]["caption_bounds"], f"{look_id} caption_bounds")
-        visible_text_bounds, visible_field_count = _visible_caption_text_bounds(
-            proof_document, int(row["indd_left_page"]), caption_bounds
-        )
+        proof_item = pairs[look_id]
+        proof_left_page = int(proof_item.get("proof_left_page", row["indd_left_page"]))
+        visible_text_bounds, visible_field_count = _visible_caption_text_bounds(proof_document, proof_left_page, caption_bounds)
         expected_field_count = products_by_look.get(look_id, 0) * 4
         visible_text_bounds, visible_bounds_source = _reliable_visible_caption_bounds(
             visible_text_bounds, visible_field_count, expected_field_count, caption_bounds,
@@ -1690,7 +1839,7 @@ def build_caption_clearance_audit(project: Path, state: dict[str, Any], manifest
         _write_caption_clearance_overlay(crop, mask, metrics["status"], proof, np, Image, ImageDraw)
         items.append({
             "look_id": look_id, "source_filename": row["left_filename"], "source_sha256": digest(source),
-            "proof_pair_sha256": manifest["look_pairs"][look_id]["sha256"],
+            "proof_pair_sha256": pairs[look_id]["sha256"],
             "status": metrics.pop("status"), "reason": metrics.pop("reason"), "metrics": metrics,
             "evidence_image": _relative_project_path(project, proof), "evidence_sha256": digest(proof),
         })
@@ -1702,6 +1851,7 @@ def build_caption_clearance_audit(project: Path, state: dict[str, Any], manifest
         "schema": CAPTION_CLEARANCE_SCHEMA, "generator": "lookbook_gate.py:caption-clearance-audit",
         "session_id": state["session_id"], "created_at": utc_now(), "master": identity(state_artifact(project, state, "master")),
         "layout_sha256": digest(caption_clearance_layout_path(project)), "visual_proof_manifest_sha256": digest(visual_proof_manifest_path(project)),
+        "mode": "caption-revision-targeted" if targeted_visual_mode(project, state, manifest) else "full",
         "passed": all(item["status"] == CAPTION_CLEARANCE_CLEAR for item in items), "items": items,
     }
     write_json(caption_clearance_report_path(project), report)
@@ -1747,12 +1897,18 @@ def validate_caption_clearance(project: Path, state: dict[str, Any]) -> dict[str
     ):
         fail("Caption-clearance audit is missing or not bound to the current rendered master.")
     registry = validate_registry(state_artifact(project, state, "registry"), int(state["look_count"]), state_artifact(project, state, "hires"))
+    proof_pairs = manifest.get("look_pairs")
+    if not isinstance(proof_pairs, dict):
+        fail("Caption-clearance audit has no proof-pair mapping.")
+    target_registry = [row for row in registry if row["look_id"] in proof_pairs]
+    if len(target_registry) != len(proof_pairs):
+        fail("Caption-clearance audit references an unknown proof LOOK.")
     raw_items = report.get("items")
-    if not isinstance(raw_items, list) or len(raw_items) != len(registry):
-        fail("Caption-clearance audit does not contain exactly one result per required look.")
+    if not isinstance(raw_items, list) or len(raw_items) != len(target_registry):
+        fail("Caption-clearance audit does not contain exactly one result per current proof look.")
     checked: dict[str, dict[str, Any]] = {}
     hires = state_artifact(project, state, "hires")
-    for row, item in zip(registry, raw_items):
+    for row, item in zip(target_registry, raw_items):
         look_id = row["look_id"]
         if not isinstance(item, dict) or item.get("look_id") != look_id:
             fail(f"{look_id}: caption-clearance audit is missing or out of order.")
@@ -1761,7 +1917,7 @@ def validate_caption_clearance(project: Path, state: dict[str, Any]) -> dict[str
             item.get("source_filename") != row["left_filename"]
             or not source.is_file()
             or item.get("source_sha256") != digest(source)
-            or item.get("proof_pair_sha256") != manifest["look_pairs"][look_id]["sha256"]
+            or item.get("proof_pair_sha256") != proof_pairs[look_id]["sha256"]
             or item.get("status") not in {CAPTION_CLEARANCE_CLEAR, CAPTION_CLEARANCE_COLLISION, CAPTION_CLEARANCE_REVIEW, CAPTION_CLEARANCE_OVERFLOW}
         ):
             fail(f"{look_id}: caption-clearance audit does not describe the current registered source and rendered proof.")
@@ -1783,13 +1939,14 @@ def validate_caption_clearance(project: Path, state: dict[str, Any]) -> dict[str
 
 def visual_confirmation_fingerprint(project: Path, state: dict[str, Any]) -> str:
     folder = visual_confirmation_dir(project)
-    registry = validate_registry(state_artifact(project, state, "registry"), int(state["look_count"]), state_artifact(project, state, "hires"))
+    manifest = validate_visual_proof(project, state)
+    look_ids = sorted(manifest["look_pairs"])
     entries: list[str] = []
-    for row in registry:
-        path = folder / f"{row['look_id']}.json"
+    for look_id in look_ids:
+        path = folder / f"{look_id}.json"
         if not path.exists():
             return ""
-        entries.append(f"{row['look_id']}:{digest(path)}")
+        entries.append(f"{look_id}:{digest(path)}")
     return hashlib.sha256("\n".join(entries).encode("utf-8")).hexdigest()
 
 
@@ -1801,13 +1958,14 @@ def validate_visual_confirmations(project: Path, state: dict[str, Any]) -> list[
     pairs = manifest["look_pairs"]
     folder = visual_confirmation_dir(project)
     registry = validate_registry(state_artifact(project, state, "registry"), int(state["look_count"]), state_artifact(project, state, "hires"))
+    target_registry = [row for row in registry if row["look_id"] in pairs]
     master_identity = identity(state_artifact(project, state, "master"))
-    expected_names = {f"{row['look_id']}.json" for row in registry}
+    expected_names = {f"{row['look_id']}.json" for row in target_registry}
     found_names = {path.name for path in folder.glob("*.json")} if folder.exists() else set()
     if found_names != expected_names:
         fail("Every rendered look pair needs one and only one visual confirmation; no bulk status file is accepted.")
     confirmations: list[dict[str, Any]] = []
-    for row in registry:
+    for row in target_registry:
         look_id = row["look_id"]
         confirmation = read_json(folder / f"{look_id}.json")
         if (
@@ -3708,11 +3866,7 @@ def command_record_visual(args: argparse.Namespace) -> None:
     if current_gate(project, state) != "visual":
         fail(f"Visual proof cannot be recorded now; next required gate is {current_gate(project, state) or 'complete'}.")
     armed = read_json(arm_file(project, "visual"))
-    plan = composition_plan_path(project)
-    applied = composition_applied_path(project)
     proof = visual_proof_manifest_path(project)
-    validate_composition_plan(project, state)
-    validate_composition_applied(project, state)
     manifest = validate_visual_proof(project, state)
     clearance = validate_caption_clearance(project, state)
     validate_visual_confirmations(project, state)
@@ -3722,16 +3876,36 @@ def command_record_visual(args: argparse.Namespace) -> None:
     evidence = {
         "schema": SCHEMA, "session_id": state["session_id"], "gate": "visual", "passed": True,
         "nonce": armed["nonce"], "created_at": utc_now(), "master": identity(master),
-        "overview": manifest["overview"], "composition_plan_sha256": digest(plan),
-        "composition_applied_sha256": digest(applied), "visual_proof_manifest_sha256": digest(proof),
         "caption_clearance_sha256": digest(caption_clearance_report_path(project)),
         "caption_clearance_fingerprint": hashlib.sha256(
             "\n".join(f"{item['look_id']}:{_caption_clearance_item_fingerprint(item)}" for item in clearance["items"]).encode("utf-8")
         ).hexdigest(),
         "visual_confirmation_fingerprint": visual_confirmation_fingerprint(project, state), "notes": args.notes.strip(),
     }
+    if targeted_visual_mode(project, state, manifest):
+        record = caption_revision_record(project, state)
+        if record is None:
+            fail("Targeted visual evidence has no manual credits revision record.")
+        scope_path = control_path(project) / "revisions" / f"revision-{int(state['current_revision']):02}-scope-audit.json"
+        evidence.update({
+            "mode": "caption-revision-targeted", "changed_looks": record["changed_looks"],
+            "revision_scope_sha256": digest(scope_path),
+            "source_visual_evidence_sha256": record["source_visual_evidence_sha256"],
+            "visual_proof_manifest_sha256": digest(proof),
+        })
+        summary = f"PASS visual: {len(record['changed_looks'])} corrected look(s) re-rendered and checked; unchanged looks are bound to the reviewed revision scope."
+    else:
+        plan = composition_plan_path(project)
+        applied = composition_applied_path(project)
+        validate_composition_plan(project, state)
+        validate_composition_applied(project, state)
+        evidence.update({
+            "overview": manifest["overview"], "composition_plan_sha256": digest(plan),
+            "composition_applied_sha256": digest(applied), "visual_proof_manifest_sha256": digest(proof),
+        })
+        summary = "PASS visual: every look was confirmed against its current-master rendered pair; composition evidence is stored."
     write_json(evidence_file(project, "visual"), evidence)
-    print("PASS visual: every look was confirmed against its current-master rendered pair; composition evidence is stored.")
+    print(summary)
 
 
 def command_pre_export(args: argparse.Namespace) -> None:
@@ -3914,8 +4088,26 @@ def verify_exported_pdf_order(project: Path, state: dict[str, Any], review_pdf: 
     pages = sorted({int(row[key]) for row in registry for key in ("indd_left_page", "indd_right_page")})
     stamp = utc_now().replace(":", "-")
     root = control_path(project) / "visual" / "pdf-order" / stamp
-    proof_pages = render_pdf_pages(proof_pdf, root / "current-master-proof", pages, 96)
     review_pages = render_pdf_pages(review_pdf, root / "review-pdf", pages, 96)
+    proof_pages: dict[int, Path]
+    if targeted_visual_mode(project, state, visual_manifest):
+        record = caption_revision_record(project, state)
+        if record is None:
+            fail("Targeted review-PDF order proof has no caption revision record.")
+        source_proof = child_of(project, str(record["source_visual_proof"]))
+        if not source_proof.is_file() or record.get("source_visual_proof_sha256") != digest(source_proof):
+            fail("Inherited reviewed proof PDF is missing or changed; review-PDF order cannot be verified.")
+        source_pages = render_pdf_pages(source_proof, root / "inherited-proof", pages, 96)
+        target_pages = render_pdf_pages(proof_pdf, root / "corrected-proof", list(range(1, int(visual_manifest["expected_pages"]) + 1)), 96)
+        proof_pages = dict(source_pages)
+        for look_id, pair in visual_manifest["look_pairs"].items():
+            row = next((candidate for candidate in registry if candidate["look_id"] == look_id), None)
+            if row is None:
+                fail(f"Targeted review-PDF order proof references unknown {look_id}.")
+            proof_pages[int(row["indd_left_page"])] = target_pages[int(pair["proof_left_page"])]
+            proof_pages[int(row["indd_right_page"])] = target_pages[int(pair["proof_right_page"])]
+    else:
+        proof_pages = render_pdf_pages(proof_pdf, root / "current-master-proof", pages, 96)
     expected_signatures = {page: page_visual_signature(proof_pages[page]) for page in pages}
     actual_signatures = {page: page_visual_signature(review_pages[page]) for page in pages}
     items: list[dict[str, Any]] = []
@@ -4096,6 +4288,107 @@ def command_render_visual_proof(args: argparse.Namespace) -> None:
             pass
 
 
+def command_audit_caption_revision_scope(args: argparse.Namespace) -> None:
+    """Ask native InDesign to prove that a credits revision changed no other look."""
+    project = project_path(args.project)
+    state = load_state(project)
+    if current_gate(project, state) != "visual":
+        fail(f"Caption revision scope can run only at visual; next required gate is {current_gate(project, state) or 'complete'}.")
+    record = caption_revision_record(project, state)
+    if record is None:
+        fail("Caption revision scope is available only for a manual credits revision.")
+    run_com_driver(["-Action", "AuditCaptionRevisionScope", "-Project", str(project)], timeout_seconds=600)
+    scope_path = control_path(project) / "revisions" / f"revision-{int(state['current_revision']):02}-scope-audit.json"
+    if not scope_path.is_file():
+        fail("Native caption revision scope audit finished without an evidence file.")
+    scope = read_json(scope_path)
+    if scope.get("passed") is not True or sorted(scope.get("changed_looks", [])) != sorted(record["changed_looks"]):
+        fail("Native caption revision scope audit did not prove the unchanged looks.")
+    print(f"CAPTION REVISION SCOPE PASS: {len(record['changed_looks'])} corrected look(s); unchanged looks are inherited from the reviewed master.")
+
+
+def command_render_revision_visual_proof(args: argparse.Namespace) -> None:
+    """Render only manually corrected look pairs for a credits-only revision."""
+    try:
+        from PIL import Image
+    except Exception as error:
+        fail(f"Targeted visual-proof renderer dependency unavailable: {error}")
+    project = project_path(args.project)
+    state = load_state(project)
+    if current_gate(project, state) != "visual":
+        fail(f"Targeted visual proof cannot be rendered now; next required gate is {current_gate(project, state) or 'complete'}.")
+    record = caption_revision_record(project, state)
+    if record is None:
+        fail("Targeted visual proof is reserved for manual credits revisions.")
+    scope_path = control_path(project) / "revisions" / f"revision-{int(state['current_revision']):02}-scope-audit.json"
+    if not scope_path.is_file():
+        fail("Run audit-caption-revision-scope before rendering a targeted visual proof.")
+    scope = read_json(scope_path)
+    if scope.get("passed") is not True:
+        fail("Native unchanged-look scope audit did not pass.")
+    proof_root = visual_proof_dir(project) / "revision-targeted"
+    stamp = utc_now().replace(":", "-")
+    proof_pdf = proof_root / f"revision-{int(state['current_revision']):02}-{stamp}.pdf"
+    registry = validate_registry(state_artifact(project, state, "registry"), int(state["look_count"]), state_artifact(project, state, "hires"))
+    by_look = {row["look_id"]: row for row in registry}
+    targets = list(record["changed_looks"])
+    pages: list[int] = []
+    for look_id in targets:
+        row = by_look.get(look_id)
+        if row is None:
+            fail(f"Targeted visual proof references unknown {look_id}.")
+        pages.extend((int(row["indd_left_page"]), int(row["indd_right_page"])))
+    page_range = compact_page_range(pages)
+    proof_root.mkdir(parents=True, exist_ok=True)
+    run_com_driver([
+        "-Action", "ExportPdf", "-Project", str(project), "-Pdf", str(proof_pdf),
+        "-RasterResolution", "96", "-PageRange", page_range,
+    ], timeout_seconds=900)
+    expected_pages = len(targets) * 2
+    rendered_count, _ = inspect_exported_pdf(proof_pdf, expected_pages, proof_root / "pdf-samples" / stamp)
+    rendered = render_pdf_pages(proof_pdf, proof_root / "rendered-pages" / stamp, list(range(1, rendered_count + 1)), 150)
+    pair_folder = proof_root / "pairs" / stamp
+    pair_folder.mkdir(parents=True, exist_ok=True)
+    pairs: dict[str, dict[str, Any]] = {}
+    for index, look_id in enumerate(targets):
+        left_proof = index * 2 + 1
+        right_proof = index * 2 + 2
+        with Image.open(rendered[left_proof]) as source:
+            left = source.convert("RGB").copy()
+        with Image.open(rendered[right_proof]) as source:
+            right = source.convert("RGB").copy()
+        canvas = Image.new("RGB", (left.width + right.width, max(left.height, right.height)), "white")
+        canvas.paste(left, (0, 0))
+        canvas.paste(right, (left.width, 0))
+        target = pair_folder / f"{look_id}.jpg"
+        canvas.save(target, "JPEG", quality=92, optimize=True)
+        if target.stat().st_size < 1024:
+            fail(f"{look_id}: generated targeted visual proof is unexpectedly empty.")
+        row = by_look[look_id]
+        pairs[look_id] = {
+            "left_page": int(row["indd_left_page"]), "right_page": int(row["indd_right_page"]),
+            "proof_left_page": left_proof, "proof_right_page": right_proof,
+            "image": _relative_project_path(project, target), "sha256": digest(target),
+        }
+    manifest = {
+        "schema": SCHEMA, "generator": "lookbook_gate.py:render-revision-visual-proof",
+        "session_id": state["session_id"], "created_at": utc_now(),
+        "master": identity(state_artifact(project, state, "master")), "proof_pdf": _relative_project_path(project, proof_pdf),
+        "proof_pdf_sha256": digest(proof_pdf), "expected_pages": expected_pages,
+        "revision_scope_sha256": digest(scope_path), "source_visual_proof_sha256": record["source_visual_proof_sha256"],
+        "look_pairs": pairs,
+    }
+    write_json(visual_proof_manifest_path(project), manifest)
+    validate_visual_proof(project, state)
+    run_com_driver(["-Action", "AuditCaptionClearance", "-Project", str(project)], timeout_seconds=900)
+    clearance = build_caption_clearance_audit(project, state, manifest)
+    blocked = [item["look_id"] for item in clearance["items"] if item["status"] != CAPTION_CLEARANCE_CLEAR]
+    if blocked:
+        fail("Targeted caption-clearance is blocked: " + ", ".join(blocked))
+    validate_caption_clearance(project, state)
+    print(f"TARGETED VISUAL PROOF RENDERED: {len(targets)} corrected look pair(s); unchanged looks retain the reviewed proof.")
+
+
 def command_refresh_caption_clearance(args: argparse.Namespace) -> None:
     """Refresh the read-only source-pixel audit after a native layout snapshot.
 
@@ -4146,7 +4439,7 @@ def command_confirm_visual_look(args: argparse.Namespace) -> None:
         ),
     })
     completed = len(list(visual_confirmation_dir(project).glob("LOOK_*.json")))
-    print(f"VISUAL LOOK CONFIRMED: {args.look} ({completed}/{state['look_count']})")
+    print(f"VISUAL LOOK CONFIRMED: {args.look} ({completed}/{len(manifest['look_pairs'])})")
 
 
 def compact_page_range(pages: list[int]) -> str:
@@ -4321,6 +4614,7 @@ def command_begin_revision(args: argparse.Namespace) -> None:
         fail("Revision reset must begin from visual or captions.")
     caption_audit: Path | None = None
     prior_map: dict[str, Any] | None = None
+    prior_visual_manifest: dict[str, Any] | None = None
     if reset_from == "captions":
         raw_audit = str(getattr(args, "caption_audit", "")).strip()
         if not raw_audit:
@@ -4331,6 +4625,10 @@ def command_begin_revision(args: argparse.Namespace) -> None:
         # source so release/PDF evidence can be completed before the copy.
         restore_caption_revision_draft_baseline(project, state, caption_audit)
         prior_map = _validate_caption_revision_preconditions(project, state, caption_audit)
+        # Capture the complete, accepted visual bundle before it is moved into
+        # immutable history. A credits-only correction may reuse it only via a
+        # native unchanged-look comparison and a new proof of changed looks.
+        prior_visual_manifest = read_json(visual_proof_manifest_path(project))
     elif current_gate(project, state) is not None:
         fail("A revision can begin only after the current review PDF has passed every gate and complete has been run.")
     if final_deliverables_file(project).exists():
@@ -4382,11 +4680,38 @@ def command_begin_revision(args: argparse.Namespace) -> None:
     if caption_audit is not None:
         state["manual_caption_revision"] = str(archived_audit.relative_to(project))
     write_json(state_file(project), state)
-    write_json(control_path(project) / "revisions" / f"revision-{revision:02}.json", {
+    revision_record: dict[str, Any] = {
         "schema": SCHEMA, "revision": revision, "created_at": utc_now(), "source_master": identity(source),
         "master": identity(target), "corrections": notes, "archived_proof": str(archive), "reset_from": reset_from,
         "manual_caption_revision": str(archived_audit.relative_to(project)) if caption_audit is not None else None,
-    })
+    }
+    if caption_audit is not None:
+        assert prior_visual_manifest is not None
+        archived_visual_evidence = archive / "evidence" / "visual.json"
+        archived_visual_manifest = archive / "visual" / "proof" / "manifest.json"
+        source_proof_relative = Path(str(prior_visual_manifest.get("proof_pdf", "")))
+        try:
+            source_proof_inside_visual = source_proof_relative.relative_to("control/visual")
+        except ValueError:
+            fail("Reviewed visual proof has an invalid location and cannot be inherited for a caption revision.")
+        archived_visual_proof = archive / "visual" / source_proof_inside_visual
+        for label, item in (
+            ("reviewed visual evidence", archived_visual_evidence),
+            ("reviewed visual manifest", archived_visual_manifest),
+            ("reviewed visual proof PDF", archived_visual_proof),
+        ):
+            if not item.is_file():
+                fail(f"Caption revision cannot preserve {label}: {item}")
+        revision_record.update({
+            "kind": "captions", "changed_looks": sorted(changes),
+            "source_visual_evidence": _relative_project_path(project, archived_visual_evidence),
+            "source_visual_evidence_sha256": digest(archived_visual_evidence),
+            "source_visual_manifest": _relative_project_path(project, archived_visual_manifest),
+            "source_visual_manifest_sha256": digest(archived_visual_manifest),
+            "source_visual_proof": _relative_project_path(project, archived_visual_proof),
+            "source_visual_proof_sha256": digest(archived_visual_proof),
+        })
+    write_json(control_path(project) / "revisions" / f"revision-{revision:02}.json", revision_record)
     if current_gate(project, state) != reset_from:
         fail(f"Revision safety reset failed: {reset_from} was not unlocked for the new master.")
     print(f"REVISION {revision:02} CREATED: {target.name}")
@@ -5048,6 +5373,12 @@ def parser() -> argparse.ArgumentParser:
     proof = commands.add_parser("render-visual-proof", help="export the current INDD and render every exact look pair for visual review")
     proof.add_argument("project")
     proof.set_defaults(func=command_render_visual_proof)
+    revision_scope = commands.add_parser("audit-caption-revision-scope", help="prove unchanged looks are inherited before a credits-only visual review")
+    revision_scope.add_argument("project")
+    revision_scope.set_defaults(func=command_audit_caption_revision_scope)
+    revision_proof = commands.add_parser("render-revision-visual-proof", help="export and check only manually corrected look pairs")
+    revision_proof.add_argument("project")
+    revision_proof.set_defaults(func=command_render_revision_visual_proof)
     clearance_refresh = commands.add_parser("refresh-caption-clearance", help="renew the read-only native credits-clearance audit without exporting a PDF")
     clearance_refresh.add_argument("project")
     clearance_refresh.set_defaults(func=command_refresh_caption_clearance)

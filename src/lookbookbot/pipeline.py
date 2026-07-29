@@ -435,6 +435,11 @@ class PipelineEngine:
     def _visual(self, project: ProjectRecord, provider: ModelProvider) -> str:
         if evidence_passed(project.project_dir, "visual"):
             return "Визуальная проверка уже подтверждена текущим master."
+        if self._has_manual_caption_revision(project.project_dir):
+            self._run_targeted_caption_revision_visual(project, provider)
+            if not evidence_passed(project.project_dir, "visual"):
+                raise ReviewRequired(visual_audit_blocker_message(project.project_dir))
+            return "После правки кредитов перепроверены только изменённые луки; остальные подтверждены сравнением с предыдущей версией."
         if isinstance(provider, CodexProvider):
             self._run_parallel_codex_visual(project, provider)
         else:
@@ -442,6 +447,56 @@ class PipelineEngine:
         if not evidence_passed(project.project_dir, "visual"):
             raise ReviewRequired(visual_audit_blocker_message(project.project_dir))
         return "Все развороты подтверждены: порядок фото, ссылки, кредиты, safe area и clearance."
+
+    @staticmethod
+    def _has_manual_caption_revision(root: Path) -> bool:
+        try:
+            return bool(read_json(root / "control" / "lookbook-state.json").get("manual_caption_revision"))
+        except (OSError, ValueError):
+            return False
+
+    def _run_targeted_caption_revision_visual(self, project: ProjectRecord, provider: ModelProvider) -> None:
+        """Recheck only corrected pairs after native COM proves all others unchanged."""
+        root = project.project_dir
+        arm = self.controller.gate("arm", root, "--gate", "visual", timeout=120, check=False)
+        if arm.returncode and "armed" not in arm.text.casefold():
+            raise PipelineError(arm.text)
+        self.controller.gate("audit-caption-revision-scope", root, timeout=900)
+        self.controller.gate("render-revision-visual-proof", root, timeout=1800)
+        manifest = read_json(root / "control" / "visual" / "proof" / "manifest.json")
+        pairs = manifest.get("look_pairs")
+        if not isinstance(pairs, dict) or not pairs:
+            raise PipelineError("Целевая visual-proof не содержит исправленных разворотов.")
+        proofs = [root / str(pairs[look_id]["image"]) for look_id in sorted(pairs)]
+        if any(not proof.is_file() for proof in proofs):
+            raise PipelineError("Целевая visual-proof не найдена на диске.")
+        self.log(f"После правки кредитов проверяю только {len(proofs)} исправленных лук(а/ов).")
+        decisions: dict[str, VisionDecision] = {}
+        if isinstance(provider, CodexProvider):
+            for batch in _path_batches(proofs, size=5):
+                decisions.update(self._confirm_codex_visual_batch(provider, root, batch))
+        else:
+            for proof in proofs:
+                decisions[proof.stem] = provider.inspect_proof(
+                    "Проверь только этот исправленный разворот: full-length слева, close-up справа, кредиты читаемы, в safe area и не пересекают силуэт. Ответь JSON {\"match\":true/false,\"note\":\"конкретное наблюдение\"}.",
+                    [proof],
+                )
+        rejected = [
+            f"{proof.stem}: {decisions.get(proof.stem).note if decisions.get(proof.stem) else 'нет решения'}"
+            for proof in proofs if not decisions.get(proof.stem) or not decisions[proof.stem].accepted
+        ]
+        if rejected:
+            raise ReviewRequired("Целевая visual-проверка отклонила исправленные развороты: " + "; ".join(rejected))
+        for proof in proofs:
+            self.controller.gate(
+                "confirm-visual-look", root, "--look", proof.stem,
+                "--note", _safe_confirmation_note(decisions[proof.stem].note), timeout=120,
+            )
+        self.controller.gate(
+            "record-visual", root,
+            "--notes", "Исправленные кредиты перепроверены по current-master proofs; неизменённые развороты подтверждены native revision scope audit.",
+            timeout=300,
+        )
 
     def _review(self, project: ProjectRecord) -> str:
         root = project.project_dir

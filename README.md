@@ -1,5 +1,10 @@
 # LOOKBOOKBOT for Windows
 
+## Version 0.2.32
+
+- A credits-only correction no longer launches a second full visual audit. The app uses native InDesign comparison to prove every unedited look retained its images, crop geometry and credits, then renders and visually checks only the changed LOOK pairs before writing the next full review PDF.
+- The visual progress indicator now switches to the number of corrected looks for this targeted revision cycle.
+
 ## Version 0.2.31
 
 - The corrections release button now compares the actual edited credit cards before deciding whether a revision is required. A lost editor `textChanged` event can no longer discard an added product or make the button appear to do nothing.

@@ -891,6 +891,17 @@ class MainWindow(QMainWindow):
         status = rows.get("visual", {}).get("status")
         state = read_json(self.project.project_dir / "control" / "lookbook-state.json")
         total = int(state.get("look_count", 0) or 0)
+        targeted = False
+        manifest_path = self.project.project_dir / "control" / "visual" / "proof" / "manifest.json"
+        try:
+            manifest = read_json(manifest_path)
+            if manifest.get("generator") == "lookbook_gate.py:render-revision-visual-proof":
+                pairs = manifest.get("look_pairs")
+                if isinstance(pairs, dict) and pairs:
+                    total = len(pairs)
+                    targeted = True
+        except (OSError, ValueError):
+            pass
         confirmations = self.project.project_dir / "control" / "visual" / "confirmations"
         complete = len(list(confirmations.glob("LOOK_*.json"))) if confirmations.is_dir() else 0
         if status != StageStatus.RUNNING.value:
@@ -903,6 +914,12 @@ class MainWindow(QMainWindow):
         self.visual_progress_label.show()
         self.visual_progress.setRange(0, max(total, 1))
         self.visual_progress.setValue(min(complete, total))
+        if targeted:
+            if complete >= total:
+                self.visual_progress_label.setText(f"Целевая визуальная проверка: {complete} из {total} — фиксируется итоговый PASS…")
+            else:
+                self.visual_progress_label.setText(f"Целевая визуальная проверка: подтверждено {complete} из {total} исправленных разворотов")
+            return
         if total and complete >= total:
             self.visual_progress_label.setText(f"Визуальная проверка: {complete} из {total} — фиксируется итоговый PASS…")
         elif total:

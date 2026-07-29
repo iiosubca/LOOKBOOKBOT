@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)][ValidateSet('ApplyGate', 'ApplyComposition', 'ApplyCompositionDelta', 'ApplyLookCalibration', 'ReapplyComposition', 'RepairCaptions', 'AuditCaptionClearance', 'RebindRevisionStructureEvidence', 'ExportPdf', 'ExportPdfSet', 'PrepareTemplate')][string]$Action,
+    [Parameter(Mandatory = $true)][ValidateSet('ApplyGate', 'ApplyComposition', 'ApplyCompositionDelta', 'ApplyLookCalibration', 'ReapplyComposition', 'RepairCaptions', 'AuditCaptionClearance', 'RebindRevisionStructureEvidence', 'AuditCaptionRevisionScope', 'ExportPdf', 'ExportPdfSet', 'PrepareTemplate')][string]$Action,
     [string]$Project,
     [ValidateSet('structure', 'dates', 'frames', 'images', 'captions', 'release')][string]$Gate,
     [string]$Pdf,
@@ -1550,6 +1550,81 @@ function Rebind-RevisionStructureEvidence([string]$ProjectPath) {
         throw
     }
 }
+function Audit-CaptionRevisionScope([string]$ProjectPath) {
+    # A manual caption correction is allowed to avoid a second full visual
+    # pass only after this native read-only comparison proves that every other
+    # spread still has the exact reviewed image sources, crop geometry and
+    # credits text. InDesign assigns new item IDs on SaveACopy, so labels and
+    # geometry—not IDs—are the stable cross-revision contract.
+    $projectFull = [System.IO.Path]::GetFullPath($ProjectPath)
+    $control = Join-Path $projectFull 'control'
+    $statePath = Join-Path $control 'lookbook-state.json'
+    $state = Read-Json $statePath
+    if ($null -eq $state.PSObject.Properties['manual_caption_revision'] -or [string]::IsNullOrWhiteSpace([string]$state.manual_caption_revision)) { Fail 'Caption revision scope requires a manual_caption_revision state marker.' }
+    $revision = [int]$state.current_revision
+    if ($revision -le 1) { Fail 'Caption revision scope requires a copied correction revision.' }
+    $recordPath = Join-Path $control ("revisions\revision-{0:D2}.json" -f $revision)
+    $record = Read-Json $recordPath
+    if ($record.schema -ne 1 -or $record.kind -ne 'captions' -or $null -eq $record.changed_looks) { Fail 'Caption revision record is missing its changed LOOK list.' }
+    $changedLooks = @([string[]]$record.changed_looks | Sort-Object -Unique)
+    if ($changedLooks.Count -lt 1) { Fail 'Caption revision record has no changed LOOK IDs.' }
+    $sourcePath = [string]$record.source_master.path
+    $masterPath = Join-Path $projectFull ([string]$state.master)
+    if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf) -or -not (Test-Path -LiteralPath $masterPath -PathType Leaf)) { Fail 'Source or target INDD is missing for caption revision scope audit.' }
+    $registry = @(Read-Tsv (Join-Path $projectFull ([string]$state.registry)) @('look_id','spread_order','pdf_spread','left_filename','right_filename','indd_left_page','indd_right_page'))
+    $hires = Join-Path $projectFull ([string]$state.hires)
+    $app = New-Object -ComObject InDesign.Application
+    Close-SavedAutomationMaster $app $sourcePath 'Caption revision scope source'
+    Close-SavedAutomationMaster $app $masterPath 'Caption revision scope target'
+    $sourceDoc = $null; $targetDoc = $null
+    try {
+        $sourceDoc = Open-AutomationDocument $app $sourcePath
+        $targetDoc = Open-AutomationDocument $app $masterPath
+        if (-not $sourceDoc.Saved -or -not $targetDoc.Saved) { Fail 'Caption revision scope cannot compare an unsaved/recovered INDD.' }
+        Assert-Structure $targetDoc $state $registry
+        Assert-Frames $targetDoc $registry
+        $sourceIndex = New-LabelIndex $sourceDoc
+        $targetIndex = New-LabelIndex $targetDoc
+        $unchanged = @(); $checked = @()
+        foreach ($row in $registry) {
+            $lookId = [string]$row.look_id
+            $leftLabel = "LOOKBOOK_LEFT_IMAGE|$lookId"; $rightLabel = "LOOKBOOK_RIGHT_IMAGE|$lookId"; $captionLabel = "LOOKBOOK_CREDITS|$lookId"
+            foreach ($label in @($leftLabel, $rightLabel, $captionLabel)) {
+                if (-not $sourceIndex.ContainsKey($label) -or -not $targetIndex.ContainsKey($label)) { Fail "$lookId is missing a labelled frame in the source or target revision." }
+            }
+            $sourceLeft = $sourceIndex[$leftLabel]; $sourceRight = $sourceIndex[$rightLabel]; $sourceCaption = $sourceIndex[$captionLabel]
+            $targetLeft = $targetIndex[$leftLabel]; $targetRight = $targetIndex[$rightLabel]; $targetCaption = $targetIndex[$captionLabel]
+            if (-not (Test-GeometryBounds -Actual @($sourceLeft.GeometricBounds) -Expected @($targetLeft.GeometricBounds)) -or -not (Test-GeometryBounds -Actual @($sourceRight.GeometricBounds) -Expected @($targetRight.GeometricBounds))) { Fail "$lookId image frame geometry changed outside a manual credits revision." }
+            $leftSource = Join-Path $hires ([string]$row.left_filename); $rightSource = Join-Path $hires ([string]$row.right_filename)
+            if (-not ((Test-FrameImage $targetLeft ([string]$row.left_filename) $leftSource) -and (Test-FrameImage $targetRight ([string]$row.right_filename) $rightSource))) { Fail "$lookId target image links do not match the frozen registry." }
+            Assert-CreditsStartAtTop $targetCaption $lookId
+            if ([bool]$targetCaption.Overflows) { Fail "$lookId credits overflow after the manual correction." }
+            if ($changedLooks -notcontains $lookId) {
+                if (-not (Test-GeometryBounds -Actual @($sourceCaption.GeometricBounds) -Expected @($targetCaption.GeometricBounds))) { Fail "$lookId credits frame geometry changed outside a signed manual credits revision." }
+                if ((Get-Text $sourceCaption) -ne (Get-Text $targetCaption)) { Fail "$lookId credits text changed outside the recorded manual correction." }
+                $unchanged += $lookId
+            }
+            $checked += [ordered]@{ look_id = $lookId; changed = ($changedLooks -contains $lookId) }
+        }
+        if ([int]$sourceDoc.Pages.Count -ne [int]$targetDoc.Pages.Count -or [int]$targetDoc.Pages.Count -ne [int]$state.expected_pages) { Fail 'Caption revision changed the required page structure.' }
+        $targetIdentity = Master-Identity $masterPath
+        $payload = [ordered]@{
+            schema = 1; generator = 'run_lookbook_gate_com.ps1:AuditCaptionRevisionScope'; session_id = [string]$state.session_id
+            created_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'); passed = $true
+            source_master = Master-Identity $sourcePath; master = $targetIdentity; changed_looks = @($changedLooks)
+            unchanged_count = [int]$unchanged.Count; checked = @($checked)
+        }
+        Write-Json (Join-Path $control ("revisions\revision-{0:D2}-scope-audit.json" -f $revision)) $payload
+        $sourceDoc.Close($SAVE_NO); $sourceDoc = $null
+        $targetDoc.Close($SAVE_NO); $targetDoc = $null
+        Write-Output "COM_CAPTION_REVISION_SCOPE_PASS changed=$($changedLooks.Count) unchanged=$($unchanged.Count)"
+    } catch {
+        try { $_ | Out-File -LiteralPath (Join-Path $control 'progress\caption-revision-scope-last-error.txt') -Encoding utf8 -Force } catch {}
+        if ($null -ne $sourceDoc) { try { $sourceDoc.Close($SAVE_NO) } catch {} }
+        if ($null -ne $targetDoc) { try { $targetDoc.Close($SAVE_NO) } catch {} }
+        throw
+    }
+}
 function Invoke-Gate([string]$ProjectPath, [string]$GateName) {
     $projectFull = [System.IO.Path]::GetFullPath($ProjectPath)
     $control = Join-Path $projectFull 'control'
@@ -1772,6 +1847,7 @@ try {
     elseif ($Action -eq 'RepairCaptions') { Invoke-CaptionRepair $Project $BatchSize }
     elseif ($Action -eq 'AuditCaptionClearance') { Export-CaptionClearanceLayout $Project }
     elseif ($Action -eq 'RebindRevisionStructureEvidence') { Rebind-RevisionStructureEvidence $Project }
+    elseif ($Action -eq 'AuditCaptionRevisionScope') { Audit-CaptionRevisionScope $Project }
     elseif ($Action -eq 'ExportPdf') { Export-AdobePrintPdf $Project $Pdf $RasterResolution $PageRange }
     elseif ($Action -eq 'ExportPdfSet') { Export-AdobePrintPdfSet $Project $ExportPlan }
     elseif ($Action -eq 'PrepareTemplate') { Prepare-Template $TemplateSource $TemplateDestination }
