@@ -65,10 +65,26 @@ def test_next_revision_is_allowed_after_the_current_review_pdf_is_controller_con
     (root / "control" / "evidence").mkdir(parents=True)
     master = "TSUM_FS-0261112_LB_WA_03.indd"
     pdf = "TSUM_FS-0261112_LB_WA_03_review.pdf"
+    (root / master).write_bytes(b"indd master")
     (root / pdf).write_bytes(b"review PDF")
     (root / "control" / "lookbook-state.json").write_text(json.dumps({"master": master}), encoding="utf-8")
     (root / "control" / "evidence" / "pdf.json").write_text(
-        json.dumps({"passed": True, "master": {"name": master}, "pdf": {"name": pdf}}), encoding="utf-8"
+        json.dumps(
+            {
+                "passed": True,
+                "master": {
+                    "name": master,
+                    "length": (root / master).stat().st_size,
+                    "modified_ms": int((root / master).stat().st_mtime * 1000),
+                },
+                "pdf": {
+                    "name": pdf,
+                    "length": (root / pdf).stat().st_size,
+                    "modified_ms": int((root / pdf).stat().st_mtime * 1000),
+                },
+            }
+        ),
+        encoding="utf-8",
     )
 
     window_stub = SimpleNamespace(project=SimpleNamespace(project_dir=root))
@@ -98,8 +114,21 @@ def test_caption_revision_is_only_reported_ready_after_native_captions_prove_the
         json.dumps({"master": master, "current_revision": 4, "manual_caption_revision": draft_ref, "captions": "control/work/caption-data.tsv"}),
         encoding="utf-8",
     )
+    master_path = root / master
+    master_path.write_bytes(b"corrected InDesign master")
     (evidence_dir / "captions.json").write_text(
-        json.dumps({"passed": True, "created_at": "2026-07-29T20:00:00Z", "master": {"name": master}}), encoding="utf-8"
+        json.dumps(
+            {
+                "passed": True,
+                "created_at": "2026-07-29T20:00:00Z",
+                "master": {
+                    "name": master,
+                    "length": master_path.stat().st_size,
+                    "modified_ms": int(master_path.stat().st_mtime * 1000),
+                },
+            }
+        ),
+        encoding="utf-8",
     )
     record = revisions_dir / "revision-04.json"
     record.write_text(json.dumps({"manual_caption_revision": draft_ref, "caption_application": "pending"}), encoding="utf-8")

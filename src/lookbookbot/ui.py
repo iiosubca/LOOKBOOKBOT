@@ -1269,6 +1269,19 @@ class MainWindow(QMainWindow):
         suffix = f"{next_revision:0{len(raw_revision)}d}"
         return f"{prefix}_{suffix}.indd", f"{prefix}_{suffix}_review.pdf"
 
+    @staticmethod
+    def _evidence_identity_matches(path: Path, evidence: dict) -> bool:
+        """Return true only for the exact saved file the controller proved."""
+        try:
+            stat = path.stat()
+        except OSError:
+            return False
+        return bool(
+            evidence.get("name") == path.name
+            and int(evidence.get("length", -1)) == stat.st_size
+            and int(evidence.get("modified_ms", -1)) == int(stat.st_mtime * 1000)
+        )
+
     def _current_caption_revision_review_pdf_passed(self) -> bool:
         """Return true only for a controller-accepted PDF of the active INDD.
 
@@ -1285,13 +1298,14 @@ class MainWindow(QMainWindow):
         expected_pdf = f"{Path(master).stem}_review.pdf" if master else ""
         reported_master = evidence.get("master") if isinstance(evidence.get("master"), dict) else {}
         reported_pdf = evidence.get("pdf") if isinstance(evidence.get("pdf"), dict) else {}
+        master_path = root / master
+        pdf_path = root / expected_pdf
         return bool(
             master
             and expected_pdf
             and evidence.get("passed") is True
-            and reported_master.get("name") == master
-            and reported_pdf.get("name") == expected_pdf
-            and (root / expected_pdf).is_file()
+            and MainWindow._evidence_identity_matches(master_path, reported_master)
+            and MainWindow._evidence_identity_matches(pdf_path, reported_pdf)
         )
 
     def _refresh_caption_draft_status(self) -> None:

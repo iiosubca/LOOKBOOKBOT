@@ -1,8 +1,8 @@
 # LOOKBOOKBOT for Windows
 
-## Version 0.2.35
+## Version 0.2.36
 
-Correction revisions are now explicitly two-phase: the copied INDD is marked as being built until the native CREDiTs pass has written and verified every saved edit. LOOKBOOKBOT shows “Версия готова к просмотру” only after the verified draft hash and current-master captions evidence agree, so a just-copied source file cannot be mistaken for the finished correction version.
+Correction revisions are now explicitly two-phase: the copied INDD is marked as being built until the native CREDiTs pass has written and verified every saved edit. LOOKBOOKBOT shows “Версия готова к просмотру” only after the verified draft hash and exact current-master captions evidence agree, so a just-copied or subsequently overwritten source file cannot be mistaken for the finished correction version.
 
 ## Version 0.2.34
 

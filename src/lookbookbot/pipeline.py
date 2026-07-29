@@ -185,7 +185,17 @@ class PipelineEngine:
             raise PipelineError("Сохранённые правки кредитов не совпадают с caption-data.tsv новой версии.")
         evidence = read_json(root / "control" / "evidence" / "captions.json")
         reported_master = evidence.get("master") if isinstance(evidence.get("master"), dict) else {}
-        if evidence.get("passed") is not True or reported_master.get("name") != master_name:
+        master_path = root / master_name
+        try:
+            master_stat = master_path.stat()
+        except OSError as error:
+            raise PipelineError("Файл новой INDD-версии не найден для проверки правок.") from error
+        master_matches = (
+            reported_master.get("name") == master_name
+            and int(reported_master.get("length", -1)) == master_stat.st_size
+            and int(reported_master.get("modified_ms", -1)) == int(master_stat.st_mtime * 1000)
+        )
+        if evidence.get("passed") is not True or not master_matches:
             raise PipelineError("InDesign ещё не подтвердил применение правок к новой версии.")
         try:
             revision = int(state.get("current_revision", 1))
