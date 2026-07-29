@@ -4842,6 +4842,10 @@ def command_begin_revision(args: argparse.Namespace) -> None:
                 fail(f"Caption revision cannot preserve {label}: {item}")
         revision_record.update({
             "kind": "captions", "changed_looks": sorted(changes),
+            # The physical INDD copy exists at this point, but it is not a
+            # finished user-visible revision until the native captions gate
+            # has saved and verified its exact text against this audit.
+            "caption_application": "pending",
             "source_visual_evidence": _relative_project_path(project, archived_visual_evidence),
             "source_visual_evidence_sha256": digest(archived_visual_evidence),
             "source_visual_manifest": _relative_project_path(project, archived_visual_manifest),

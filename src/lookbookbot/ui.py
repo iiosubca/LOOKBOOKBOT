@@ -136,6 +136,12 @@ class PipelineWorker(QObject):
                 engine.set_caption_revision_visual_mode(project, targeted=self.targeted_caption_visual)
                 if self.caption_revision_action == "create":
                     result = engine.run(project, "captions", continue_after=False, stop_after="captions")
+                    if not result.stopped_at:
+                        result = PipelineResult(
+                            result.completed,
+                            None,
+                            engine.caption_revision_ready_message(project),
+                        )
                 else:
                     result = engine.run(project, "captions", continue_after=True, stop_after="review")
             elif self.caption_revision_action == "export-review":
@@ -1302,6 +1308,20 @@ class MainWindow(QMainWindow):
         if state.get("manual_caption_revision"):
             master = str(state.get("master", ""))
             review_pdf = f"{Path(master).stem}_review.pdf" if master else "review PDF"
+            try:
+                revision = int(state.get("current_revision", 1))
+                record = read_json(
+                    self.project.project_dir / "control" / "revisions" / f"revision-{revision:02}.json"
+                )
+                application_ready = record.get("caption_application") == "ready"
+            except (TypeError, ValueError):
+                application_ready = False
+            if not application_ready:
+                self.correction_draft_status.setText(
+                    f"СОЗДАЁТСЯ ВЕРСИЯ: {master}. Копия INDD ещё техническая — "
+                    "сохранённые правки сейчас применяются и проверяются. Не открывайте её до сообщения «Версия готова к просмотру»."
+                )
+                return
             if look_ids:
                 if self._current_caption_revision_review_pdf_passed():
                     self.correction_draft_status.setText(
@@ -1508,7 +1528,10 @@ class MainWindow(QMainWindow):
             return
         future = self._next_caption_revision_names()
         label = future[0] if future else "следующая версия"
-        self._append_log(f"Создаётся новая ревизия InDesign: {label}. PDF пока не записывается.")
+        self._append_log(
+            f"Создаётся версия InDesign: {label}. Сначала будут применены и проверены все сохранённые правки кредитов; "
+            "файл станет готовым к просмотру только после сообщения «Версия готова к просмотру». PDF пока не записывается."
+        )
         self._start_pipeline(
             None,
             False,

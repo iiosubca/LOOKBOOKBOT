@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
@@ -73,3 +74,38 @@ def test_next_revision_is_allowed_after_the_current_review_pdf_is_controller_con
     window_stub = SimpleNamespace(project=SimpleNamespace(project_dir=root))
 
     assert MainWindow._current_caption_revision_review_pdf_passed(window_stub) is True
+
+
+def test_caption_revision_is_only_reported_ready_after_native_captions_prove_the_saved_draft(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    project = _project(store, tmp_path)
+    root = project.project_dir
+    evidence_dir = root / "control" / "evidence"
+    revisions_dir = root / "control" / "revisions"
+    work_dir = root / "control" / "work"
+    evidence_dir.mkdir(parents=True)
+    revisions_dir.mkdir(parents=True)
+    work_dir.mkdir(parents=True)
+    master = "TSUM_FS-0261112_LB_WA_04.indd"
+    captions = work_dir / "caption-data.tsv"
+    captions.write_text("look_id\ttype\tbrand\tprice\tarticle\nLOOK_001\tОчки\tTEST\t1 ₽\t1\n", encoding="utf-8")
+    digest = hashlib.sha256(captions.read_bytes()).hexdigest()
+    draft_ref = "control/revisions/manual-caption-revision.json"
+    (root / draft_ref).write_text(
+        json.dumps({"look_ids": ["LOOK_001"], "after_caption_data_sha256": digest}), encoding="utf-8"
+    )
+    (root / "control" / "lookbook-state.json").write_text(
+        json.dumps({"master": master, "current_revision": 4, "manual_caption_revision": draft_ref, "captions": "control/work/caption-data.tsv"}),
+        encoding="utf-8",
+    )
+    (evidence_dir / "captions.json").write_text(
+        json.dumps({"passed": True, "created_at": "2026-07-29T20:00:00Z", "master": {"name": master}}), encoding="utf-8"
+    )
+    record = revisions_dir / "revision-04.json"
+    record.write_text(json.dumps({"manual_caption_revision": draft_ref, "caption_application": "pending"}), encoding="utf-8")
+
+    message = PipelineEngine(store).caption_revision_ready_message(project)
+
+    assert master in message
+    assert "LOOK_001" in message
+    assert json.loads(record.read_text(encoding="utf-8"))["caption_application"] == "ready"

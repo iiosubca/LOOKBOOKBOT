@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import re
 import shutil
@@ -155,6 +156,52 @@ class PipelineEngine:
             raise PipelineError("Целевой визуальный контроль доступен только для созданной ревизии кредитов.")
         mode = "targeted" if targeted else "scope-only"
         self.controller.gate("set-caption-revision-visual-mode", root, "--mode", mode, timeout=120)
+
+    def caption_revision_ready_message(self, project: ProjectRecord) -> str:
+        """Prove that a correction revision is ready for a person to open.
+
+        ``begin-revision`` intentionally creates a physical INDD copy before
+        CREDiTs can be written into it.  That copy is *not* a finished
+        revision.  This check is deliberately performed only after the native
+        captions gate has saved and compared every text block with the draft
+        TSV, so the UI never presents a bare source copy as a completed
+        correction revision.
+        """
+        root = project.project_dir
+        state = read_json(root / "control" / "lookbook-state.json")
+        master_name = str(state.get("master", "")).strip()
+        draft_ref = str(state.get("manual_caption_revision", "")).strip()
+        if not master_name or not draft_ref:
+            raise PipelineError("Новая версия не содержит обязательного маркера правок кредитов.")
+        draft_path = root / draft_ref
+        draft = read_json(draft_path)
+        captions_ref = str(state.get("captions", "control/work/caption-data.tsv"))
+        captions_path = root / captions_ref
+        if not captions_path.is_file():
+            raise PipelineError("Новая версия не содержит caption-data.tsv для проверки правок.")
+        expected_hash = str(draft.get("after_caption_data_sha256", "")).strip()
+        actual_hash = hashlib.sha256(captions_path.read_bytes()).hexdigest()
+        if not expected_hash or actual_hash != expected_hash:
+            raise PipelineError("Сохранённые правки кредитов не совпадают с caption-data.tsv новой версии.")
+        evidence = read_json(root / "control" / "evidence" / "captions.json")
+        reported_master = evidence.get("master") if isinstance(evidence.get("master"), dict) else {}
+        if evidence.get("passed") is not True or reported_master.get("name") != master_name:
+            raise PipelineError("InDesign ещё не подтвердил применение правок к новой версии.")
+        try:
+            revision = int(state.get("current_revision", 1))
+        except (TypeError, ValueError) as error:
+            raise PipelineError(f"Некорректный номер текущей версии: {error}") from error
+        record_path = root / "control" / "revisions" / f"revision-{revision:02}.json"
+        record = read_json(record_path)
+        if record.get("manual_caption_revision") != draft_ref:
+            raise PipelineError("Ревизия не связана с сохранённым черновиком правок.")
+        record["caption_application"] = "ready"
+        record["caption_application_verified_at"] = str(evidence.get("created_at", ""))
+        record_path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        look_ids = draft.get("look_ids") if isinstance(draft.get("look_ids"), list) else []
+        looks = ", ".join(str(value) for value in look_ids)
+        suffix = f" Правки применены: {looks}." if looks else " Правки применены."
+        return f"Версия {master_name} готова к просмотру.{suffix}"
 
     def prepare_caption_revision(self, project: ProjectRecord, audit: Path) -> None:
         """Keep the reviewed source pristine before completing its release/PDF."""
@@ -444,6 +491,8 @@ class PipelineEngine:
     def _native(self, project: ProjectRecord, gate: str) -> str:
         self._require_initialized(project)
         self.controller.apply_native_gate(project.project_dir, gate)
+        if gate == "captions" and self._has_manual_caption_revision(project.project_dir):
+            return self.caption_revision_ready_message(project)
         return f"PASS {gate}: контроллер подтвердил сохранённый InDesign master."
 
     def _visual(self, project: ProjectRecord, provider: ModelProvider) -> str:
