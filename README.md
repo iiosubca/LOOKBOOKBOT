@@ -1,6 +1,9 @@
 # LOOKBOOKBOT for Windows
 
-## Version 0.2.26
+## Version 0.2.27
+
+- Fixed release-stage COM stability: all InDesign page items are now read through indexed collection access instead of the unstable COM enumerator.
+- Release and review-PDF recovery now continue after repeated COM disconnects only while the saved master remains byte-identical; no fixed retry count can stop a safe, unchanged release.
 
 - Added the `ПРАВКИ` workspace between visual audit and log. It shows the selected full-length and close-up images vertically beside an editable product list.
 - Saving a correction creates a controlled source draft; `СОХРАНИТЬ И НАПИСАТЬ PDF НА ПРОВЕРКУ` copies the reviewed INDD to the next `_NN` revision, restores captions through the native `CREDiTs` style and writes the new revision's review PDF. Previous review files remain intact.

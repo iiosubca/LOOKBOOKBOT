@@ -120,9 +120,35 @@ function Read-Tsv([string]$Path, [string[]]$ExpectedHeader) {
     }
     return $rows
 }
+function Get-DocumentPageItems($Document) {
+    # Do not enumerate Document.AllPageItems directly.  On a large document
+    # the COM enumerable proxy can disconnect although the InDesign process
+    # and the saved document are both still healthy (RPC_E_DISCONNECTED).
+    # Indexed collection access uses InDesign's native collection API and is
+    # stable across 100+ page releases.  Keep the returned objects unchanged:
+    # callers still validate the exact labelled template frames.
+    try {
+        $collection = $Document.AllPageItems
+        $count = [int]$collection.Count
+    } catch {
+        Fail 'InDesign cannot read the document page-item collection.'
+    }
+    $items = @()
+    for ($index = 1; $index -le $count; $index++) {
+        try {
+            $items += $collection.Item($index)
+        } catch {
+            Fail "InDesign cannot read page item $index of $count."
+        }
+    }
+    return $items
+}
+function Get-DocumentPageItemCount($Document) {
+    try { return [int]$Document.AllPageItems.Count } catch { Fail 'InDesign cannot count document page items.' }
+}
 function Get-LabeledItems($Document, [string]$Label) {
     $result = @()
-    foreach ($item in $Document.AllPageItems) {
+    foreach ($item in @(Get-DocumentPageItems $Document)) {
         if ([string]$item.Label -eq $Label) { $result += $item }
     }
     return $result
@@ -174,7 +200,7 @@ function Get-LockedFrameGeometry($Document) {
     # COM launches. Store horizontal geometry relative to its parent page so the
     # structural lock is stable across those equivalent coordinate systems.
     $pageWidth = [double]$Document.DocumentPreferences.PageWidth
-    foreach ($item in $Document.AllPageItems) {
+    foreach ($item in @(Get-DocumentPageItems $Document)) {
         $label = [string]$item.Label
         if ($label -notmatch '^LOOKBOOK_(LEFT_IMAGE|RIGHT_IMAGE|CREDITS)(\|LOOK_\d{3})?$') { continue }
         try {
@@ -248,7 +274,7 @@ function Get-VisualCaptionCorrections([string]$CorrectionPlanPath, $State) {
 }
 function Assert-Baseline($Document, [string]$StructureEvidencePath, [string]$CaptionGeometryPath = '', [bool]$AllowCreditExpansion = $false, [string]$VisualCaptionCorrectionPath = '', $State = $null) {
     $baseline = Read-Json $StructureEvidencePath
-    if ([int]$baseline.page_item_count -ne [int]$Document.AllPageItems.Count) { Fail 'Page-item count changed after structure proof.' }
+    if ([int]$baseline.page_item_count -ne (Get-DocumentPageItemCount $Document)) { Fail 'Page-item count changed after structure proof.' }
     if ([int]$baseline.text_frame_count -ne [int]$Document.TextFrames.Count) { Fail 'Text-frame count changed after structure proof.' }
     # Older sessions do not have geometry evidence. Keep them releasable, but
     # every session started with this controller locks the three look frames on
@@ -305,7 +331,7 @@ function Assert-Frames($Document, $Registry) {
     # Build a label index in one COM traversal.  Repeated Get-OneItem scans
     # exhaust InDesign's COM bridge on a 100+ page lookbook.
     $byLabel = @{}
-    foreach ($item in $Document.AllPageItems) {
+    foreach ($item in @(Get-DocumentPageItems $Document)) {
         $label = [string]$item.Label
         if ($label) {
             if (-not $byLabel.ContainsKey($label)) { $byLabel[$label] = @() }
@@ -332,7 +358,7 @@ function Assert-Frames($Document, $Registry) {
 }
 function New-LabelIndex($Document) {
     $byLabel = @{}
-    foreach ($item in $Document.AllPageItems) { if ([string]$item.Label) { $byLabel[[string]$item.Label] = $item } }
+    foreach ($item in @(Get-DocumentPageItems $Document)) { if ([string]$item.Label) { $byLabel[[string]$item.Label] = $item } }
     return $byLabel
 }
 function Test-FrameImage($Frame, [string]$ExpectedFilename, [string]$ExpectedPath = '') {
@@ -675,7 +701,7 @@ function Assert-VisualCaptionCorrectionsApplied($Document, $VisualCaptionCorrect
 }
 function Write-CaptionGeometryEvidence($Control, $State, $Arm, [string]$MasterPath, $Document) {
     $frames = @()
-    foreach ($item in $Document.AllPageItems) {
+    foreach ($item in @(Get-DocumentPageItems $Document)) {
         $label = [string]$item.Label
         if ($label -notlike 'LOOKBOOK_CREDITS|*') { continue }
         $bounds = @($item.GeometricBounds)
@@ -708,7 +734,7 @@ function Write-Evidence($Control, $State, $Arm, [string]$GateName, [string]$Mast
     $evidence = [ordered]@{
         schema = 1; session_id = [string]$State.session_id; gate = $GateName; passed = $true
         nonce = [string]$Arm.nonce; created_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-        master = Master-Identity $MasterPath; page_item_count = [int]$Document.AllPageItems.Count
+        master = Master-Identity $MasterPath; page_item_count = (Get-DocumentPageItemCount $Document)
         text_frame_count = [int]$Document.TextFrames.Count; checks = $checks
     }
     if ($GateName -eq 'structure') {
@@ -1659,7 +1685,7 @@ function Prepare-Template([string]$Source, [string]$Destination) {
         $prepared = Open-AutomationDocument $app $Destination
         $labels = @{'LOOKBOOK_LEFT_IMAGE|LOOK_001'='LOOKBOOK_LEFT_IMAGE';'LOOKBOOK_RIGHT_IMAGE|LOOK_001'='LOOKBOOK_RIGHT_IMAGE';'LOOKBOOK_CREDITS|LOOK_001'='LOOKBOOK_CREDITS'}
         $changed = 0
-        foreach ($item in $prepared.AllPageItems) { if ($labels.ContainsKey([string]$item.Label)) { $item.Label = $labels[[string]$item.Label]; $changed++ } }
+        foreach ($item in @(Get-DocumentPageItems $prepared)) { if ($labels.ContainsKey([string]$item.Label)) { $item.Label = $labels[[string]$item.Label]; $changed++ } }
         if ($changed -ne 3) { Fail "Expected exactly three LOOK_001 work labels; changed $changed." }
         if ([int]$prepared.Pages.Count -ne 4 -or [int]$prepared.Spreads.Count -ne 3) { Fail 'Template must contain front + one two-page work spread + back.' }
         $prepared.Save(); $prepared.Close($SAVE_NO); $prepared = $null

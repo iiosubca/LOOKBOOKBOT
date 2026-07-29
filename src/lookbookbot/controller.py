@@ -76,6 +76,32 @@ def _artifact_signature(path: Path) -> tuple[int, int] | None:
     return stat.st_size, stat.st_mtime_ns
 
 
+def _controlled_master(project: Path) -> Path:
+    """Return the saved master only when state keeps it inside the project."""
+    state = read_json(project / "control" / "lookbook-state.json")
+    name = str(state.get("master", "")).strip()
+    if not name:
+        raise CommandError("Контроллер не указал master-файл для безопасного восстановления InDesign.")
+    root = project.resolve()
+    master = (root / name).resolve()
+    try:
+        master.relative_to(root)
+    except ValueError as error:
+        raise CommandError("Master-файл контроллера находится вне папки проекта.") from error
+    if not master.is_file():
+        raise CommandError("Сохранённый master-файл не найден; автоматическое восстановление остановлено.")
+    return master
+
+
+def _assert_unchanged_master(master: Path, expected: tuple[int, int] | None, context: str) -> None:
+    """Never retry a read-only stage after its master changed on disk."""
+    actual = _artifact_signature(master)
+    if expected is None or actual != expected:
+        raise CommandError(
+            f"Master-файл изменился во время {context}; автоматический повтор остановлен, чтобы не перезаписать выпуск."
+        )
+
+
 def _stable_failure_text(value: str) -> str:
     return " ".join(str(value).split())
 
@@ -147,14 +173,15 @@ class LookbookController:
         return self.gate("status", project, timeout=120, check=False).text
 
     def export_review_pdf(self, project: Path, pdf: str) -> None:
-        """Export a review PDF while each COM recovery changes saved state.
+        """Export a review PDF while every COM retry proves master stability.
 
         A release/export COM dropout leaves the saved master untouched.  A
         fresh permit also quarantines a partial PDF, so retrying from this
         boundary is both idempotent and safer than asking the operator to
         press Continue.
         """
-        seen_failures: set[tuple[tuple[int, int] | None, str]] = set()
+        master = _controlled_master(project)
+        master_before_export = _artifact_signature(master)
         while True:
             self._wait_for_master(project)
             permit = self.gate("pre-export", project, "--pdf", pdf, "--quarantine-existing", timeout=180, check=False)
@@ -165,16 +192,7 @@ class LookbookController:
                 self._wait_for_master(project)
                 return
             if self._is_com_disconnect(project, exported.text):
-                failure_state = (
-                    _artifact_signature(project / pdf),
-                    _stable_failure_text(exported.text),
-                )
-                if failure_state in seen_failures:
-                    raise CommandError(
-                        "InDesign повторил тот же сбой экспорта без нового PDF-checkpoint; "
-                        "автоматический перезапуск остановлен, чтобы не перезаписывать выпуск."
-                    )
-                seen_failures.add(failure_state)
+                _assert_unchanged_master(master, master_before_export, "экспорта PDF")
                 if self._restart_controlled_indesign(project):
                     self.runner.log(
                         "InDesign потерял COM-соединение при экспорте review-PDF; "
@@ -192,6 +210,8 @@ class LookbookController:
             raise CommandError(arm.text)
         seen_checkpoints: set[str] = set()
         seen_com_failures: set[tuple[str | None, str]] = set()
+        release_master = _controlled_master(project) if gate == "release" else None
+        release_master_signature = _artifact_signature(release_master) if release_master else None
         while True:
             if evidence_passed(project, gate):
                 return
@@ -203,6 +223,25 @@ class LookbookController:
                 return
             if result.returncode:
                 if self._is_com_disconnect(project, result.text):
+                    if gate == "release":
+                        # release is intentionally read-only.  A verified
+                        # unchanged master plus a neutral InDesign restart is
+                        # a new safe recovery state, even when Adobe repeats
+                        # the same RPC diagnostic.  Do not replace this with
+                        # an arbitrary retry count: that was the source of
+                        # false stops on otherwise valid lookbooks.
+                        _assert_unchanged_master(release_master, release_master_signature, "контрольного выпуска")
+                        self.runner.log(
+                            "InDesign потерял COM-соединение на release; master не изменён. "
+                            "Безопасно перезапускаю document-free экземпляр и продолжаю тот же этап."
+                        )
+                        if not self._restart_controlled_indesign(project):
+                            raise CommandError(
+                                "InDesign потерял COM-соединение на этапе release, но приложение не смогло "
+                                "доказать, что экземпляр безопасно перезапустить. Документ не изменён."
+                            )
+                        self._wait_for_indesign_ready()
+                        continue
                     failure_state = (checkpoint_before, _stable_failure_text(result.text))
                     if failure_state in seen_com_failures:
                         raise CommandError(
@@ -210,26 +249,14 @@ class LookbookController:
                             "Документ не изменён; повтор не даст нового безопасного действия."
                         )
                     seen_com_failures.add(failure_state)
-                    if gate == "release":
-                        self.runner.log(
-                            "InDesign потерял COM-соединение на release; безопасно перезапускаю "
-                            "документ-free экземпляр и повторяю тот же arm из сохранённой точки."
-                        )
-                        if not self._restart_controlled_indesign(project):
-                            raise CommandError(
-                                f"InDesign потерял COM-соединение на этапе {gate}, но приложение не смогло "
-                                "доказать, что экземпляр безопасно перезапустить. Документ не изменён."
-                            )
-                        self._wait_for_indesign_ready()
-                    else:
-                        self.runner.log(
-                            f"InDesign потерял COM-соединение на этапе {gate}; повторяю тот же arm "
-                            "из сохранённой точки."
-                        )
-                        # Other native gates may have durable checkpoints that
-                        # the underlying controller can resume itself.  Do not
-                        # close a possible in-progress transactional document.
-                        time.sleep(4)
+                    self.runner.log(
+                        f"InDesign потерял COM-соединение на этапе {gate}; повторяю тот же arm "
+                        "из сохранённой точки."
+                    )
+                    # Other native gates may have durable checkpoints that
+                    # the underlying controller can resume itself.  Do not
+                    # close a possible in-progress transactional document.
+                    time.sleep(4)
                     # Return to the guarded loop.  It preserves the existing
                     # arm and rechecks both lock and evidence before retrying.
                     continue

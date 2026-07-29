@@ -12,6 +12,11 @@ from lookbookbot.controller import CommandError, CommandResult, CommandRunner, L
 
 
 def _tools(tmp_path: Path) -> ToolPaths:
+    master = tmp_path / "template.indd"
+    master.touch()
+    control = tmp_path / "control"
+    control.mkdir(exist_ok=True)
+    (control / "lookbook-state.json").write_text(json.dumps({"master": master.name}), encoding="utf-8")
     return ToolPaths(
         python=tmp_path / "python.exe",
         engine_scripts=tmp_path,
@@ -47,7 +52,7 @@ def test_native_gate_retries_one_safe_com_disconnect(tmp_path: Path, monkeypatch
     assert calls == ["arm", "apply", "apply"]
 
 
-def test_release_stops_only_when_the_same_com_failure_has_no_new_state(tmp_path: Path, monkeypatch) -> None:
+def test_release_retries_repeated_com_disconnects_while_master_is_unchanged(tmp_path: Path, monkeypatch) -> None:
     controller = LookbookController(_tools(tmp_path), CommandRunner())
     calls: list[str] = []
     apply_calls = 0
@@ -72,13 +77,29 @@ def test_release_stops_only_when_the_same_com_failure_has_no_new_state(tmp_path:
     monkeypatch.setattr(controller, "_wait_for_master", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(controller, "_restart_controlled_indesign", fake_restart)
     monkeypatch.setattr(controller, "_wait_for_indesign_ready", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr("lookbookbot.controller.evidence_passed", lambda *_args: False)
+    monkeypatch.setattr("lookbookbot.controller.evidence_passed", lambda *_args: apply_calls >= 3)
 
-    with pytest.raises(CommandError, match="без нового checkpoint"):
+    controller.apply_native_gate(tmp_path, "release")
+
+    assert calls == ["arm", "apply", "apply", "apply"]
+    assert restarts == 2
+
+
+def test_release_refuses_to_retry_when_master_changes(tmp_path: Path, monkeypatch) -> None:
+    controller = LookbookController(_tools(tmp_path), CommandRunner())
+    master = tmp_path / "template.indd"
+
+    def fake_gate(action: str, _project: Path, *_args, **_kwargs) -> CommandResult:
+        if action == "arm":
+            return CommandResult((), 0, "ARMED", "", 0)
+        master.write_bytes(b"changed")
+        return CommandResult((), 1, "", "RPC_E_DISCONNECTED 0x80010108", 0)
+
+    monkeypatch.setattr(controller, "gate", fake_gate)
+    monkeypatch.setattr(controller, "_wait_for_master", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(CommandError, match="Master-файл изменился"):
         controller.apply_native_gate(tmp_path, "release")
-
-    assert calls == ["arm", "apply", "apply"]
-    assert restarts == 1
 
 
 def test_com_disconnect_stops_when_safe_restart_cannot_be_proven(tmp_path: Path, monkeypatch) -> None:
@@ -142,7 +163,7 @@ def test_safe_restart_waits_for_a_cold_indesign_launch(tmp_path: Path, monkeypat
     master = tmp_path / "controlled.indd"
     master.touch()
     control = tmp_path / "control"
-    control.mkdir()
+    control.mkdir(exist_ok=True)
     (control / "lookbook-state.json").write_text(json.dumps({"master": master.name}), encoding="utf-8")
     calls: list[tuple[list[str], dict]] = []
 
