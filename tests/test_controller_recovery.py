@@ -5,6 +5,8 @@ import base64
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from lookbookbot.config import ToolPaths
 from lookbookbot.controller import CommandError, CommandResult, CommandRunner, LookbookController
 
@@ -45,7 +47,7 @@ def test_native_gate_retries_one_safe_com_disconnect(tmp_path: Path, monkeypatch
     assert calls == ["arm", "apply", "apply"]
 
 
-def test_release_retries_the_same_arm_after_two_com_disconnects(tmp_path: Path, monkeypatch) -> None:
+def test_release_stops_only_when_the_same_com_failure_has_no_new_state(tmp_path: Path, monkeypatch) -> None:
     controller = LookbookController(_tools(tmp_path), CommandRunner())
     calls: list[str] = []
     apply_calls = 0
@@ -70,12 +72,13 @@ def test_release_retries_the_same_arm_after_two_com_disconnects(tmp_path: Path, 
     monkeypatch.setattr(controller, "_wait_for_master", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(controller, "_restart_controlled_indesign", fake_restart)
     monkeypatch.setattr(controller, "_wait_for_indesign_ready", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr("lookbookbot.controller.evidence_passed", lambda *_args: apply_calls >= 3)
+    monkeypatch.setattr("lookbookbot.controller.evidence_passed", lambda *_args: False)
 
-    controller.apply_native_gate(tmp_path, "release")
+    with pytest.raises(CommandError, match="без нового checkpoint"):
+        controller.apply_native_gate(tmp_path, "release")
 
-    assert calls == ["arm", "apply", "apply", "apply"]
-    assert restarts == 2
+    assert calls == ["arm", "apply", "apply"]
+    assert restarts == 1
 
 
 def test_com_disconnect_stops_when_safe_restart_cannot_be_proven(tmp_path: Path, monkeypatch) -> None:
@@ -96,6 +99,42 @@ def test_com_disconnect_stops_when_safe_restart_cannot_be_proven(tmp_path: Path,
         assert "не смогло доказать" in str(error)
     else:
         raise AssertionError("a non-provable restart must not touch InDesign")
+
+
+def test_native_batches_continue_past_a_fixed_count_when_checkpoints_advance(tmp_path: Path, monkeypatch) -> None:
+    controller = LookbookController(_tools(tmp_path), CommandRunner())
+    calls = 0
+
+    def fake_gate(action: str, _project: Path, *_args, **_kwargs) -> CommandResult:
+        nonlocal calls
+        if action == "arm":
+            return CommandResult((), 0, "ARMED", "", 0)
+        calls += 1
+        if calls > 101:
+            return CommandResult((), 0, "PASS images", "", 0)
+        progress = tmp_path / "control" / "progress" / "images.json"
+        progress.parent.mkdir(parents=True, exist_ok=True)
+        progress.write_text(
+            json.dumps(
+                {
+                    "gate": "images",
+                    "nonce": "test",
+                    "completed_count": calls,
+                    "completed_looks": [f"LOOK_{calls:03}"],
+                    "look_count": 102,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return CommandResult((), 0, f"CHECKPOINT images: {calls}/102", "", 0)
+
+    monkeypatch.setattr(controller, "gate", fake_gate)
+    monkeypatch.setattr(controller, "_wait_for_master", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("lookbookbot.controller.evidence_passed", lambda *_args: calls > 101)
+
+    controller.apply_native_gate(tmp_path, "images")
+
+    assert calls == 102
 
 
 def test_safe_restart_waits_for_a_cold_indesign_launch(tmp_path: Path, monkeypatch) -> None:

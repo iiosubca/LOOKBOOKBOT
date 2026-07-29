@@ -3313,7 +3313,10 @@ def command_repair_captions(args: argparse.Namespace) -> None:
         validate_composition_applied(project, state)
     elif not same_identity(resume.get("master", {}), identity(state_artifact(project, state, "master"))):
         fail("Caption-repair checkpoint does not match the current saved master.")
-    for _ in range(total):
+    # Each native batch declares exactly which LOOK IDs are complete. Continue
+    # until the repair evidence is written; a non-advancing checkpoint is the
+    # convergence boundary, not an arbitrary number of calls.
+    while True:
         repair_path = control_path(project) / "visual" / "caption-repair.json"
         if repair_path.exists():
             repair = read_json(repair_path)
@@ -3378,7 +3381,6 @@ def command_repair_captions(args: argparse.Namespace) -> None:
         if completed <= before:
             fail("Caption-repair batch did not advance durable progress. Retry without re-arming.")
         print(f"CHECKPOINT caption repair: {completed}/{total} looks saved and verified.")
-    fail("Caption-repair batch safety limit reached before full verification. Retry without re-arming.")
 
 
 def command_restore_failed_caption_repair(args: argparse.Namespace) -> None:

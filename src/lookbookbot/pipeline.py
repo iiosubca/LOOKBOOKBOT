@@ -664,14 +664,7 @@ class PipelineEngine:
         if arm.returncode and "armed" not in arm.text.casefold():
             self.log(arm.text)
         self._prepare_or_resume_visual_composition(root)
-        for _ in range(100):
-            result = self.controller.gate("apply-composition", root, timeout=1800, check=False)
-            if result.returncode:
-                raise PipelineError(result.text)
-            if "PASS composition" in result.text or "PASS COMPOSITION" in result.text.upper():
-                break
-            if "CHECKPOINT" not in result.text.upper():
-                break
+        self._apply_composition_until_saved(root)
         # A visual proof is expensive, but a retry count is not a clearance
         # rule.  One plan may fix many looks at once, while a later proof can
         # expose another one of the 50 looks.  Continue until the proof is
@@ -723,15 +716,42 @@ class PipelineEngine:
                 f"Caption-clearance: выполняю автономную коррекцию №{attempt} "
                 f"(фото: {len(plan_data.get('corrections', []))}, кредиты: {len(plan_data.get('caption_corrections', []))})."
             )
-            for _batch in range(100):
-                applied = self.controller.gate("apply-composition", root, timeout=1800, check=False)
-                if applied.returncode:
-                    raise PipelineError(applied.text)
-                if "PASS composition" in applied.text or "CHECKPOINT" not in applied.text.upper():
-                    break
+            self._apply_composition_until_saved(root)
+
+    def _apply_composition_until_saved(self, root: Path) -> None:
+        """Resume composition only while its durable checkpoint advances.
+
+        ``apply-composition`` owns one short native transaction.  The previous
+        100-call ceiling was unrelated to the number of looks in the current
+        signed plan.  A checkpoint carries the exact completed LOOK IDs, so it
+        is the authority for both safe continuation and convergence.
+        """
+        seen_checkpoints: set[str] = set()
+        while True:
+            before = _composition_checkpoint_signature(root)
+            result = self.controller.gate("apply-composition", root, timeout=1800, check=False)
+            if result.returncode:
+                raise PipelineError(result.text)
+            output = result.text.upper()
+            if "PASS COMPOSITION" in output:
+                return
+            if "CHECKPOINT" not in output:
+                raise PipelineError(
+                    "Контроллер не зафиксировал PASS или checkpoint для применения composition plan."
+                )
+            after = _composition_checkpoint_signature(root)
+            if after is None:
+                raise PipelineError(
+                    "Composition вернул checkpoint без сохранённых данных о выполненных LOOK."
+                )
+            if after == before or after in seen_checkpoints:
+                raise PipelineError(
+                    "Composition повторил checkpoint без нового сохранённого прогресса; master не изменён."
+                )
+            seen_checkpoints.add(after)
 
     def _run_parallel_codex_visual(
-        self, project: ProjectRecord, provider: CodexProvider, *, repair_attempts: int = 0,
+        self, project: ProjectRecord, provider: CodexProvider, *, repaired_plans: set[str] | None = None,
     ) -> None:
         """Inspect proof cards concurrently and commit accepted checks serially.
 
@@ -748,18 +768,19 @@ class PipelineEngine:
         decisions: dict[str, VisionDecision] = {}
         unresolved = pending
         diagnostics: dict[str, str] = {}
+        repaired_plans = set() if repaired_plans is None else repaired_plans
+        repeated_observation_states: set[tuple[tuple[str, str], ...]] = set()
 
         # A missing decision is a transient worker failure, not a reason to
-        # ask the operator to click Continue.  Retry only those exact proof
-        # cards with fresh, explicitly attached images.  Confirmed cards are
-        # never rendered or reviewed again.
-        for attempt in range(1, 4):
-            if not unresolved:
-                break
+        # ask the operator to click Continue. Retry only those exact proof
+        # cards while the response state changes. A repeated identical failure
+        # has no new evidence to act on, so it must not become an infinite
+        # unattended loop.
+        while unresolved:
             batches = _path_batches(unresolved, size=5)
             workers = min(4, len(batches))
             self.log(
-                f"Визуальная проверка, попытка {attempt}/3: {len(unresolved)} разворотов "
+                f"Визуальная проверка: {len(unresolved)} разворотов "
                 f"в {len(batches)} независимых пакетах, одновременно до {workers}."
             )
             attempt_decisions: dict[str, VisionDecision] = {}
@@ -789,36 +810,55 @@ class PipelineEngine:
                 proof for proof in unresolved
                 if not attempt_decisions.get(proof.stem) or not attempt_decisions[proof.stem].accepted
             ]
-            if unresolved:
-                labels = ", ".join(proof.stem for proof in unresolved)
-                self.log(
-                    f"Автоповтор visual-proof только для: {labels}. "
-                    + ("Ошибки пакетов: " + "; ".join(failures) if failures else "")
-                )
-
-        if unresolved:
+            if not unresolved:
+                break
             rejected = {
                 proof.stem: decisions[proof.stem]
                 for proof in unresolved
                 if proof.stem in decisions and not decisions[proof.stem].accepted
             }
-            if len(rejected) == len(unresolved) and repair_attempts < 2:
-                if self._repair_rejected_visual_proofs(root, rejected):
-                    self.log(
-                        "Контролируемая коррекция visual-proof подготовлена; "
-                        "перезапускаю только обязательный новый цикл доказательств."
+            if rejected:
+                plan_digest = self._repair_rejected_visual_proofs(root, rejected)
+                if plan_digest is None:
+                    details = "; ".join(
+                        f"{look_id}: {decision.note}" for look_id, decision in rejected.items()
                     )
-                    return self._run_parallel_codex_visual(
-                        project, provider, repair_attempts=repair_attempts + 1,
+                    raise ReviewRequired(
+                        "Контроллер не нашёл новую допустимую visual-коррекцию: " + details
                     )
-            details = "; ".join(
-                f"{proof.stem}: {diagnostics.get(proof.stem, 'нет решения визуальной модели')}"
-                for proof in unresolved
+                if plan_digest in repaired_plans:
+                    raise ReviewRequired(
+                        "Контроллер повторил уже применённую visual-коррекцию без новой геометрии: "
+                        + ", ".join(sorted(rejected))
+                    )
+                repaired_plans.add(plan_digest)
+                self.log(
+                    "Контролируемая коррекция visual-proof подготовлена; "
+                    "перезапускаю только новый цикл доказательств."
+                )
+                return self._run_parallel_codex_visual(project, provider, repaired_plans=repaired_plans)
+
+            missing = [proof for proof in unresolved if proof.stem not in decisions]
+            if not missing:
+                raise PipelineError(
+                    "Визуальная модель вернула неиспользуемое решение без подтверждения или корректировки."
+                )
+            observation_state = tuple(
+                (proof.stem, _normalise_observation_error(diagnostics.get(proof.stem, "нет решения")))
+                for proof in missing
             )
-            raise ReviewRequired(
-                "Автоматическая визуальная проверка трижды не смогла подтвердить только эти развороты: "
-                + details
+            if observation_state in repeated_observation_states:
+                details = "; ".join(f"{look}: {reason}" for look, reason in observation_state)
+                raise ProviderError(
+                    "Визуальная модель повторила неизменный сбой без новых наблюдений: " + details
+                )
+            repeated_observation_states.add(observation_state)
+            labels = ", ".join(proof.stem for proof in missing)
+            self.log(
+                f"Автоповтор visual-proof только для: {labels}. "
+                + ("Ошибки пакетов: " + "; ".join(failures) if failures else "")
             )
+            unresolved = missing
 
         # Keep the durable state single-writer.  A worker never calls a
         # controller command; only accepted decisions become immutable proof
@@ -860,8 +900,8 @@ class PipelineEngine:
 
     def _repair_rejected_visual_proofs(
         self, root: Path, rejected: dict[str, VisionDecision],
-    ) -> bool:
-        """Turn a grounded visual rejection into a bounded controller repair.
+    ) -> str | None:
+        """Turn a grounded visual rejection into a state-checked controller repair.
 
         The computer clearance audit is renewed before its plan is made.  The
         controller then archives only the superseded partial confirmations and
@@ -877,26 +917,40 @@ class PipelineEngine:
         refreshed = self.controller.gate("refresh-caption-clearance", root, timeout=900, check=False)
         if refreshed.returncode:
             self.log("Не удалось обновить caption-clearance для автокоррекции: " + refreshed.text)
-            return False
+            return None
         discarded = self.controller.gate(
             "restart-visual-confirmations", root, "--notes", notes, timeout=180, check=False,
         )
         if discarded.returncode:
             self.log("Не удалось безопасно архивировать partial visual confirmations: " + discarded.text)
-            return False
+            return None
         planned = self.controller.gate(
             "plan-clearance-corrections", root, "--force-looks", ",".join(look_ids), timeout=1800, check=False,
         )
         if planned.returncode:
             self.log("Контроллер не смог построить безопасную visual-коррекцию: " + planned.text)
-            return False
+            return None
+        plan_path = root / "control" / "visual" / "clearance-correction-plan.json"
+        try:
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            self.log("Контроллер не сохранил читаемый план visual-коррекции.")
+            return None
+        if not isinstance(plan, dict):
+            self.log("Контроллер сохранил план visual-коррекции в неверном формате.")
+            return None
+        executable = list(plan.get("corrections", [])) + list(plan.get("caption_corrections", []))
+        if not executable:
+            self.log("План visual-коррекции не содержит допустимых изменений.")
+            return None
         self.log(planned.text)
-        return True
+        return _clearance_plan_digest(plan)
 
     def _run_local_visual(
-        self, project: ProjectRecord, provider: ModelProvider, *, repair_attempts: int = 0,
+        self, project: ProjectRecord, provider: ModelProvider, *, repaired_plans: set[str] | None = None,
     ) -> None:
         root = project.project_dir
+        repaired_plans = set() if repaired_plans is None else repaired_plans
         pairs = self._prepare_visual_proof(project)
         rejected: dict[str, VisionDecision] = {}
         for proof in pairs:
@@ -910,8 +964,10 @@ class PipelineEngine:
                 continue
             self.controller.gate("confirm-visual-look", root, "--look", proof.stem, "--note", decision.note, timeout=120)
         if rejected:
-            if repair_attempts < 2 and self._repair_rejected_visual_proofs(root, rejected):
-                return self._run_local_visual(project, provider, repair_attempts=repair_attempts + 1)
+            plan_digest = self._repair_rejected_visual_proofs(root, rejected)
+            if plan_digest is not None and plan_digest not in repaired_plans:
+                repaired_plans.add(plan_digest)
+                return self._run_local_visual(project, provider, repaired_plans=repaired_plans)
             details = "; ".join(f"{look}: {decision.note}" for look, decision in rejected.items())
             raise ReviewRequired("Автоматическая visual-коррекция не смогла безопасно исправить: " + details)
         self.controller.gate("record-visual", root, "--notes", "Проверены все current-master proofs и компьютерный caption clearance.", timeout=300)
@@ -1109,6 +1165,55 @@ def _clearance_plan_digest(plan: dict[str, object]) -> str:
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def _composition_checkpoint_signature(root: Path) -> str | None:
+    """Return only durable composition progress, never a timestamp.
+
+    The controller's progress files may be rewritten while a worker reports a
+    failure.  ``updated_at`` alone is not progress: the completed LOOK IDs and
+    the signed plan identities must change before another native batch is
+    allowed.
+    """
+    snapshots: list[dict[str, object]] = []
+    progress_root = root / "control" / "progress"
+    for name in ("composition.json", "composition-delta.json"):
+        path = progress_root / name
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        completed_looks = payload.get("completed_looks")
+        if not isinstance(completed_looks, list):
+            items = payload.get("items")
+            completed_looks = [
+                item.get("look_id")
+                for item in items
+                if isinstance(item, dict) and isinstance(item.get("look_id"), str)
+            ] if isinstance(items, list) else []
+        snapshots.append(
+            {
+                "file": name,
+                "gate": payload.get("gate"),
+                "nonce": payload.get("nonce"),
+                "completed_count": payload.get("completed_count", len(completed_looks)),
+                "completed_looks": sorted(str(value) for value in completed_looks),
+                "composition_plan": payload.get("composition_plan_sha256"),
+                "correction_plan": payload.get("clearance_correction_plan_sha256"),
+                "baseline": payload.get("baseline_composition_sha256"),
+            }
+        )
+    if not snapshots:
+        return None
+    return json.dumps(snapshots, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _normalise_observation_error(value: str) -> str:
+    """Make repeated worker failures comparable without timestamps/whitespace."""
+    compact = " ".join(str(value).split())
+    return re.sub(r"\b\d{4}-\d{2}-\d{2}[T ][0-9:.+-]+\b", "<time>", compact)
 
 
 def _look_ids_in_text(value: str) -> list[str]:

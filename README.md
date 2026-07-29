@@ -1,5 +1,10 @@
 # LOOKBOOKBOT for Windows
 
+## Version 0.2.25
+
+- Visual model retries, visual-layout corrections, native four-look batches and caption repair now continue only while a signed plan or durable checkpoint changes. Fixed attempt ceilings no longer stop a valid long-running release.
+- A repeated identical model/COM failure now stops with a precise diagnostic instead of consuming a counter or endlessly repeating the same InDesign action.
+
 ## Version 0.2.24
 
 - Credit-proof notes now recognise concrete visual cues in Russian and English, including explicit labels such as `garment=...; bag=...`.

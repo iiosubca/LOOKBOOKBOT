@@ -154,14 +154,16 @@ def test_targeted_rematch_restores_every_unmarked_map_row(tmp_path: Path, monkey
     engine = PipelineEngine(store)
     monkeypatch.setattr(engine.controller, "script", lambda *_args, **_kwargs: None)
 
-    def simulated_agent(_project, _provider, _stage: str) -> None:
+    def simulated_agent(*_args, **_kwargs) -> str:
         changed = _read_tsv(map_path)
         changed[0].update({"excel_sheet": "M", "excel_look_number": "9", "excel_image": "nine.jpg", "visual_status": "CONFIRMED"})
         changed[1].update({"excel_sheet": "M", "excel_look_number": "8", "excel_image": "eight.jpg", "visual_status": "CONFIRMED"})
         _write_tsv(map_path, changed)
+        return "confirmed"
 
-    monkeypatch.setattr(engine, "_delegate_codex", simulated_agent)
-    result = engine._targeted_credit_rematch(project, CodexProvider(), ["LOOK_001"])
+    provider = CodexProvider()
+    monkeypatch.setattr(provider, "run_agent", simulated_agent)
+    result = engine._targeted_credit_rematch(project, provider, ["LOOK_001"])
     after = {row["look_id"]: row for row in _read_tsv(map_path)}
 
     assert "LOOK_001" in result

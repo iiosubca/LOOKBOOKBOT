@@ -6,7 +6,7 @@ from pathlib import Path
 
 from lookbookbot.domain import ProviderKind
 from lookbookbot.pipeline import PipelineEngine, _path_batches
-from lookbookbot.providers import CodexProvider, VisionDecision
+from lookbookbot.providers import CodexProvider, ProviderError, VisionDecision
 from lookbookbot.state import StateStore
 
 
@@ -93,10 +93,11 @@ def test_parallel_codex_visual_retries_only_unconfirmed_proof(tmp_path: Path, mo
 
     def fake_confirm(_provider, _root: Path, batch: list[Path]):
         attempts.append(batch[0].stem)
-        accepted = len(attempts) == 2
+        if len(attempts) == 1:
+            raise ProviderError("temporary visual worker outage")
         return {
             "LOOK_041": VisionDecision(
-                accepted=accepted,
+                accepted=True,
                 note="Кадры корректны, кредиты читаемы и остаются в безопасной зоне страницы.",
             )
         }
@@ -184,7 +185,7 @@ def test_visual_rejection_starts_a_controller_repair_and_rechecks(tmp_path: Path
     def fake_confirm(_provider, _root: Path, _batch: list[Path]):
         nonlocal attempts
         attempts += 1
-        accepted = attempts > 3
+        accepted = attempts > 4
         return {
             "LOOK_041": VisionDecision(
                 accepted=accepted,
@@ -192,9 +193,9 @@ def test_visual_rejection_starts_a_controller_repair_and_rechecks(tmp_path: Path
             )
         }
 
-    def fake_repair(_root: Path, rejected: dict[str, VisionDecision]) -> bool:
+    def fake_repair(_root: Path, rejected: dict[str, VisionDecision]) -> str:
         repairs.append(sorted(rejected))
-        return True
+        return f"new-plan-{len(repairs)}"
 
     def fake_gate(action: str, _root: Path, *args: str, **_kwargs) -> None:
         records.append(action)
@@ -208,6 +209,6 @@ def test_visual_rejection_starts_a_controller_repair_and_rechecks(tmp_path: Path
 
     engine._run_parallel_codex_visual(project, CodexProvider())
 
-    assert attempts == 4
-    assert repairs == [["LOOK_041"]]
+    assert attempts == 5
+    assert repairs == [["LOOK_041"]] * 4
     assert records == ["confirm-visual-look", "record-visual"]

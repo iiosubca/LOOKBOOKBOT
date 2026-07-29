@@ -41,6 +41,45 @@ def evidence_passed(project: Path, gate: str) -> bool:
     return read_json(project / "control" / "evidence" / f"{gate}.json").get("passed") is True
 
 
+def _gate_checkpoint_signature(project: Path, gate: str) -> str | None:
+    """Return meaningful native progress for a resumable gate.
+
+    A fresh timestamp is not a reason to run another InDesign transaction. The
+    checkpoint must name a different completed LOOK set or count.
+    """
+    payload = read_json(project / "control" / "progress" / f"{gate}.json")
+    if not payload:
+        return None
+    completed = payload.get("completed_looks")
+    if not isinstance(completed, list):
+        completed = []
+    return json.dumps(
+        {
+            "gate": payload.get("gate"),
+            "nonce": payload.get("nonce"),
+            "completed_count": payload.get("completed_count"),
+            "completed_looks": sorted(str(value) for value in completed),
+            "look_count": payload.get("look_count"),
+            "master": payload.get("master"),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _artifact_signature(path: Path) -> tuple[int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return stat.st_size, stat.st_mtime_ns
+
+
+def _stable_failure_text(value: str) -> str:
+    return " ".join(str(value).split())
+
+
 def final_outputs_passed(project: Path) -> bool:
     manifest = read_json(project / "control" / "final-deliverables.json")
     status = str(manifest.get("status", "")).casefold()
@@ -108,14 +147,15 @@ class LookbookController:
         return self.gate("status", project, timeout=120, check=False).text
 
     def export_review_pdf(self, project: Path, pdf: str) -> None:
-        """Export a review PDF with one safe retry for a lost InDesign COM client.
+        """Export a review PDF while each COM recovery changes saved state.
 
         A release/export COM dropout leaves the saved master untouched.  A
         fresh permit also quarantines a partial PDF, so retrying from this
         boundary is both idempotent and safer than asking the operator to
         press Continue.
         """
-        for attempt in range(2):
+        seen_failures: set[tuple[tuple[int, int] | None, str]] = set()
+        while True:
             self._wait_for_master(project)
             permit = self.gate("pre-export", project, "--pdf", pdf, "--quarantine-existing", timeout=180, check=False)
             if permit.returncode:
@@ -124,7 +164,17 @@ class LookbookController:
             if not exported.returncode:
                 self._wait_for_master(project)
                 return
-            if attempt == 0 and self._is_com_disconnect(project, exported.text):
+            if self._is_com_disconnect(project, exported.text):
+                failure_state = (
+                    _artifact_signature(project / pdf),
+                    _stable_failure_text(exported.text),
+                )
+                if failure_state in seen_failures:
+                    raise CommandError(
+                        "InDesign повторил тот же сбой экспорта без нового PDF-checkpoint; "
+                        "автоматический перезапуск остановлен, чтобы не перезаписывать выпуск."
+                    )
+                seen_failures.add(failure_state)
                 if self._restart_controlled_indesign(project):
                     self.runner.log(
                         "InDesign потерял COM-соединение при экспорте review-PDF; "
@@ -133,22 +183,19 @@ class LookbookController:
                     self._wait_for_indesign_ready()
                     continue
             raise CommandError(exported.text)
-        raise CommandError("Не удалось безопасно восстановить экспорт review-PDF.")
 
-    def apply_native_gate(self, project: Path, gate: str, *, max_batches: int = 100) -> None:
+    def apply_native_gate(self, project: Path, gate: str) -> None:
         if evidence_passed(project, gate):
             return
         arm = self.gate("arm", project, "--gate", gate, timeout=120, check=False)
         if arm.returncode and not any(word in arm.text.casefold() for word in ("armed", "progress", "nonce", "already")):
             raise CommandError(arm.text)
-        # Release is a read-only audit and remains bound to the saved arm. An
-        # RPC disconnect has no layout side effect, so two cold recoveries are
-        # safe without re-arming, skipping, or changing the master.
-        max_com_recoveries = 2 if gate == "release" else 1
-        com_recoveries = 0
-        for _ in range(max_batches):
+        seen_checkpoints: set[str] = set()
+        seen_com_failures: set[tuple[str | None, str]] = set()
+        while True:
             if evidence_passed(project, gate):
                 return
+            checkpoint_before = _gate_checkpoint_signature(project, gate)
             self._wait_for_master(project)
             result = self.gate("apply", project, "--gate", gate, timeout=1800, check=False)
             self._wait_for_master(project)
@@ -156,17 +203,17 @@ class LookbookController:
                 return
             if result.returncode:
                 if self._is_com_disconnect(project, result.text):
-                    if com_recoveries >= max_com_recoveries:
+                    failure_state = (checkpoint_before, _stable_failure_text(result.text))
+                    if failure_state in seen_com_failures:
                         raise CommandError(
-                            f"InDesign повторно потерял COM-связь на этапе {gate} после "
-                            f"{com_recoveries} безопасных восстановлений. Документ не изменён; "
-                            "автоматическое восстановление остановлено из-за лимита безопасности."
+                            f"InDesign повторил тот же COM-сбой на этапе {gate} без нового checkpoint. "
+                            "Документ не изменён; повтор не даст нового безопасного действия."
                         )
-                    com_recoveries += 1
+                    seen_com_failures.add(failure_state)
                     if gate == "release":
                         self.runner.log(
                             "InDesign потерял COM-соединение на release; безопасно перезапускаю "
-                            f"документ-free экземпляр и повторяю тот же arm ({com_recoveries}/{max_com_recoveries})."
+                            "документ-free экземпляр и повторяю тот же arm из сохранённой точки."
                         )
                         if not self._restart_controlled_indesign(project):
                             raise CommandError(
@@ -177,7 +224,7 @@ class LookbookController:
                     else:
                         self.runner.log(
                             f"InDesign потерял COM-соединение на этапе {gate}; повторяю тот же arm "
-                            f"из сохранённой точки ({com_recoveries}/{max_com_recoveries})."
+                            "из сохранённой точки."
                         )
                         # Other native gates may have durable checkpoints that
                         # the underlying controller can resume itself.  Do not
@@ -190,7 +237,16 @@ class LookbookController:
                     raise CommandError(result.text)
             if "CHECKPOINT" not in result.text.upper() and "PASS" not in result.text.upper():
                 raise CommandError(f"Контроллер не зафиксировал checkpoint для {gate}: {result.text}")
-        raise CommandError(f"Превышено число безопасных пакетов этапа {gate}.")
+            checkpoint_after = _gate_checkpoint_signature(project, gate)
+            if checkpoint_after is None:
+                raise CommandError(
+                    f"Контроллер сообщил checkpoint для {gate}, но не сохранил его состояние."
+                )
+            if checkpoint_after == checkpoint_before or checkpoint_after in seen_checkpoints:
+                raise CommandError(
+                    f"Этап {gate} повторил checkpoint без нового сохранённого прогресса."
+                )
+            seen_checkpoints.add(checkpoint_after)
 
     @staticmethod
     def _wait_for_master(project: Path, timeout: int = 900) -> None:

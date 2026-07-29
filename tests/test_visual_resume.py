@@ -114,3 +114,37 @@ def test_clearance_recovery_stops_before_reapplying_identical_plan(tmp_path: Pat
         engine._prepare_visual_proof(SimpleNamespace(project_dir=root))
 
     assert calls == {"apply": 2, "plan": 2}
+
+
+def test_composition_resume_has_no_fixed_batch_ceiling(tmp_path: Path, monkeypatch) -> None:
+    engine = PipelineEngine(StateStore(tmp_path / "state.db"))
+    root = tmp_path / "project"
+    calls = 0
+
+    def gate(action: str, *_args, **_kwargs):
+        nonlocal calls
+        assert action == "apply-composition"
+        calls += 1
+        if calls > 101:
+            return SimpleNamespace(returncode=0, text="PASS composition")
+        progress = root / "control" / "progress" / "composition.json"
+        progress.parent.mkdir(parents=True, exist_ok=True)
+        progress.write_text(
+            json.dumps(
+                {
+                    "gate": "visual-composition",
+                    "nonce": "test",
+                    "completed_count": calls,
+                    "items": [{"look_id": f"LOOK_{calls:03}"}],
+                    "composition_plan_sha256": "plan",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return SimpleNamespace(returncode=0, text=f"CHECKPOINT composition: {calls}")
+
+    monkeypatch.setattr(engine.controller, "gate", gate)
+
+    engine._apply_composition_until_saved(root)
+
+    assert calls == 102
