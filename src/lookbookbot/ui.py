@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import hashlib
 from datetime import date
 from pathlib import Path
 
@@ -37,6 +38,16 @@ from PySide6.QtWidgets import (
 )
 
 from .config import ToolPaths
+from .caption_editor import (
+    CaptionEditorError,
+    format_caption_editor,
+    parse_caption_editor,
+    products_for_look,
+    read_caption_rows,
+    replace_look_products,
+    write_caption_audit,
+    write_caption_rows,
+)
 from .controller import read_json
 from .discovery import discover_sources, infer_output_root
 from .domain import ProviderKind, STAGES, StageStatus, project_code
@@ -81,12 +92,23 @@ class PipelineWorker(QObject):
     finished = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, store: StateStore, project_id: str, start_key: str | None, continue_after: bool) -> None:
+    def __init__(
+        self,
+        store: StateStore,
+        project_id: str,
+        start_key: str | None,
+        continue_after: bool,
+        *,
+        stop_after: str | None = None,
+        caption_revision_audit: str | None = None,
+    ) -> None:
         super().__init__()
         self.store = store
         self.project_id = project_id
         self.start_key = start_key
         self.continue_after = continue_after
+        self.stop_after = stop_after
+        self.caption_revision_audit = caption_revision_audit
 
     def run(self) -> None:
         try:
@@ -96,7 +118,13 @@ class PipelineWorker(QObject):
                 log=self.log.emit,
                 progress=lambda key, status, message: self.stage.emit(key, status.value, message),
             )
-            result = engine.run(project, self.start_key, continue_after=self.continue_after)
+            if self.caption_revision_audit:
+                engine.begin_caption_revision(project, Path(self.caption_revision_audit))
+                result = engine.run(project, "captions", continue_after=True, stop_after="review")
+            else:
+                result = engine.run(
+                    project, self.start_key, continue_after=self.continue_after, stop_after=self.stop_after,
+                )
         except Exception as error:
             self.failed.emit(str(error))
         else:
@@ -141,6 +169,10 @@ class MainWindow(QMainWindow):
         self.worker: PipelineWorker | None = None
         self.stage_items: dict[str, QListWidgetItem] = {}
         self._loading_credits = False
+        self._correction_rows: list[dict[str, str]] = []
+        self._correction_look_id = ""
+        self._correction_dirty = False
+        self._loading_corrections = False
         self.visual_progress_timer = QTimer(self)
         self.visual_progress_timer.setInterval(750)
         self.visual_progress_timer.timeout.connect(self._refresh_visual_progress)
@@ -326,6 +358,7 @@ class MainWindow(QMainWindow):
         self.looks_tab = self.tabs.addTab(self._build_looks(), "СПИСОК ЛУКОВ")
         self.credits_tab = self.tabs.addTab(self._build_credits(), "СПИСОК КРЕДИТОВ")
         self.visual_tab = self.tabs.addTab(self._build_visual_audit(), "ВИЗУАЛЬНАЯ ПРОВЕРКА")
+        self.corrections_tab = self.tabs.addTab(self._build_corrections(), "ПРАВКИ")
         self.log_tab = self.tabs.addTab(self._build_log(), "ЖУРНАЛ")
         splitter.addWidget(self.tabs)
         splitter.setStretchFactor(1, 1)
@@ -452,6 +485,60 @@ class MainWindow(QMainWindow):
         layout.addWidget(content, 1)
         return page
 
+    def _build_corrections(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(18, 18, 18, 18)
+        hint = QLabel(
+            "После проверки PDF исправьте только нужный лук. Один товар — четыре строки: тип, бренд, цена, артикул. "
+            "При выпуске новой версии InDesign сам применит подготовленный стиль CREDiTs, интервалы и начертания."
+        )
+        hint.setObjectName("Muted")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        content = QSplitter(Qt.Orientation.Horizontal)
+        self.correction_look_list = QListWidget()
+        self.correction_look_list.setMinimumWidth(170)
+        self.correction_look_list.currentItemChanged.connect(self._correction_look_changed)
+        content.addWidget(self.correction_look_list)
+
+        photos = QWidget()
+        photos_layout = QVBoxLayout(photos)
+        photos_layout.setContentsMargins(0, 0, 0, 0)
+        self.correction_left_preview = ImagePreview("ПОЛНЫЙ РОСТ")
+        self.correction_right_preview = ImagePreview("КЛОУЗАП")
+        self.correction_left_preview.setMinimumSize(260, 290)
+        self.correction_right_preview.setMinimumSize(260, 290)
+        photos_layout.addWidget(self.correction_left_preview, 1)
+        photos_layout.addWidget(self.correction_right_preview, 1)
+        content.addWidget(photos)
+
+        editor_box = QWidget()
+        editor_layout = QVBoxLayout(editor_box)
+        editor_layout.setContentsMargins(0, 0, 0, 0)
+        self.correction_title = QLabel("ВЫБЕРИТЕ ЛУК")
+        self.correction_title.setObjectName("SidebarTitle")
+        self.correction_editor = QTextEdit()
+        self.correction_editor.setPlaceholderText("Тип\nБренд\nЦена\nАртикул\n\nСледующий товар…")
+        self.correction_editor.textChanged.connect(self._correction_text_changed)
+        editor_layout.addWidget(self.correction_title)
+        editor_layout.addWidget(self.correction_editor, 1)
+        buttons = QHBoxLayout()
+        self.save_correction_button = QPushButton("СОХРАНИТЬ ПРАВКИ")
+        self.save_correction_button.clicked.connect(self._save_caption_correction)
+        self.export_correction_button = QPushButton("СОХРАНИТЬ И НАПИСАТЬ PDF НА ПРОВЕРКУ")
+        self.export_correction_button.setObjectName("Primary")
+        self.export_correction_button.clicked.connect(self._save_and_export_caption_corrections)
+        buttons.addWidget(self.save_correction_button)
+        buttons.addWidget(self.export_correction_button)
+        editor_layout.addLayout(buttons)
+        content.addWidget(editor_box)
+        content.setStretchFactor(0, 1)
+        content.setStretchFactor(1, 2)
+        content.setStretchFactor(2, 2)
+        layout.addWidget(content, 1)
+        return page
+
     def _build_log(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -567,6 +654,7 @@ class MainWindow(QMainWindow):
         self._load_looks()
         self._load_credits()
         self._load_visual_audit()
+        self._load_corrections()
         self._load_runs()
         self._refresh_google_quota()
 
@@ -696,13 +784,25 @@ class MainWindow(QMainWindow):
             self._refresh_stages()
         self._start_pipeline(start_key, not self.run_one.isChecked())
 
-    def _start_pipeline(self, start_key: str | None, continue_after: bool) -> None:
+    def _start_pipeline(
+        self,
+        start_key: str | None,
+        continue_after: bool,
+        *,
+        caption_revision_audit: str | None = None,
+    ) -> None:
         if self.project is None:
             return
         self.run_button.setEnabled(False)
         self.run_button.setText("ВЫПОЛНЯЕТСЯ…")
+        if hasattr(self, "save_correction_button"):
+            self.save_correction_button.setEnabled(False)
+            self.export_correction_button.setEnabled(False)
         self.worker_thread = QThread(self)
-        self.worker = PipelineWorker(self.store, self.project.id, start_key, continue_after)
+        self.worker = PipelineWorker(
+            self.store, self.project.id, start_key, continue_after,
+            caption_revision_audit=caption_revision_audit,
+        )
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.run)
         self.worker.log.connect(self._append_log)
@@ -755,6 +855,9 @@ class MainWindow(QMainWindow):
         self._refresh_final_export_progress()
         self.run_button.setEnabled(True)
         self.run_button.setText("▶  ПУСК")
+        if hasattr(self, "save_correction_button"):
+            self.save_correction_button.setEnabled(True)
+            self.export_correction_button.setEnabled(True)
         self._load_project()
 
     def _begin_visual_progress(self) -> None:
@@ -1078,6 +1181,152 @@ class MainWindow(QMainWindow):
             return
         evidence = self.credits_table.item(self.credits_table.currentRow(), 6).text()
         self.credit_preview.set_image(self.project.project_dir / evidence if evidence else None)
+
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def _caption_draft_path(self) -> Path | None:
+        if not self.project:
+            return None
+        return self.project.project_dir / "control" / "work" / "manual-caption-revisions" / "draft.json"
+
+    def _load_corrections(self) -> None:
+        if not hasattr(self, "correction_look_list"):
+            return
+        previous = self._correction_look_id
+        self._loading_corrections = True
+        try:
+            self.correction_look_list.clear()
+            self._correction_rows = []
+            self._correction_look_id = ""
+            if not self.project:
+                self.correction_editor.clear()
+                self.correction_left_preview.set_image(None)
+                self.correction_right_preview.set_image(None)
+                return
+            try:
+                self._correction_rows = read_caption_rows(self.project.project_dir / "control" / "work" / "caption-data.tsv")
+            except CaptionEditorError:
+                self.correction_editor.clear()
+                self.correction_title.setText("ПРАВКИ ДОСТУПНЫ ПОСЛЕ PDF НА ПРОВЕРКУ")
+                self.correction_left_preview.set_image(None)
+                self.correction_right_preview.set_image(None)
+                return
+            current = previous
+            for row in self.store.looks(self.project.id):
+                look_id = str(row["look_id"])
+                item = QListWidgetItem(look_id)
+                item.setData(Qt.ItemDataRole.UserRole, look_id)
+                self.correction_look_list.addItem(item)
+                if not current:
+                    current = look_id
+            for index in range(self.correction_look_list.count()):
+                item = self.correction_look_list.item(index)
+                if item.data(Qt.ItemDataRole.UserRole) == current:
+                    self.correction_look_list.setCurrentItem(item)
+                    break
+        finally:
+            self._loading_corrections = False
+        if self.correction_look_list.currentItem() is not None:
+            self._load_correction_look(self.correction_look_list.currentItem())
+
+    def _correction_look_changed(self, current: QListWidgetItem | None, previous: QListWidgetItem | None) -> None:
+        if self._loading_corrections or current is None:
+            return
+        if self._correction_dirty and previous is not None:
+            answer = QMessageBox.question(
+                self,
+                "Сохранить правки?",
+                "В текущем луке есть несохранённые изменения кредитов.",
+                QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Save,
+            )
+            if answer == QMessageBox.StandardButton.Save:
+                if self._save_caption_correction() is None:
+                    self._restore_correction_selection(previous)
+                    return
+            elif answer == QMessageBox.StandardButton.Cancel:
+                self._restore_correction_selection(previous)
+                return
+        self._load_correction_look(current)
+
+    def _restore_correction_selection(self, item: QListWidgetItem) -> None:
+        self._loading_corrections = True
+        try:
+            self.correction_look_list.setCurrentItem(item)
+        finally:
+            self._loading_corrections = False
+
+    def _load_correction_look(self, item: QListWidgetItem) -> None:
+        if not self.project:
+            return
+        look_id = str(item.data(Qt.ItemDataRole.UserRole) or "")
+        look = next((row for row in self.store.looks(self.project.id) if row["look_id"] == look_id), None)
+        self._correction_look_id = look_id
+        self._loading_corrections = True
+        try:
+            self.correction_title.setText(f"КРЕДИТЫ {look_id}")
+            self.correction_editor.setPlainText(format_caption_editor(products_for_look(self._correction_rows, look_id)))
+        finally:
+            self._loading_corrections = False
+        self._correction_dirty = False
+        hires = self.project.project_dir / "control" / "work" / "_mat" / "hires"
+        self.correction_left_preview.set_image(hires / str(look.get("left_filename", "")) if look else None)
+        self.correction_right_preview.set_image(hires / str(look.get("right_filename", "")) if look else None)
+
+    def _correction_text_changed(self) -> None:
+        if not self._loading_corrections and self._correction_look_id:
+            self._correction_dirty = True
+
+    def _save_caption_correction(self) -> Path | None:
+        if not self.project or not self._correction_look_id:
+            return None
+        if self.worker_thread and self.worker_thread.isRunning():
+            QMessageBox.information(self, "Выполняется выпуск", "Дождитесь завершения текущей операции перед сохранением правок.")
+            return None
+        draft = self._caption_draft_path()
+        if not self._correction_dirty:
+            return draft if draft and draft.is_file() else None
+        caption_path = self.project.project_dir / "control" / "work" / "caption-data.tsv"
+        try:
+            products = parse_caption_editor(self.correction_editor.toPlainText())
+            before = products_for_look(self._correction_rows, self._correction_look_id)
+            before_sha = self._file_sha256(caption_path)
+            replacement = replace_look_products(self._correction_rows, self._correction_look_id, products)
+            write_caption_rows(caption_path, replacement)
+            after_sha = self._file_sha256(caption_path)
+            draft = write_caption_audit(
+                self.project.project_dir,
+                self._correction_look_id,
+                before,
+                products,
+                before_caption_data_sha256=before_sha,
+                after_caption_data_sha256=after_sha,
+            )
+        except (CaptionEditorError, OSError) as error:
+            QMessageBox.warning(self, "Не удалось сохранить правки", str(error))
+            return None
+        self._correction_rows = replacement
+        self._correction_dirty = False
+        self.store.set_approved(self.project.id, False)
+        self.approved.blockSignals(True)
+        self.approved.setChecked(False)
+        self.approved.blockSignals(False)
+        self._append_log(f"Сохранены правки кредитов: {self._correction_look_id}. Черновик новой ревизии: {draft.relative_to(self.project.project_dir)}")
+        return draft
+
+    def _save_and_export_caption_corrections(self) -> None:
+        audit = self._save_caption_correction()
+        if audit is None:
+            QMessageBox.information(
+                self,
+                "Нет правок для выпуска",
+                "Измените кредиты и сохраните их. Затем программа создаст новую версию InDesign и PDF на проверку.",
+            )
+            return
+        self._append_log("Создаётся новая ревизия InDesign из сохранённых правок кредитов…")
+        self._start_pipeline(None, True, caption_revision_audit=str(audit))
 
     def _load_visual_audit(self) -> None:
         rows = load_visual_audit(self.project.project_dir) if self.project else []

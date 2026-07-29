@@ -282,6 +282,10 @@ def load_evidence(project: Path, state: dict[str, Any], gate: str) -> dict[str, 
         try:
             manifest = validate_reference_order(project, state)
             expected_confirmation_fingerprint = reference_order_confirmation_fingerprint(project, state)
+            manual = manual_caption_revision_audit(project, state)
+            if manual is not None:
+                audit, _payload = manual
+                validate_manual_caption_revision_inputs(project, state)
         except (GateError, OSError):
             return None
         if evidence.get("reference_order_manifest_sha256") != digest(reference_order_manifest_path(project)):
@@ -289,6 +293,8 @@ def load_evidence(project: Path, state: dict[str, Any], gate: str) -> dict[str, 
         if evidence.get("reference_order_confirmation_fingerprint") != expected_confirmation_fingerprint:
             return None
         if manifest.get("registry_sha256") != digest(state_artifact(project, state, "registry")):
+            return None
+        if manual is not None and evidence.get("manual_caption_revision_sha256") != digest(audit):
             return None
         return evidence if all(evidence.get(key) == digest(artifact) for key, artifact in required.items()) else None
     arm = arm_file(project, gate)
@@ -665,6 +671,83 @@ def validate_verified_caption_inputs(project: Path, state: dict[str, Any], regis
         fail("Caption provenance does not match the current map, workbook, and caption data.")
     if provenance.get("look_count") != int(state["look_count"]) or provenance.get("caption_rows") != len(actual):
         fail("Caption provenance has an unexpected look or product-row count.")
+    return len(actual)
+
+
+def manual_caption_revision_audit(project: Path, state: dict[str, Any]) -> tuple[Path, dict[str, Any]] | None:
+    """Return the immutable human-caption correction manifest for this master.
+
+    A review correction is allowed to change the product list without
+    falsifying the original Excel mapping.  The edited TSV is therefore bound
+    to a revision-specific audit kept in controlled history, rather than being
+    mistaken for a new Excel-derived caption map.
+    """
+    raw = str(state.get("manual_caption_revision", "")).strip()
+    if not raw:
+        return None
+    audit = child_of(project, raw)
+    payload = read_json(audit)
+    if payload.get("schema") != "lookbookbot-caption-revision-v1":
+        fail("Manual caption revision audit has an unsupported schema.")
+    captions = state_artifact(project, state, "captions")
+    if payload.get("after_caption_data_sha256") != digest(captions):
+        fail("Manual caption revision audit does not match the current caption-data.tsv.")
+    changes = payload.get("changes")
+    look_ids = payload.get("look_ids")
+    if not isinstance(changes, list) or not changes or not isinstance(look_ids, list):
+        fail("Manual caption revision audit must contain at least one edited LOOK.")
+    changed_ids = [str(item.get("look_id", "")).strip().upper() for item in changes if isinstance(item, dict)]
+    if not all(re.fullmatch(r"LOOK_\d{3}", look_id or "") for look_id in changed_ids):
+        fail("Manual caption revision audit has an invalid LOOK ID.")
+    if len(set(changed_ids)) != len(changed_ids) or sorted(changed_ids) != sorted(str(value).strip().upper() for value in look_ids):
+        fail("Manual caption revision audit has a duplicated or incomplete LOOK list.")
+    return audit, payload
+
+
+def validate_manual_caption_revision_inputs(project: Path, state: dict[str, Any], registry: list[dict[str, str]] | None = None) -> int:
+    """Validate human-approved caption edits while preserving untouched Excel rows."""
+    revision = manual_caption_revision_audit(project, state)
+    if revision is None:
+        return validate_verified_caption_inputs(project, state, registry)
+    _audit, payload = revision
+    registry_rows = registry or validate_registry(
+        state_artifact(project, state, "registry"), int(state["look_count"]), state_artifact(project, state, "hires")
+    )
+    mapping = validate_caption_map(
+        project, state_artifact(project, state, "caption_map"), registry_rows,
+        state_artifact(project, state, "hires"), int(state["look_count"]),
+    )
+    expected = workbook_caption_rows(state_artifact(project, state, "caption_workbook"), mapping)
+    actual = csv_rows(state_artifact(project, state, "captions"), CAPTION_FIELDS)
+    validate_captions(state_artifact(project, state, "captions"), int(state["look_count"]))
+    expected_by_look: dict[str, list[dict[str, str]]] = {}
+    actual_by_look: dict[str, list[dict[str, str]]] = {}
+    for row in expected:
+        expected_by_look.setdefault(row["look_id"], []).append(row)
+    for row in actual:
+        actual_by_look.setdefault(row["look_id"], []).append(row)
+    changed = {str(item["look_id"]).strip().upper(): item for item in payload["changes"] if isinstance(item, dict)}
+    if set(actual_by_look) != set(expected_by_look):
+        fail("Manual caption revision changed the required LOOK set.")
+    for look_id, expected_rows in expected_by_look.items():
+        current_rows = actual_by_look.get(look_id, [])
+        if look_id not in changed:
+            if current_rows != expected_rows:
+                fail(f"{look_id}: caption data changed without a recorded manual correction.")
+            continue
+        audit_rows = changed[look_id].get("after")
+        if not isinstance(audit_rows, list) or not audit_rows:
+            fail(f"{look_id}: manual caption revision has no replacement product rows.")
+        normalized: list[dict[str, str]] = []
+        for product in audit_rows:
+            if not isinstance(product, dict):
+                fail(f"{look_id}: manual caption revision contains an invalid product.")
+            values = {field: str(product.get(field, "")).strip() for field in CAPTION_FIELDS[1:]}
+            if any(not value for value in values.values()):
+                fail(f"{look_id}: every manual credit field must be filled.")
+            normalized.append({"look_id": look_id, **values})
+        if current_rows != normalized:
+            fail(f"{look_id}: caption-data.tsv differs from the signed manual correction.")
     return len(actual)
 
 
@@ -1855,7 +1938,7 @@ def command_arm(args: argparse.Namespace) -> None:
     if not master.exists():
         fail("Master is missing.")
     if gate in {"captions", "release"}:
-        validate_verified_caption_inputs(project, state)
+        validate_manual_caption_revision_inputs(project, state)
     clear_for_new_arm(project, gate)
     arm = {
         "schema": SCHEMA, "session_id": state["session_id"], "gate": gate,
@@ -3454,8 +3537,9 @@ def command_confirm(args: argparse.Namespace) -> None:
     if evidence is None:
         fail(f"No current PASS evidence for {gate}. Run its audit against the saved current master.")
     if gate == "captions":
-        count = validate_verified_caption_inputs(project, state)
-        print(f"PASS captions: evidence accepted; source contains {count} workbook-derived product rows.")
+        count = validate_manual_caption_revision_inputs(project, state)
+        source = "human-approved revision" if state.get("manual_caption_revision") else "workbook-derived"
+        print(f"PASS captions: evidence accepted; source contains {count} {source} product rows.")
     else:
         print(f"PASS {gate}: evidence accepted.")
 
@@ -4002,13 +4086,19 @@ def revision_target(source: Path) -> tuple[int, Path]:
     return revision, target
 
 
-def archive_for_revision(project: Path, revision: int) -> Path:
+def archive_for_revision(project: Path, revision: int, reset_from: str = "visual") -> Path:
     control = control_path(project)
     archive = control / "history" / f"revision-{revision:02}-{utc_now().replace(':', '-') }"
-    for relative in (
+    relative_paths = [
         "visual", "evidence/visual.json", "evidence/release.json", "evidence/pdf.json",
         "arms/visual.json", "arms/release.json", "arms/pdf.json", "progress/composition.json", "export-permit.json",
-    ):
+    ]
+    if reset_from == "captions":
+        relative_paths.extend((
+            "evidence/captions.json", "evidence/caption-geometry.json", "arms/captions.json",
+            "progress/captions.json", "progress/caption-repair.json",
+        ))
+    for relative in relative_paths:
         source = control / relative
         if not source.exists():
             continue
@@ -4019,10 +4109,66 @@ def archive_for_revision(project: Path, revision: int) -> Path:
     return archive
 
 
+def _validate_caption_revision_preconditions(project: Path, state: dict[str, Any], audit: Path) -> dict[str, Any]:
+    """Verify that a draft only changes captions after a complete review."""
+    prior_map = read_json(evidence_file(project, "map"))
+    if (
+        prior_map.get("schema") != SCHEMA or prior_map.get("session_id") != state["session_id"]
+        or prior_map.get("gate") != "map" or prior_map.get("passed") is not True
+    ):
+        fail("A caption revision requires the accepted map evidence from the reviewed release.")
+    for key, artifact_key in (
+        ("registry_sha256", "registry"), ("reference_pdf_sha256", "reference_pdf"),
+        ("caption_map_sha256", "caption_map"), ("caption_workbook_sha256", "caption_workbook"),
+        ("caption_provenance_sha256", "caption_provenance"),
+    ):
+        if prior_map.get(key) != digest(state_artifact(project, state, artifact_key)):
+            fail("A caption revision cannot proceed because the reviewed source map has changed.")
+    payload = read_json(audit)
+    captions = state_artifact(project, state, "captions")
+    if payload.get("before_caption_data_sha256") != prior_map.get("caption_data_sha256"):
+        fail("Manual caption revision does not start from the reviewed caption source.")
+    if payload.get("after_caption_data_sha256") != digest(captions):
+        fail("Manual caption revision audit does not match the saved caption-data.tsv.")
+    # Temporarily bind the draft to the current state so the same strict
+    # validator used later by the native captions gate can inspect it.
+    state["manual_caption_revision"] = str(audit.relative_to(project))
+    try:
+        validate_manual_caption_revision_inputs(project, state)
+    finally:
+        state.pop("manual_caption_revision", None)
+    # Caption-data has deliberately changed, so normal visual/release/PDF
+    # validators would (correctly) see the old proof as stale.  Here we are
+    # proving the *reviewed baseline* before copying it: require its immutable
+    # session-bound records and unchanged old master identity, then archive
+    # them before native CREDiTs formatting begins on the new INDD.
+    master = state_artifact(project, state, "master")
+    for gate in ("visual", "release", "pdf"):
+        evidence = read_json(evidence_file(project, gate))
+        if (
+            evidence.get("schema") != SCHEMA or evidence.get("session_id") != state["session_id"]
+            or evidence.get("gate") != gate or evidence.get("passed") is not True
+            or not isinstance(evidence.get("master"), dict) or not same_identity(evidence["master"], identity(master))
+        ):
+            fail(f"A caption revision requires a complete reviewed release; {gate} proof is absent or from another master.")
+    return prior_map
+
+
 def command_begin_revision(args: argparse.Namespace) -> None:
     project = project_path(args.project)
     state = load_state(project)
-    if current_gate(project, state) is not None:
+    reset_from = str(getattr(args, "reset_from", "visual")).strip().lower()
+    if reset_from not in {"visual", "captions"}:
+        fail("Revision reset must begin from visual or captions.")
+    caption_audit: Path | None = None
+    prior_map: dict[str, Any] | None = None
+    if reset_from == "captions":
+        raw_audit = str(getattr(args, "caption_audit", "")).strip()
+        if not raw_audit:
+            fail("A captions revision requires --caption-audit from LOOKBOOKBOT corrections.")
+        caption_audit = child_of(project, raw_audit)
+        prior_map = _validate_caption_revision_preconditions(project, state, caption_audit)
+    elif current_gate(project, state) is not None:
         fail("A revision can begin only after the current review PDF has passed every gate and complete has been run.")
     if final_deliverables_file(project).exists():
         fail("This version is already approved and published. Start a new requested lookbook revision instead of changing an approved master.")
@@ -4032,18 +4178,39 @@ def command_begin_revision(args: argparse.Namespace) -> None:
     source = state_artifact(project, state, "master")
     revision, target = revision_target(source)
     shutil.copy2(source, target)
-    archive = archive_for_revision(project, revision)
+    archive = archive_for_revision(project, revision, reset_from)
+    if caption_audit is not None:
+        archived_audit = archive / "manual-caption-revision.json"
+        archived_audit.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(caption_audit, archived_audit)
+        # The work-area draft is intentionally single-use.  The archived copy
+        # becomes the immutable evidence bound to this revision, so a later
+        # review starts with a fresh draft instead of accidentally reusing old
+        # edits and their original hash.
+        caption_audit.unlink()
+        assert prior_map is not None
+        prior_map["caption_data_sha256"] = digest(state_artifact(project, state, "captions"))
+        prior_map["manual_caption_revision_sha256"] = digest(archived_audit)
+        prior_map["manual_caption_revision"] = str(archived_audit.relative_to(project))
+        prior_map["created_at"] = utc_now()
+        write_json(evidence_file(project, "map"), prior_map)
     state["master"] = target.name
     state["current_revision"] = revision
+    if caption_audit is not None:
+        state["manual_caption_revision"] = str(archived_audit.relative_to(project))
     write_json(state_file(project), state)
     write_json(control_path(project) / "revisions" / f"revision-{revision:02}.json", {
         "schema": SCHEMA, "revision": revision, "created_at": utc_now(), "source_master": identity(source),
-        "master": identity(target), "corrections": notes, "archived_proof": str(archive),
+        "master": identity(target), "corrections": notes, "archived_proof": str(archive), "reset_from": reset_from,
+        "manual_caption_revision": str(archived_audit.relative_to(project)) if caption_audit is not None else None,
     })
-    if current_gate(project, state) != "visual":
-        fail("Revision safety reset failed: visual review was not unlocked for the new master.")
+    if current_gate(project, state) != reset_from:
+        fail(f"Revision safety reset failed: {reset_from} was not unlocked for the new master.")
     print(f"REVISION {revision:02} CREATED: {target.name}")
-    print("Apply only the recorded corrections to this new INDD, then repeat composition plan, native crop application, pair proof, visual confirmations, release, and review-PDF verification.")
+    if reset_from == "captions":
+        print("Manual credits are bound to this new INDD revision. Reformat existing CREDiTs frames, then repeat visual proof, release, and review-PDF verification.")
+    else:
+        print("Apply only the recorded corrections to this new INDD, then repeat composition plan, native crop application, pair proof, visual confirmations, release, and review-PDF verification.")
 
 
 def supersede_legacy_final_exports(project: Path, manifest: dict[str, Any]) -> list[str]:
@@ -4532,10 +4699,33 @@ def command_self_test(_: argparse.Namespace) -> None:
         actual_specs = [(item["key"], item["path"], item["raster_ppi"], item["page_range"], item["expected_pages"]) for item in specs]
         if actual_specs != expected_specs:
             fail(f"Self-test failure: final output plan was {actual_specs!r}.")
-        command_begin_revision(argparse.Namespace(project=str(project), notes="Page 2: adjust the approved crop."))
+        before_caption_hash = digest(captions)
+        captions.write_text(
+            "\t".join(CAPTION_FIELDS) + "\n"
+            "LOOK_001\tMANUAL TYPE\tBRAND\t1 000 ₽\tA\n"
+            "LOOK_002\tTYPE\tBRAND\t2 000 ₽\tB\n",
+            encoding="utf-8",
+        )
+        caption_audit = work / "manual-caption-revisions" / "draft.json"
+        write_json(caption_audit, {
+            "schema": "lookbookbot-caption-revision-v1", "created_at": utc_now(),
+            "look_ids": ["LOOK_001"], "before_caption_data_sha256": before_caption_hash,
+            "after_caption_data_sha256": digest(captions), "changes": [{
+                "look_id": "LOOK_001", "before": [{"type": "TYPE", "brand": "BRAND", "price": "1 000 ₽", "article": "A"}],
+                "after": [{"type": "MANUAL TYPE", "brand": "BRAND", "price": "1 000 ₽", "article": "A"}],
+            }],
+        })
+        command_begin_revision(argparse.Namespace(
+            project=str(project), notes="Page 2: correct the manual credit.", reset_from="captions",
+            caption_audit="control/work/manual-caption-revisions/draft.json",
+        ))
         revised_state = load_state(project)
-        if revised_state["master"] != "master_02.indd" or not (project / "master_02.indd").exists() or current_gate(project, revised_state) != "visual":
-            fail("Self-test failure: revision did not safely return to visual proof.")
+        if (
+            revised_state["master"] != "master_02.indd" or not (project / "master_02.indd").exists()
+            or current_gate(project, revised_state) != "captions" or not revised_state.get("manual_caption_revision")
+        ):
+            fail("Self-test failure: caption revision did not safely return to native CREDiTs formatting.")
+        command_arm(argparse.Namespace(project=str(project), gate="captions"))
     print("SELF-TEST PASS")
 
 
@@ -4657,6 +4847,8 @@ def parser() -> argparse.ArgumentParser:
     revision = commands.add_parser("begin-revision", help="copy the approved review master to the next _NN INDD for recorded corrections")
     revision.add_argument("project")
     revision.add_argument("--notes", required=True, help="received page-by-page correction request")
+    revision.add_argument("--reset-from", choices=("visual", "captions"), default="visual", help="first controlled gate for this revision")
+    revision.add_argument("--caption-audit", default="", help="controlled draft audit required with --reset-from captions")
     revision.set_defaults(func=command_begin_revision)
     publish = commands.add_parser("publish-final", help="after explicit user approval, write the five final PDF variants")
     publish.add_argument("project")

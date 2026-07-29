@@ -11,7 +11,7 @@ from typing import Callable
 
 from .ai_policy import read_only_vision_prompt, targeted_credit_rematch_prompt
 from .config import ToolPaths
-from .controller import CommandError, CommandRunner, LookbookController, evidence_passed, final_outputs_passed
+from .controller import CommandError, CommandRunner, LookbookController, evidence_passed, final_outputs_passed, read_json
 from .discovery import discover_sources
 from .domain import (
     ProjectRecord,
@@ -55,7 +55,14 @@ class PipelineEngine:
         self.runner = CommandRunner(self.log)
         self.controller = LookbookController(self.tools, self.runner)
 
-    def run(self, project: ProjectRecord, start_key: str | None = None, *, continue_after: bool = True) -> PipelineResult:
+    def run(
+        self,
+        project: ProjectRecord,
+        start_key: str | None = None,
+        *,
+        continue_after: bool = True,
+        stop_after: str | None = None,
+    ) -> PipelineResult:
         keys = [stage.key for stage in STAGES]
         start_key = start_key or self.store.first_incomplete_stage(project.id)
         if start_key not in keys:
@@ -85,9 +92,32 @@ class PipelineEngine:
             self.store.finish_run(run_id, StageStatus.PASSED, message)
             self.progress(stage.key, StageStatus.PASSED, message)
             completed.append(stage.key)
+            if stage.key == stop_after:
+                return PipelineResult(tuple(completed), None, message)
             if not continue_after:
                 break
         return PipelineResult(tuple(completed), None, "Все доступные этапы завершены.")
+
+    def begin_caption_revision(self, project: ProjectRecord, audit: Path) -> None:
+        """Copy the reviewed master and return the new revision to captions."""
+        root = project.project_dir
+        try:
+            relative_audit = audit.resolve().relative_to(root.resolve())
+        except ValueError as error:
+            raise PipelineError("Файл правок должен находиться внутри папки проекта.") from error
+        payload = read_json(audit)
+        values = payload.get("look_ids") if isinstance(payload.get("look_ids"), list) else []
+        look_text = ", ".join(str(value) for value in values)
+        notes = f"Правки кредитов: {look_text}" if look_text else "Правки кредитов из вкладки Правки"
+        self.controller.gate(
+            "begin-revision", root,
+            "--notes", notes,
+            "--reset-from", "captions",
+            "--caption-audit", str(relative_audit),
+            timeout=300,
+        )
+        self.store.set_approved(project.id, False)
+        self.store.reset_from(project.id, "captions")
 
     def _provider(self, project: ProjectRecord) -> ModelProvider:
         return make_provider(
@@ -368,7 +398,12 @@ class PipelineEngine:
         self.controller.apply_native_gate(root, "release")
         if evidence_passed(root, "pdf"):
             return "Review-PDF уже проверен контроллером."
-        pdf = review_pdf_filename(project.show_date)
+        state = read_json(root / "control" / "lookbook-state.json")
+        try:
+            revision = max(1, int(state.get("current_revision", 1)))
+        except (TypeError, ValueError):
+            revision = 1
+        pdf = review_pdf_filename(project.show_date, revision)
         self.controller.export_review_pdf(root, pdf)
         self.controller.gate("verify-pdf", root, "--pdf", pdf, timeout=1800)
         self.controller.gate("complete", root, timeout=180)

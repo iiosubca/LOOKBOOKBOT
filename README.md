@@ -1,5 +1,11 @@
 # LOOKBOOKBOT for Windows
 
+## Version 0.2.26
+
+- Added the `ПРАВКИ` workspace between visual audit and log. It shows the selected full-length and close-up images vertically beside an editable product list.
+- Saving a correction creates a controlled source draft; `СОХРАНИТЬ И НАПИСАТЬ PDF НА ПРОВЕРКУ` copies the reviewed INDD to the next `_NN` revision, restores captions through the native `CREDiTs` style and writes the new revision's review PDF. Previous review files remain intact.
+- The controller verifies that only the explicitly recorded LOOK credits differ from the approved Excel-derived data; all other looks stay frozen.
+
 ## Version 0.2.25
 
 - Visual model retries, visual-layout corrections, native four-look batches and caption repair now continue only while a signed plan or durable checkpoint changes. Fixed attempt ceilings no longer stop a valid long-running release.
