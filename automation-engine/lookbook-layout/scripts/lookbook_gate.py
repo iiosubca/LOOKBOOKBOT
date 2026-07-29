@@ -365,19 +365,30 @@ def csv_rows(path: Path, required: list[str]) -> list[dict[str, str]]:
     return rows
 
 
-def write_caption_rows(path: Path, rows: list[dict[str, str]]) -> None:
-    """Atomically write the controlled caption TSV in the UI's canonical form."""
+def caption_rows_bytes(
+    rows: list[dict[str, str]], *, line_terminator: str = "\n", utf8_bom: bool = False,
+) -> bytes:
+    """Serialize captions without guessing the reviewed file's byte format."""
     target = io.StringIO(newline="")
-    writer = csv.DictWriter(target, fieldnames=CAPTION_FIELDS, delimiter="\t", lineterminator="\n")
+    writer = csv.DictWriter(target, fieldnames=CAPTION_FIELDS, delimiter="\t", lineterminator=line_terminator)
     writer.writeheader()
     for row in rows:
         clean = {field: str(row.get(field, "")).strip() for field in CAPTION_FIELDS}
         if any(not value for value in clean.values()):
             fail("Manual caption revision contains an empty product field.")
         writer.writerow(clean)
+    text = target.getvalue().encode("utf-8")
+    return (b"\xef\xbb\xbf" if utf8_bom else b"") + text
+
+
+def write_caption_rows(
+    path: Path, rows: list[dict[str, str]], *, line_terminator: str = "\n", utf8_bom: bool = False,
+) -> None:
+    """Atomically write the controlled caption TSV in the requested byte form."""
+    content = caption_rows_bytes(rows, line_terminator=line_terminator, utf8_bom=utf8_bom)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(target.getvalue(), encoding="utf-8")
+    temporary.write_bytes(content)
     os.replace(temporary, path)
 
 
@@ -480,9 +491,26 @@ def restore_caption_revision_draft_baseline(project: Path, state: dict[str, Any]
         if grouped.get(look_id) != manual_caption_rows(look_id, change["after"]):
             fail(f"{look_id}: legacy draft no longer matches the saved correction target.")
         restored = replace_caption_look(restored, look_id, manual_caption_rows(look_id, change["before"]))
+    # The Excel builder historically emits CRLF while legacy UI corrections
+    # emitted LF.  Controller evidence binds the *reviewed bytes*, therefore
+    # reconstruct the source in the one byte form that matches its signed
+    # baseline rather than assuming the current draft's line ending.
+    restored_bytes: bytes | None = None
+    for line_terminator in ("\r\n", "\n"):
+        for utf8_bom in (False, True):
+            candidate = caption_rows_bytes(restored, line_terminator=line_terminator, utf8_bom=utf8_bom)
+            if hashlib.sha256(candidate).hexdigest() == before_hash:
+                restored_bytes = candidate
+                break
+        if restored_bytes is not None:
+            break
+    if restored_bytes is None:
+        fail("Legacy caption draft has the right products but its reviewed TSV byte format cannot be reconstructed safely.")
     original = captions.read_bytes()
     try:
-        write_caption_rows(captions, restored)
+        temporary = captions.with_suffix(captions.suffix + ".tmp")
+        temporary.write_bytes(restored_bytes)
+        os.replace(temporary, captions)
         if digest(captions) != before_hash:
             fail("Legacy caption draft could not restore the exact reviewed baseline.")
     except Exception:
@@ -4630,7 +4658,9 @@ def command_self_test(_: argparse.Namespace) -> None:
             },
         })
         captions = work / "caption-data.tsv"
-        captions.write_text("\t".join(CAPTION_FIELDS) + "\nLOOK_001\tTYPE\tBRAND\t1 000 ₽\tA\nLOOK_002\tTYPE\tBRAND\t2 000 ₽\tB\n", encoding="utf-8")
+        # This reproduces the Excel builder's historical CRLF output, whereas
+        # the legacy desktop correction below intentionally rewrites it as LF.
+        captions.write_bytes(("\t".join(CAPTION_FIELDS) + "\r\nLOOK_001\tTYPE\tBRAND\t1 000 ₽\tA\r\nLOOK_002\tTYPE\tBRAND\t2 000 ₽\tB\r\n").encode("utf-8"))
         provenance = work / "caption-provenance.json"
         write_json(provenance, {
             "schema": 1,
