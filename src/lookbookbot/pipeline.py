@@ -142,6 +142,20 @@ class PipelineEngine:
         self.store.set_approved(project.id, False)
         self.store.reset_from(project.id, "captions")
 
+    def set_caption_revision_visual_mode(self, project: ProjectRecord, *, targeted: bool) -> None:
+        """Persist the operator's visual-check choice on the current revision.
+
+        A correction revision can be created now and exported later, possibly
+        after restarting LOOKBOOKBOT.  The choice therefore belongs to the
+        revision record, rather than to a transient UI action.
+        """
+        root = project.project_dir
+        state = read_json(root / "control" / "lookbook-state.json")
+        if not state.get("manual_caption_revision"):
+            raise PipelineError("Целевой визуальный контроль доступен только для созданной ревизии кредитов.")
+        mode = "targeted" if targeted else "scope-only"
+        self.controller.gate("set-caption-revision-visual-mode", root, "--mode", mode, timeout=120)
+
     def prepare_caption_revision(self, project: ProjectRecord, audit: Path) -> None:
         """Keep the reviewed source pristine before completing its release/PDF."""
         root = project.project_dir
@@ -436,10 +450,22 @@ class PipelineEngine:
         if evidence_passed(project.project_dir, "visual"):
             return "Визуальная проверка уже подтверждена текущим master."
         if self._has_manual_caption_revision(project.project_dir):
-            self._run_targeted_caption_revision_visual(project, provider)
+            if self._caption_revision_targeted_visual_enabled(project.project_dir):
+                self._run_targeted_caption_revision_visual(project, provider)
+                message = (
+                    "После правки кредитов перепроверены только изменённые луки; "
+                    "остальные подтверждены сравнением с предыдущей версией."
+                )
+            else:
+                self._record_scope_only_caption_revision_visual(project)
+                message = (
+                    "Целевая визуальная проверка изменённых луков отключена для этой ревизии. "
+                    "Перед PDF выполнен native scope-аудит: неизменность остальных разворотов, "
+                    "ссылки изображений и отсутствие переполнения кредитов подтверждены."
+                )
             if not evidence_passed(project.project_dir, "visual"):
                 raise ReviewRequired(visual_audit_blocker_message(project.project_dir))
-            return "После правки кредитов перепроверены только изменённые луки; остальные подтверждены сравнением с предыдущей версией."
+            return message
         if isinstance(provider, CodexProvider):
             self._run_parallel_codex_visual(project, provider)
         else:
@@ -454,6 +480,33 @@ class PipelineEngine:
             return bool(read_json(root / "control" / "lookbook-state.json").get("manual_caption_revision"))
         except (OSError, ValueError):
             return False
+
+    @staticmethod
+    def _caption_revision_targeted_visual_enabled(root: Path) -> bool:
+        """Keep the safer targeted proof as the compatibility/default mode."""
+        state = read_json(root / "control" / "lookbook-state.json")
+        try:
+            revision = int(state.get("current_revision", 1))
+        except (TypeError, ValueError):
+            return True
+        record = read_json(root / "control" / "revisions" / f"revision-{revision:02}.json")
+        return str(record.get("visual_check_mode", "targeted")) != "scope-only"
+
+    def _record_scope_only_caption_revision_visual(self, project: ProjectRecord) -> None:
+        """Accept the explicit no-render option only after native scope proof.
+
+        This does *not* describe the result as a visual inspection.  It keeps
+        the release gate honest: unchanged looks, image links, fixed geometry
+        and caption overflow are proved natively, while the changed looks are
+        deliberately not rendered/model-reviewed because the operator turned
+        that optional check off.
+        """
+        root = project.project_dir
+        arm = self.controller.gate("arm", root, "--gate", "visual", timeout=120, check=False)
+        if arm.returncode and "armed" not in arm.text.casefold():
+            raise PipelineError(arm.text)
+        self.controller.gate("audit-caption-revision-scope", root, timeout=900)
+        self.controller.gate("record-caption-revision-scope-visual", root, timeout=180)
 
     def _run_targeted_caption_revision_visual(self, project: ProjectRecord, provider: ModelProvider) -> None:
         """Recheck only corrected pairs after native COM proves all others unchanged."""

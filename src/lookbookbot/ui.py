@@ -103,6 +103,8 @@ class PipelineWorker(QObject):
         *,
         stop_after: str | None = None,
         caption_revision_audit: str | None = None,
+        caption_revision_action: str | None = None,
+        targeted_caption_visual: bool = True,
     ) -> None:
         super().__init__()
         self.store = store
@@ -111,6 +113,8 @@ class PipelineWorker(QObject):
         self.continue_after = continue_after
         self.stop_after = stop_after
         self.caption_revision_audit = caption_revision_audit
+        self.caption_revision_action = caption_revision_action
+        self.targeted_caption_visual = targeted_caption_visual
 
     def run(self) -> None:
         try:
@@ -129,7 +133,14 @@ class PipelineWorker(QObject):
                         + baseline.message
                     )
                 engine.begin_caption_revision(project, Path(self.caption_revision_audit))
-                result = engine.run(project, "captions", continue_after=True, stop_after="review")
+                engine.set_caption_revision_visual_mode(project, targeted=self.targeted_caption_visual)
+                if self.caption_revision_action == "create":
+                    result = engine.run(project, "captions", continue_after=False, stop_after="captions")
+                else:
+                    result = engine.run(project, "captions", continue_after=True, stop_after="review")
+            elif self.caption_revision_action == "export-review":
+                engine.set_caption_revision_visual_mode(project, targeted=self.targeted_caption_visual)
+                result = engine.run(project, None, continue_after=True, stop_after="review")
             else:
                 result = engine.run(
                     project, self.start_key, continue_after=self.continue_after, stop_after=self.stop_after,
@@ -539,10 +550,20 @@ class MainWindow(QMainWindow):
         buttons = QHBoxLayout()
         self.save_correction_button = QPushButton("СОХРАНИТЬ В ЧЕРНОВИК")
         self.save_correction_button.clicked.connect(self._save_caption_correction)
-        self.export_correction_button = QPushButton("СОЗДАТЬ НОВУЮ ВЕРСИЮ И PDF НА ПРОВЕРКУ")
-        self.export_correction_button.setObjectName("Primary")
-        self.export_correction_button.clicked.connect(self._save_and_export_caption_corrections)
+        self.targeted_caption_visual_check = QCheckBox("ПРОВЕРИТЬ ИЗМЕНЁННЫЕ ЛУКИ ПЕРЕД PDF")
+        self.targeted_caption_visual_check.setChecked(True)
+        self.targeted_caption_visual_check.setToolTip(
+            "Включено: перед PDF проверяются только изменённые луки.\n"
+            "Выключено: перед PDF выполняется только native scope-аудит — без нового визуального рендера изменённых луков."
+        )
+        self.create_caption_revision_button = QPushButton("СОЗДАТЬ НОВУЮ ВЕРСИЮ")
+        self.create_caption_revision_button.setObjectName("Primary")
+        self.create_caption_revision_button.clicked.connect(self._create_caption_revision)
+        self.export_correction_button = QPushButton("НАПИСАТЬ PDF ВЫБРАННОЙ ВЕРСИИ")
+        self.export_correction_button.clicked.connect(self._export_caption_revision_pdf)
         buttons.addWidget(self.save_correction_button)
+        editor_layout.addWidget(self.targeted_caption_visual_check)
+        buttons.addWidget(self.create_caption_revision_button)
         buttons.addWidget(self.export_correction_button)
         editor_layout.addLayout(buttons)
         content.addWidget(editor_box)
@@ -668,6 +689,7 @@ class MainWindow(QMainWindow):
         self._load_credits()
         self._load_visual_audit()
         self._load_corrections()
+        self._load_caption_revision_visual_mode()
         self._load_runs()
         self._refresh_google_quota()
 
@@ -803,6 +825,8 @@ class MainWindow(QMainWindow):
         continue_after: bool,
         *,
         caption_revision_audit: str | None = None,
+        caption_revision_action: str | None = None,
+        targeted_caption_visual: bool = True,
     ) -> None:
         if self.project is None:
             return
@@ -810,11 +834,14 @@ class MainWindow(QMainWindow):
         self.run_button.setText("ВЫПОЛНЯЕТСЯ…")
         if hasattr(self, "save_correction_button"):
             self.save_correction_button.setEnabled(False)
+            self.create_caption_revision_button.setEnabled(False)
             self.export_correction_button.setEnabled(False)
         self.worker_thread = QThread(self)
         self.worker = PipelineWorker(
             self.store, self.project.id, start_key, continue_after,
             caption_revision_audit=caption_revision_audit,
+            caption_revision_action=caption_revision_action,
+            targeted_caption_visual=targeted_caption_visual,
         )
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.run)
@@ -870,6 +897,7 @@ class MainWindow(QMainWindow):
         self.run_button.setText("▶  ПУСК")
         if hasattr(self, "save_correction_button"):
             self.save_correction_button.setEnabled(True)
+            self.create_caption_revision_button.setEnabled(True)
             self.export_correction_button.setEnabled(True)
         self._load_project()
 
@@ -1245,6 +1273,21 @@ class MainWindow(QMainWindow):
         draft = self._caption_draft_path()
         payload = read_json(draft) if draft and draft.is_file() else {}
         look_ids = payload.get("look_ids") if isinstance(payload.get("look_ids"), list) else []
+        state = read_json(self.project.project_dir / "control" / "lookbook-state.json")
+        if state.get("manual_caption_revision"):
+            master = str(state.get("master", ""))
+            review_pdf = f"{Path(master).stem}_review.pdf" if master else "review PDF"
+            if look_ids:
+                self.correction_draft_status.setText(
+                    f"ТЕКУЩАЯ ВЕРСИЯ: {master} → {review_pdf}. В черновике есть новые правки для следующей версии; "
+                    "сначала запишите PDF текущей версии."
+                )
+            else:
+                self.correction_draft_status.setText(
+                    f"ТЕКУЩАЯ ВЕРСИЯ: {master} → {review_pdf}. Создание версии завершено; "
+                    "теперь можно отдельно записать PDF на проверку."
+                )
+            return
         upcoming = f"{future[0]} → {future[1]}"
         if not look_ids:
             self.correction_draft_status.setText(
@@ -1257,6 +1300,19 @@ class MainWindow(QMainWindow):
         self.correction_draft_status.setText(
             f"Черновик: {listed}. При выпуске будет создана одна новая версия: {upcoming}."
         )
+
+    def _load_caption_revision_visual_mode(self) -> None:
+        if not self.project or not hasattr(self, "targeted_caption_visual_check"):
+            return
+        state = read_json(self.project.project_dir / "control" / "lookbook-state.json")
+        if not state.get("manual_caption_revision"):
+            return
+        try:
+            revision = int(state.get("current_revision", 1))
+        except (TypeError, ValueError):
+            return
+        record = read_json(self.project.project_dir / "control" / "revisions" / f"revision-{revision:02}.json")
+        self.targeted_caption_visual_check.setChecked(str(record.get("visual_check_mode", "targeted")) != "scope-only")
 
     def _load_corrections(self) -> None:
         if not hasattr(self, "correction_look_list"):
@@ -1390,7 +1446,13 @@ class MainWindow(QMainWindow):
         self._append_log(f"Сохранены правки кредитов: {self._correction_look_id}. Черновик новой ревизии: {draft.relative_to(self.project.project_dir)}")
         return draft
 
-    def _save_and_export_caption_corrections(self) -> None:
+    def _caption_revision_is_active(self) -> bool:
+        if not self.project:
+            return False
+        state = read_json(self.project.project_dir / "control" / "lookbook-state.json")
+        return bool(state.get("manual_caption_revision"))
+
+    def _create_caption_revision(self) -> None:
         if self.worker_thread and self.worker_thread.isRunning():
             QMessageBox.information(
                 self,
@@ -1399,6 +1461,13 @@ class MainWindow(QMainWindow):
             )
             return
         audit = self._save_caption_correction()
+        if self._caption_revision_is_active():
+            QMessageBox.information(
+                self,
+                "Текущая версия уже создана",
+                "Сначала напишите PDF текущей версии. Новые сохранённые правки останутся в черновике и будут применены к следующей версии после её проверки.",
+            )
+            return
         if audit is None:
             QMessageBox.information(
                 self,
@@ -1408,8 +1477,50 @@ class MainWindow(QMainWindow):
             return
         future = self._next_caption_revision_names()
         label = future[0] if future else "следующая версия"
-        self._append_log(f"Создаётся одна новая ревизия InDesign: {label}. После неё будет записан PDF на проверку той же версии…")
-        self._start_pipeline(None, True, caption_revision_audit=str(audit))
+        self._append_log(f"Создаётся новая ревизия InDesign: {label}. PDF пока не записывается.")
+        self._start_pipeline(
+            None,
+            False,
+            caption_revision_audit=str(audit),
+            caption_revision_action="create",
+            targeted_caption_visual=self.targeted_caption_visual_check.isChecked(),
+        )
+
+    def _export_caption_revision_pdf(self) -> None:
+        if self.worker_thread and self.worker_thread.isRunning():
+            QMessageBox.information(
+                self,
+                "Выполняется выпуск",
+                "Дождитесь завершения текущей операции перед записью PDF.",
+            )
+            return
+        if self._correction_dirty:
+            self._save_caption_correction()
+        draft = self._caption_draft_path()
+        if draft is not None and draft.is_file():
+            QMessageBox.information(
+                self,
+                "Сначала создайте новую версию",
+                "В черновике есть ещё не применённые правки кредитов. Создайте новую версию, затем отдельно запишите PDF этой версии.",
+            )
+            return
+        if not self._caption_revision_is_active():
+            QMessageBox.information(
+                self,
+                "Нет выбранной ревизии",
+                "Сначала создайте новую версию InDesign из сохранённого черновика правок.",
+            )
+            return
+        state = read_json(self.project.project_dir / "control" / "lookbook-state.json") if self.project else {}
+        master = str(state.get("master", "текущая версия"))
+        mode = "с целевой проверкой изменённых луков" if self.targeted_caption_visual_check.isChecked() else "без целевой визуальной проверки"
+        self._append_log(f"Записываю PDF на проверку версии {master} {mode}.")
+        self._start_pipeline(
+            None,
+            True,
+            caption_revision_action="export-review",
+            targeted_caption_visual=self.targeted_caption_visual_check.isChecked(),
+        )
 
     def _load_visual_audit(self) -> None:
         rows = load_visual_audit(self.project.project_dir) if self.project else []

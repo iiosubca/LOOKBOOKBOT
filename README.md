@@ -1,5 +1,10 @@
 # LOOKBOOKBOT for Windows
 
+## Version 0.2.33
+
+- Credit-correction release is now split into two deliberate actions: **Create new version** creates and formats the next sequential INDD only; **Write PDF of selected version** runs the remaining release path and writes that revision's review PDF.
+- `ПРОВЕРИТЬ ИЗМЕНЁННЫЕ ЛУКИ ПЕРЕД PDF` is now an explicit, saved revision option. It is on by default and renders/model-checks only the corrected LOOK pairs. When it is off, the controller records a clearly labelled scope-only route: native InDesign still proves unchanged spreads, image links, fixed frames and non-overset credits, but it never claims the changed credits were visually inspected.
+
 ## Version 0.2.32
 
 - A credits-only correction no longer launches a second full visual audit. The app uses native InDesign comparison to prove every unedited look retained its images, crop geometry and credits, then renders and visually checks only the changed LOOK pairs before writing the next full review PDF.
@@ -23,7 +28,7 @@
 
 ## Version 0.2.28
 
-- Credit corrections now accumulate automatically in one revision draft while moving between looks. Only "Create new version and review PDF" creates the next sequential INDD and its matching review PDF.
+- Credit corrections now accumulate automatically in one revision draft while moving between looks. The next sequential INDD and its matching review PDF remain bound to the same revision.
 - The corrections panel shows the exact upcoming INDD/PDF names before release; final PDFs always derive their names from the current approved master revision.
 
 ## Version 0.2.27

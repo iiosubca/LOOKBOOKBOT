@@ -312,39 +312,42 @@ def load_evidence(project: Path, state: dict[str, Any], gate: str) -> dict[str, 
         return evidence
     if gate == "visual":
         try:
-            proof = visual_proof_manifest_path(project)
-            manifest = validate_visual_proof(project, state)
-            clearance = validate_caption_clearance(project, state)
-            validate_visual_confirmations(project, state)
-            clearance_fingerprint = hashlib.sha256(
-                "\n".join(f"{item['look_id']}:{_caption_clearance_item_fingerprint(item)}" for item in clearance["items"]).encode("utf-8")
-            ).hexdigest()
-            common_matches = (
-                evidence.get("visual_proof_manifest_sha256") == digest(proof)
-                and evidence.get("caption_clearance_sha256") == digest(caption_clearance_report_path(project))
-                and evidence.get("caption_clearance_fingerprint") == clearance_fingerprint
-                and evidence.get("visual_confirmation_fingerprint") == visual_confirmation_fingerprint(project, state)
-            )
-            if not common_matches:
-                return None
-            if targeted_visual_mode(project, state, manifest):
-                record = caption_revision_record(project, state)
-                scope_path = control_path(project) / "revisions" / f"revision-{int(state['current_revision']):02}-scope-audit.json"
-                if (
-                    record is None
-                    or evidence.get("mode") != "caption-revision-targeted"
-                    or not scope_path.is_file()
-                    or evidence.get("revision_scope_sha256") != digest(scope_path)
-                    or evidence.get("source_visual_evidence_sha256") != record.get("source_visual_evidence_sha256")
-                ):
-                    return None
+            if evidence.get("mode") == "caption-revision-scope-only":
+                validate_caption_revision_scope_only_visual(project, state, evidence)
             else:
-                plan = composition_plan_path(project)
-                applied = composition_applied_path(project)
-                validate_composition_plan(project, state)
-                validate_composition_applied(project, state)
-                if evidence.get("composition_plan_sha256") != digest(plan) or evidence.get("composition_applied_sha256") != digest(applied):
+                proof = visual_proof_manifest_path(project)
+                manifest = validate_visual_proof(project, state)
+                clearance = validate_caption_clearance(project, state)
+                validate_visual_confirmations(project, state)
+                clearance_fingerprint = hashlib.sha256(
+                    "\n".join(f"{item['look_id']}:{_caption_clearance_item_fingerprint(item)}" for item in clearance["items"]).encode("utf-8")
+                ).hexdigest()
+                common_matches = (
+                    evidence.get("visual_proof_manifest_sha256") == digest(proof)
+                    and evidence.get("caption_clearance_sha256") == digest(caption_clearance_report_path(project))
+                    and evidence.get("caption_clearance_fingerprint") == clearance_fingerprint
+                    and evidence.get("visual_confirmation_fingerprint") == visual_confirmation_fingerprint(project, state)
+                )
+                if not common_matches:
                     return None
+                if targeted_visual_mode(project, state, manifest):
+                    record = caption_revision_record(project, state)
+                    scope_path = caption_revision_scope_audit_path(project, state)
+                    if (
+                        record is None
+                        or evidence.get("mode") != "caption-revision-targeted"
+                        or not scope_path.is_file()
+                        or evidence.get("revision_scope_sha256") != digest(scope_path)
+                        or evidence.get("source_visual_evidence_sha256") != record.get("source_visual_evidence_sha256")
+                    ):
+                        return None
+                else:
+                    plan = composition_plan_path(project)
+                    applied = composition_applied_path(project)
+                    validate_composition_plan(project, state)
+                    validate_composition_applied(project, state)
+                    if evidence.get("composition_plan_sha256") != digest(plan) or evidence.get("composition_applied_sha256") != digest(applied):
+                        return None
         except (GateError, OSError):
             return None
     master = state_artifact(project, state, "master")
@@ -978,6 +981,53 @@ def caption_revision_record(project: Path, state: dict[str, Any]) -> dict[str, A
     if len(set(targets)) != len(targets):
         fail("Manual caption revision record contains duplicated changed LOOK IDs.")
     return record
+
+
+def caption_revision_scope_audit_path(project: Path, state: dict[str, Any]) -> Path:
+    return control_path(project) / "revisions" / f"revision-{int(state['current_revision']):02}-scope-audit.json"
+
+
+def validate_caption_revision_scope_only_visual(project: Path, state: dict[str, Any], evidence: dict[str, Any]) -> None:
+    """Validate the explicit no-render choice for a credits-only revision.
+
+    It is intentionally separate from a visual proof.  The native scope audit
+    proves that only the recorded credits changed and that all image links,
+    frames and unedited captions remain identical to the reviewed version.
+    It also rejects overset credits.  What it does not claim is that the new
+    credits have been visually inspected for clearance from the model.
+    """
+    record = caption_revision_record(project, state)
+    if record is None or str(record.get("visual_check_mode", "targeted")) != "scope-only":
+        fail("Scope-only visual evidence is not enabled for this caption revision.")
+    scope_path = caption_revision_scope_audit_path(project, state)
+    if not scope_path.is_file():
+        fail("Scope-only visual evidence is missing the native revision scope audit.")
+    scope = read_json(scope_path)
+    master = state_artifact(project, state, "master")
+    if (
+        scope.get("schema") != SCHEMA
+        or scope.get("generator") != "run_lookbook_gate_com.ps1:AuditCaptionRevisionScope"
+        or scope.get("session_id") != state["session_id"]
+        or scope.get("passed") is not True
+        or not isinstance(scope.get("master"), dict)
+        or not same_identity(scope["master"], identity(master))
+        or sorted(scope.get("changed_looks", [])) != sorted(record["changed_looks"])
+        or int(scope.get("unchanged_count", -1)) != int(state["look_count"]) - len(record["changed_looks"])
+    ):
+        fail("Native revision scope audit does not prove the requested scope-only PDF release.")
+    for label in ("source_visual_evidence", "source_visual_manifest", "source_visual_proof"):
+        raw = str(record.get(label, ""))
+        source = child_of(project, raw)
+        if not raw or not source.is_file() or record.get(f"{label}_sha256") != digest(source):
+            fail(f"Scope-only visual evidence lost its inherited {label.replace('_', ' ')}.")
+    if (
+        evidence.get("changed_looks") != record["changed_looks"]
+        or evidence.get("revision_scope_sha256") != digest(scope_path)
+        or evidence.get("source_visual_evidence_sha256") != record["source_visual_evidence_sha256"]
+        or evidence.get("source_visual_manifest_sha256") != record["source_visual_manifest_sha256"]
+        or evidence.get("source_visual_proof_sha256") != record["source_visual_proof_sha256"]
+    ):
+        fail("Scope-only visual evidence no longer matches the caption revision record.")
 
 
 def targeted_visual_mode(project: Path, state: dict[str, Any], manifest: dict[str, Any] | None = None) -> bool:
@@ -3908,6 +3958,75 @@ def command_record_visual(args: argparse.Namespace) -> None:
     print(summary)
 
 
+def command_set_caption_revision_visual_mode(args: argparse.Namespace) -> None:
+    """Store the optional targeted-check choice before the visual gate runs."""
+    project = project_path(args.project)
+    state = load_state(project)
+    gate = current_gate(project, state)
+    if gate not in {"captions", "visual"}:
+        fail(f"Caption revision visual mode can be set only before visual release; next required gate is {gate or 'complete'}.")
+    record = caption_revision_record(project, state)
+    if record is None:
+        fail("Caption revision visual mode is available only for a manual credits revision.")
+    mode = str(args.mode).strip().lower()
+    if mode not in {"targeted", "scope-only"}:
+        fail("Caption revision visual mode must be targeted or scope-only.")
+    record["visual_check_mode"] = mode
+    record["visual_check_configured_at"] = utc_now()
+    write_json(revision_record_path(project, state), record)
+    if mode == "targeted":
+        print("CAPTION REVISION VISUAL MODE: targeted proof before review PDF.")
+    else:
+        print("CAPTION REVISION VISUAL MODE: scope-only audit before review PDF; corrected looks will not be re-rendered.")
+
+
+def command_record_caption_revision_scope_visual(args: argparse.Namespace) -> None:
+    """Record the explicit no-render release route for a caption revision."""
+    project = project_path(args.project)
+    state = load_state(project)
+    if current_gate(project, state) != "visual":
+        fail(f"Scope-only visual evidence can be recorded only at visual; next required gate is {current_gate(project, state) or 'complete'}.")
+    armed = read_json(arm_file(project, "visual"))
+    if armed.get("session_id") != state["session_id"] or armed.get("gate") != "visual" or not armed.get("nonce"):
+        fail("Scope-only visual evidence requires an armed visual gate.")
+    record = caption_revision_record(project, state)
+    if record is None or str(record.get("visual_check_mode", "targeted")) != "scope-only":
+        fail("Scope-only visual evidence was not selected for this caption revision.")
+    scope_path = caption_revision_scope_audit_path(project, state)
+    scope = read_json(scope_path)
+    master = state_artifact(project, state, "master")
+    if (
+        not scope_path.is_file()
+        or scope.get("schema") != SCHEMA
+        or scope.get("generator") != "run_lookbook_gate_com.ps1:AuditCaptionRevisionScope"
+        or scope.get("session_id") != state["session_id"]
+        or scope.get("passed") is not True
+        or not isinstance(scope.get("master"), dict)
+        or not same_identity(scope["master"], identity(master))
+        or sorted(scope.get("changed_looks", [])) != sorted(record["changed_looks"])
+        or int(scope.get("unchanged_count", -1)) != int(state["look_count"]) - len(record["changed_looks"])
+    ):
+        fail("Native revision scope audit is incomplete; scope-only review PDF is not safe to record.")
+    # All inherited artefacts are hash-bound, so a manually deleted or swapped
+    # reviewed proof cannot be used as the page-order basis for the new PDF.
+    for label in ("source_visual_evidence", "source_visual_manifest", "source_visual_proof"):
+        source = child_of(project, str(record.get(label, "")))
+        if not source.is_file() or record.get(f"{label}_sha256") != digest(source):
+            fail(f"Scope-only visual evidence is missing inherited {label.replace('_', ' ')}.")
+    evidence = {
+        "schema": SCHEMA, "session_id": state["session_id"], "gate": "visual", "passed": True,
+        "nonce": armed["nonce"], "created_at": utc_now(), "master": identity(master),
+        "mode": "caption-revision-scope-only", "changed_looks": record["changed_looks"],
+        "revision_scope_sha256": digest(scope_path),
+        "source_visual_evidence_sha256": record["source_visual_evidence_sha256"],
+        "source_visual_manifest_sha256": record["source_visual_manifest_sha256"],
+        "source_visual_proof_sha256": record["source_visual_proof_sha256"],
+        "notes": "Operator disabled the optional targeted visual check; native scope audit confirms unchanged looks, image links and non-overset credits.",
+    }
+    write_json(evidence_file(project, "visual"), evidence)
+    print(f"PASS visual (scope-only): {len(record['changed_looks'])} corrected look(s) were not re-rendered by operator choice; native revision scope audit passed.")
+
+
 def command_pre_export(args: argparse.Namespace) -> None:
     project = project_path(args.project)
     assert_project_root_clean(project)
@@ -4078,10 +4197,26 @@ def verify_exported_pdf_order(project: Path, state: dict[str, Any], review_pdf: 
     merely from matching page count.
     """
     reference_manifest = validate_reference_order(project, state)
-    visual_manifest = validate_visual_proof(project, state)
-    proof_pdf = child_of(project, str(visual_manifest.get("proof_pdf", "")))
-    if not proof_pdf.is_file() or visual_manifest.get("proof_pdf_sha256") != digest(proof_pdf):
-        fail("Current-master visual proof PDF is absent or changed; review-PDF order cannot be verified.")
+    visual_evidence = read_json(evidence_file(project, "visual"))
+    scope_only = visual_evidence.get("mode") == "caption-revision-scope-only"
+    visual_manifest: dict[str, Any] | None = None
+    if scope_only:
+        # The operator has deliberately skipped the optional re-render of the
+        # corrected looks.  Their pair order is still anchored to the reviewed
+        # proof: the native scope audit bound every image frame and crop to the
+        # frozen registry before this point.
+        validate_caption_revision_scope_only_visual(project, state, visual_evidence)
+        record = caption_revision_record(project, state)
+        if record is None:
+            fail("Scope-only review-PDF order proof has no caption revision record.")
+        proof_pdf = child_of(project, str(record["source_visual_proof"]))
+        if not proof_pdf.is_file() or record.get("source_visual_proof_sha256") != digest(proof_pdf):
+            fail("Inherited reviewed proof PDF is missing or changed; review-PDF order cannot be verified.")
+    else:
+        visual_manifest = validate_visual_proof(project, state)
+        proof_pdf = child_of(project, str(visual_manifest.get("proof_pdf", "")))
+        if not proof_pdf.is_file() or visual_manifest.get("proof_pdf_sha256") != digest(proof_pdf):
+            fail("Current-master visual proof PDF is absent or changed; review-PDF order cannot be verified.")
     registry = validate_registry(
         state_artifact(project, state, "registry"), int(state["look_count"]), state_artifact(project, state, "hires")
     )
@@ -4090,7 +4225,9 @@ def verify_exported_pdf_order(project: Path, state: dict[str, Any], review_pdf: 
     root = control_path(project) / "visual" / "pdf-order" / stamp
     review_pages = render_pdf_pages(review_pdf, root / "review-pdf", pages, 96)
     proof_pages: dict[int, Path]
-    if targeted_visual_mode(project, state, visual_manifest):
+    if scope_only:
+        proof_pages = render_pdf_pages(proof_pdf, root / "inherited-proof", pages, 96)
+    elif visual_manifest is not None and targeted_visual_mode(project, state, visual_manifest):
         record = caption_revision_record(project, state)
         if record is None:
             fail("Targeted review-PDF order proof has no caption revision record.")
@@ -4148,6 +4285,7 @@ def verify_exported_pdf_order(project: Path, state: dict[str, Any], review_pdf: 
         "reference_order_confirmation_fingerprint": reference_order_confirmation_fingerprint(project, state),
         "reference_pdf_sha256": reference_manifest["reference_pdf_sha256"],
         "current_master_proof_pdf_sha256": digest(proof_pdf), "review_pdf_sha256": digest(review_pdf),
+        "proof_mode": "caption-revision-scope-only" if scope_only else "current-master-rendered",
         "items": items,
     }
 
@@ -4710,6 +4848,9 @@ def command_begin_revision(args: argparse.Namespace) -> None:
             "source_visual_manifest_sha256": digest(archived_visual_manifest),
             "source_visual_proof": _relative_project_path(project, archived_visual_proof),
             "source_visual_proof_sha256": digest(archived_visual_proof),
+            # The safer targeted proof remains the default. LOOKBOOKBOT can
+            # explicitly switch this to scope-only before the visual gate.
+            "visual_check_mode": "targeted",
         })
     write_json(control_path(project) / "revisions" / f"revision-{revision:02}.json", revision_record)
     if current_gate(project, state) != reset_from:
@@ -5287,6 +5428,30 @@ def command_self_test(_: argparse.Namespace) -> None:
         if digest(captions) != read_json(child_of(project, revised_state["manual_caption_revision"]))["after_caption_data_sha256"]:
             fail("Self-test failure: caption revision did not apply the preserved correction draft.")
         command_arm(argparse.Namespace(project=str(project), gate="captions"))
+        caption_arm = read_json(arm_file(project, "captions"))
+        revised_master = state_artifact(project, revised_state, "master")
+        write_json(evidence_file(project, "captions"), {
+            "schema": SCHEMA, "session_id": revised_state["session_id"], "gate": "captions", "passed": True,
+            "nonce": caption_arm["nonce"], "created_at": utc_now(), "master": identity(revised_master),
+        })
+        if current_gate(project, load_state(project)) != "visual":
+            fail("Self-test failure: corrected captions did not advance to visual.")
+        command_set_caption_revision_visual_mode(argparse.Namespace(project=str(project), mode="scope-only"))
+        command_arm(argparse.Namespace(project=str(project), gate="visual"))
+        scope_path = caption_revision_scope_audit_path(project, load_state(project))
+        write_json(scope_path, {
+            "schema": SCHEMA, "generator": "run_lookbook_gate_com.ps1:AuditCaptionRevisionScope",
+            "session_id": revised_state["session_id"], "created_at": utc_now(), "passed": True,
+            "source_master": identity(project / "master_01.indd"), "master": identity(revised_master),
+            "changed_looks": ["LOOK_001"], "unchanged_count": 1,
+            "checked": [{"look_id": "LOOK_001", "changed": True}, {"look_id": "LOOK_002", "changed": False}],
+        })
+        command_record_caption_revision_scope_visual(argparse.Namespace(project=str(project)))
+        if current_gate(project, load_state(project)) != "release":
+            fail("Self-test failure: scope-only caption revision visual evidence did not unlock release.")
+        scope_order = verify_exported_pdf_order(project, load_state(project), project / output)
+        if scope_order.get("proof_mode") != "caption-revision-scope-only":
+            fail("Self-test failure: scope-only revision did not retain inherited PDF-order proof.")
     print("SELF-TEST PASS")
 
 
@@ -5379,6 +5544,13 @@ def parser() -> argparse.ArgumentParser:
     revision_proof = commands.add_parser("render-revision-visual-proof", help="export and check only manually corrected look pairs")
     revision_proof.add_argument("project")
     revision_proof.set_defaults(func=command_render_revision_visual_proof)
+    revision_mode = commands.add_parser("set-caption-revision-visual-mode", help="choose targeted or scope-only check for the current caption revision")
+    revision_mode.add_argument("project")
+    revision_mode.add_argument("--mode", required=True, choices=("targeted", "scope-only"))
+    revision_mode.set_defaults(func=command_set_caption_revision_visual_mode)
+    revision_scope_record = commands.add_parser("record-caption-revision-scope-visual", help="record an explicit no-render visual route after native caption-revision scope audit")
+    revision_scope_record.add_argument("project")
+    revision_scope_record.set_defaults(func=command_record_caption_revision_scope_visual)
     clearance_refresh = commands.add_parser("refresh-caption-clearance", help="renew the read-only native credits-clearance audit without exporting a PDF")
     clearance_refresh.add_argument("project")
     clearance_refresh.set_defaults(func=command_refresh_caption_clearance)
