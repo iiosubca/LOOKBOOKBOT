@@ -1,5 +1,10 @@
 # LOOKBOOKBOT for Windows
 
+## Version 0.2.31
+
+- The corrections release button now compares the actual edited credit cards before deciding whether a revision is required. A lost editor `textChanged` event can no longer discard an added product or make the button appear to do nothing.
+- If the text is truly unchanged or a release is still active, the interface explains the exact reason instead of presenting the generic “no corrections” result.
+
 ## Version 0.2.30
 
 - Creating a corrected `_02` revision now automatically rebinds the native structure profile to that exact copied INDD before credits are applied. InDesign regenerates internal frame IDs when a document is copied; the rebind verifies the existing structure and frames without changing the layout, preventing a false “credits frame moved” stop.

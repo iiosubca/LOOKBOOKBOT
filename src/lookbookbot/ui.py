@@ -1334,12 +1334,18 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Выполняется выпуск", "Дождитесь завершения текущей операции перед сохранением правок.")
             return None
         draft = self._caption_draft_path()
-        if not self._correction_dirty:
-            return draft if draft and draft.is_file() else None
         caption_path = self.project.project_dir / "control" / "work" / "caption-data.tsv"
         try:
             products = parse_caption_editor(self.correction_editor.toPlainText())
             before = products_for_look(self._correction_rows, self._correction_look_id)
+            # QTextEdit can lose a textChanged notification while a selected
+            # look is refreshed.  The release button must trust the actual
+            # four-line credit content, not an incidental UI dirty flag.
+            # This also prevents a second click from creating a revision when
+            # the visible credits are semantically unchanged.
+            if products == before:
+                self._correction_dirty = False
+                return draft if draft and draft.is_file() else None
             before_sha = self._file_sha256(caption_path)
             replacement = replace_look_products(self._correction_rows, self._correction_look_id, products)
             # Keep the reviewed caption-data.tsv pristine until the baseline
@@ -1368,12 +1374,19 @@ class MainWindow(QMainWindow):
         return draft
 
     def _save_and_export_caption_corrections(self) -> None:
+        if self.worker_thread and self.worker_thread.isRunning():
+            QMessageBox.information(
+                self,
+                "Выполняется выпуск",
+                "Правки не потеряны, но новая версия будет создана после завершения текущего выпуска.",
+            )
+            return
         audit = self._save_caption_correction()
         if audit is None:
             QMessageBox.information(
                 self,
                 "Нет правок для выпуска",
-                "Измените кредиты и сохраните их. Затем программа создаст новую версию InDesign и PDF на проверку.",
+                "Текст выбранного лука не отличается от текущей версии, поэтому новая INDD не создаётся. Добавьте или измените четыре строки товара: тип, бренд, цена, артикул.",
             )
             return
         future = self._next_caption_revision_names()
