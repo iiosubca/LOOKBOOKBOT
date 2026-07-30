@@ -201,6 +201,7 @@ class MainWindow(QMainWindow):
         self.project = self.store.active_project()
         self.worker_thread: QThread | None = None
         self.worker: PipelineWorker | None = None
+        self._busy_controls: list[tuple[QPushButton, str, bool]] = []
         self.stage_items: dict[str, QListWidgetItem] = {}
         self._loading_credits = False
         self._correction_rows: list[dict[str, str]] = []
@@ -353,10 +354,10 @@ class MainWindow(QMainWindow):
             self.stage_list.addItem(item)
             self.stage_items[stage.key] = item
         side_layout.addWidget(self.stage_list, 1)
-        continue_button = QPushButton("ПРОДОЛЖИТЬ С МЕСТА ОСТАНОВКИ")
-        continue_button.setObjectName("Continue")
-        continue_button.clicked.connect(self._continue_from_checkpoint)
-        side_layout.addWidget(continue_button)
+        self.continue_button = QPushButton("ПРОДОЛЖИТЬ С МЕСТА ОСТАНОВКИ")
+        self.continue_button.setObjectName("Continue")
+        self.continue_button.clicked.connect(self._continue_from_checkpoint)
+        side_layout.addWidget(self.continue_button)
         self.approved = QCheckBox("Согласовано — разрешить финальные PDF")
         self.approved.toggled.connect(self._approval_changed)
         side_layout.addWidget(self.approved)
@@ -468,12 +469,12 @@ class MainWindow(QMainWindow):
         toolbar = QHBoxLayout()
         hint = QLabel("Отметьте галочкой только спорные луки: повторно сопоставляться будут лишь они, остальные CONFIRMED останутся замороженными.")
         hint.setObjectName("Muted")
-        rematch = QPushButton("↻ Повторно сопоставить отмеченные")
-        rematch.clicked.connect(self._run_targeted_credit_rematch)
+        self.rematch_credits_button = QPushButton("↻ Повторно сопоставить отмеченные")
+        self.rematch_credits_button.clicked.connect(self._run_targeted_credit_rematch)
         save = QPushButton("Сохранить ручные правки")
         save.clicked.connect(self._save_credit_edits)
         toolbar.addWidget(hint, 1)
-        toolbar.addWidget(rematch)
+        toolbar.addWidget(self.rematch_credits_button)
         toolbar.addWidget(save)
         layout.addLayout(toolbar)
         content = QSplitter(Qt.Orientation.Horizontal)
@@ -842,15 +843,15 @@ class MainWindow(QMainWindow):
         caption_revision_audit: str | None = None,
         caption_revision_action: str | None = None,
         targeted_caption_visual: bool = True,
+        initiator: QPushButton | None = None,
+        activity_text: str = "ВЫПОЛНЯЕТСЯ…",
     ) -> None:
         if self.project is None:
             return
-        self.run_button.setEnabled(False)
-        self.run_button.setText("ВЫПОЛНЯЕТСЯ…")
-        if hasattr(self, "save_correction_button"):
-            self.save_correction_button.setEnabled(False)
-            self.create_caption_revision_button.setEnabled(False)
-            self.export_correction_button.setEnabled(False)
+        if self.worker_thread is not None and self.worker_thread.isRunning():
+            self._append_log("Операция уже выполняется; повторный запуск не создан.")
+            return
+        self._begin_worker_ui(initiator or self.run_button, activity_text)
         self.worker_thread = QThread(self)
         self.worker = PipelineWorker(
             self.store, self.project.id, start_key, continue_after,
@@ -868,8 +869,45 @@ class MainWindow(QMainWindow):
         self.worker.failed.connect(self.worker_thread.quit)
         self.worker_thread.finished.connect(self.worker.deleteLater)
         self.worker_thread.finished.connect(self.worker_thread.deleteLater)
+        self.worker_thread.finished.connect(self._clear_worker_reference)
         self.tabs.setCurrentIndex(self.log_tab)
         self.worker_thread.start()
+
+    def _begin_worker_ui(self, initiator: QPushButton, activity_text: str) -> None:
+        """Make every long-running UI action immediately and visibly busy."""
+        controls = [self.run_button]
+        for name in (
+            "continue_button", "rematch_credits_button", "save_correction_button",
+            "create_caption_revision_button", "export_correction_button",
+        ):
+            control = getattr(self, name, None)
+            if isinstance(control, QPushButton):
+                controls.append(control)
+        self._busy_controls = []
+        seen_controls: set[int] = set()
+        for control in controls:
+            if id(control) in seen_controls:
+                continue
+            seen_controls.add(id(control))
+            self._busy_controls.append((control, control.text(), control.isEnabled()))
+            control.setEnabled(False)
+        self.run_button.setText("ВЫПОЛНЯЕТСЯ…")
+        initiator.setText(activity_text)
+        if hasattr(self, "correction_draft_status") and initiator in {
+            getattr(self, "create_caption_revision_button", None),
+            getattr(self, "export_correction_button", None),
+        }:
+            self.correction_draft_status.setText(f"ВЫПОЛНЯЕТСЯ: {activity_text.lower()}")
+
+    def _restore_worker_ui(self) -> None:
+        for control, label, enabled in self._busy_controls:
+            control.setText(label)
+            control.setEnabled(enabled)
+        self._busy_controls = []
+
+    def _clear_worker_reference(self) -> None:
+        self.worker = None
+        self.worker_thread = None
 
     def _continue_from_checkpoint(self) -> None:
         self.stage_list.clearSelection()
@@ -908,12 +946,7 @@ class MainWindow(QMainWindow):
             self.final_export_timer.stop()
         self._refresh_visual_progress()
         self._refresh_final_export_progress()
-        self.run_button.setEnabled(True)
-        self.run_button.setText("▶  ПУСК")
-        if hasattr(self, "save_correction_button"):
-            self.save_correction_button.setEnabled(True)
-            self.create_caption_revision_button.setEnabled(True)
-            self.export_correction_button.setEnabled(True)
+        self._restore_worker_ui()
         self._load_project()
 
     def _begin_visual_progress(self) -> None:
@@ -1213,7 +1246,12 @@ class MainWindow(QMainWindow):
         # The rematch worker intentionally stops after the credit stage so
         # the operator can review only the corrected proof cards before any
         # later controller gate or InDesign work begins.
-        self._start_pipeline("credits_map", continue_after=False)
+        self._start_pipeline(
+            "credits_map",
+            continue_after=False,
+            initiator=self.rematch_credits_button,
+            activity_text="СОПОСТАВЛЯЕТСЯ…",
+        )
 
     def _credit_table_duplicates(self) -> dict[tuple[str, str], list[str]]:
         pairs: dict[tuple[str, str], list[str]] = {}
@@ -1537,6 +1575,8 @@ class MainWindow(QMainWindow):
             return
         audit = self._save_caption_correction()
         if self._caption_revision_is_active() and not self._current_caption_revision_review_pdf_passed():
+            self.correction_draft_status.setText("НОВАЯ ВЕРСИЯ НЕ ЗАПУЩЕНА: сначала напишите PDF текущей версии.")
+            self._append_log("Новая версия не запущена: текущая INDD-версия ещё не имеет подтверждённого review PDF.")
             QMessageBox.information(
                 self,
                 "Текущая версия уже создана",
@@ -1544,6 +1584,8 @@ class MainWindow(QMainWindow):
             )
             return
         if audit is None:
+            self.correction_draft_status.setText("НОВАЯ ВЕРСИЯ НЕ ЗАПУЩЕНА: сохранённых изменений в кредитах нет.")
+            self._append_log("Новая версия не запущена: в черновике нет изменений кредитов.")
             QMessageBox.information(
                 self,
                 "Нет правок для выпуска",
@@ -1562,6 +1604,8 @@ class MainWindow(QMainWindow):
             caption_revision_audit=str(audit),
             caption_revision_action="create",
             targeted_caption_visual=self.targeted_caption_visual_check.isChecked(),
+            initiator=self.create_caption_revision_button,
+            activity_text="СОЗДАЁТСЯ…",
         )
 
     def _export_caption_revision_pdf(self) -> None:
@@ -1598,6 +1642,8 @@ class MainWindow(QMainWindow):
             True,
             caption_revision_action="export-review",
             targeted_caption_visual=self.targeted_caption_visual_check.isChecked(),
+            initiator=self.export_correction_button,
+            activity_text="ПИШЕТСЯ PDF…",
         )
 
     def _load_visual_audit(self) -> None:
