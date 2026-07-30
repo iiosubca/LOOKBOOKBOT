@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from .ai_policy import read_only_vision_prompt, targeted_credit_rematch_prompt
+from .ai_policy import read_only_vision_prompt
 from .config import ToolPaths
 from .controller import CommandError, CommandRunner, LookbookController, evidence_passed, final_outputs_passed, read_json
 from .discovery import discover_sources
@@ -572,6 +572,17 @@ class PipelineEngine:
                         }
                         for look_id in targets
                     },
+                    # A candidate rejected by an actual visual comparison is
+                    # never shown again for that same LOOK. This is a logical
+                    # exhaustion guard, not an arbitrary retry limit.
+                    "attempted_candidates": {
+                        look_id: [
+                            f"{before_by_look[look_id]['excel_sheet'].upper()}:"
+                            f"{before_by_look[look_id]['excel_look_number']}"
+                        ]
+                        for look_id in targets
+                    },
+                    "reserved_candidates": [],
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -582,19 +593,16 @@ class PipelineEngine:
         for look_id in targets:
             (observations / f"{look_id}.json").unlink(missing_ok=True)
 
-        # Re-rendering leaves every map entry intact; it only gives the model
-        # current proof images for the target rows and their candidate cards.
-        self.controller.script(
-            "render_caption_mapping_evidence.py", root,
-            "--map", "control/work/caption-map.tsv", "--hires", "control/work/_mat/hires", timeout=1800,
-        )
         if isinstance(provider, CodexProvider):
-            result = provider.run_agent(
-                targeted_credit_rematch_prompt(str(root), targets), root, timeout=7200,
-            )
-            if result:
-                self.log("Codex: " + result[-4000:])
+            self._resolve_codex_targeted_credit_rematch(project, provider, targets, manifest)
         else:
+            # Other model providers retain the existing conservative path.
+            # They never mutate the map themselves and therefore cannot turn
+            # an unconfirmed proposal into a false CONFIRMED match.
+            self.controller.script(
+                "render_caption_mapping_evidence.py", root,
+                "--map", "control/work/caption-map.tsv", "--hires", "control/work/_mat/hires", timeout=1800,
+            )
             self._confirm_local_credit_proofs(project, provider, only_looks=set(targets))
 
         after = _read_tsv(caption_map)
@@ -623,6 +631,248 @@ class PipelineEngine:
         provenance = root / "control" / "work" / "caption-provenance.json"
         self.controller.script("build_verified_caption_data.py", caption_map, workbook, captions, "--provenance", provenance, timeout=600)
         return f"Точечно перепроверены только отмеченные луки: {', '.join(targets)}. Остальные строки карты сохранены без изменений."
+
+    def _resolve_codex_targeted_credit_rematch(
+        self,
+        project: ProjectRecord,
+        provider: CodexProvider,
+        targets: list[str],
+        manifest: Path,
+    ) -> None:
+        """Resolve rejected cards using controller-owned candidate evidence.
+
+        The previous implementation delegated this mutation to a broad Codex
+        task. A read-only worker could reject a bad proof but had no durable
+        way to choose, prove, select and re-confirm a replacement. Here Codex
+        only sees pixels and returns a single candidate; the controller owns
+        every file mutation and validates every transition.
+        """
+        root = project.project_dir
+        unresolved = list(targets)
+        while unresolved:
+            selections = self._choose_and_verify_codex_rematch_candidates(
+                provider, root, unresolved, manifest,
+            )
+            assignment_text = ",".join(
+                f"{look_id}={sheet}:{number}"
+                for look_id, (sheet, number) in sorted(selections.items())
+            )
+            self.controller.script(
+                "auto_caption_map.py", root,
+                "--mode", "select-alternatives", "--controller-batch",
+                "--assignments", assignment_text,
+                timeout=1800,
+            )
+            self.controller.script(
+                "render_caption_mapping_evidence.py", root,
+                "--map", "control/work/caption-map.tsv", "--hires", "control/work/_mat/hires", timeout=1800,
+            )
+            rejected = self._confirm_codex_credit_proofs_parallel(project, provider)
+            unresolved = [look_id for look_id in unresolved if look_id in set(rejected)]
+            if unresolved:
+                self.log(
+                    "New ordinary proof cards still reject only: " + ", ".join(unresolved)
+                )
+                self._append_rematch_attempts(manifest, {
+                    look_id: selections[look_id] for look_id in unresolved
+                })
+
+    def _choose_and_verify_codex_rematch_candidates(
+        self,
+        provider: CodexProvider,
+        root: Path,
+        targets: list[str],
+        manifest: Path,
+    ) -> dict[str, tuple[str, str]]:
+        """Choose unique alternatives, then inspect their exact proof cards.
+
+        Each candidate can be tried once per LOOK. If the exact alternative
+        card is rejected, only that LOOK returns to the remaining candidate
+        pool. The completion bound is the controlled catalogue, rather than a
+        random number of retries.
+        """
+        remaining = sorted(set(targets))
+        accepted: dict[str, tuple[str, str]] = {}
+        while remaining:
+            self._write_rematch_reserved(manifest, accepted.values())
+            self.controller.script(
+                "build_targeted_rematch_proofs.py", root,
+                "--looks", ",".join(remaining),
+                "--exclude-json", "control/work/ui-overrides/targeted-credit-rematch.json",
+                timeout=1800,
+            )
+            choices = self._choose_codex_rematch_candidates(provider, root, remaining)
+            duplicate_pairs: dict[tuple[str, str], list[str]] = {}
+            for look_id, pair in choices.items():
+                duplicate_pairs.setdefault(pair, []).append(look_id)
+            collisions = [
+                look_id
+                for _pair, look_ids in duplicate_pairs.items() if len(look_ids) > 1
+                for look_id in sorted(look_ids)[1:]
+            ]
+            if collisions:
+                # The colliding LOOKs lose only the duplicate candidate. The
+                # whole current batch is then re-read so no unverified choice
+                # can be silently dropped from the atomic selection.
+                self._append_rematch_attempts(manifest, {look_id: choices[look_id] for look_id in collisions})
+                remaining = sorted(set(remaining))
+                continue
+
+            assignment_text = ",".join(
+                f"{look_id}={sheet}:{number}"
+                for look_id, (sheet, number) in sorted(choices.items())
+            )
+            self.controller.script(
+                "auto_caption_map.py", root,
+                "--mode", "alternative-proofs", "--controller-batch",
+                "--looks", ",".join(sorted(choices)), "--assignments", assignment_text,
+                timeout=1800,
+            )
+            alternative_rows = self._alternative_evidence_rows(root, choices)
+            decisions = self._inspect_codex_credit_evidence_parallel(provider, root, alternative_rows)
+            rejected = [
+                look_id for look_id in choices
+                if not decisions.get(look_id) or not decisions[look_id].accepted
+            ]
+            if rejected:
+                self._append_rematch_attempts(manifest, {look_id: choices[look_id] for look_id in rejected})
+            for look_id, pair in choices.items():
+                if look_id not in rejected:
+                    accepted[look_id] = pair
+            remaining = rejected
+        self._write_rematch_reserved(manifest, [])
+        return accepted
+
+    def _choose_codex_rematch_candidates(
+        self,
+        provider: CodexProvider,
+        root: Path,
+        targets: list[str],
+    ) -> dict[str, tuple[str, str]]:
+        workers = min(4, len(targets))
+        choices: dict[str, tuple[str, str]] = {}
+        failures: list[str] = []
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="lookbook-rematch") as executor:
+            futures = {
+                executor.submit(self._inspect_codex_rematch_candidate, provider, root, look_id): look_id
+                for look_id in targets
+            }
+            for future in as_completed(futures):
+                look_id = futures[future]
+                try:
+                    choices[look_id] = future.result()
+                except (ProviderError, ValueError, OSError) as error:
+                    failures.append(f"{look_id}: {error}")
+        if failures:
+            raise ReviewRequired("Automatic alternative selection did not finish:\n" + "\n".join(failures))
+        return choices
+
+    def _inspect_codex_rematch_candidate(
+        self,
+        provider: CodexProvider,
+        root: Path,
+        look_id: str,
+    ) -> tuple[str, str]:
+        folder = root / "control" / "work" / "rematch-evidence" / look_id
+        manifest_path = folder / "manifest.json"
+        try:
+            evidence = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(f"{look_id}: missing candidate evidence manifest ({error})") from error
+        candidates = {
+            tuple(item.split(":", 1))
+            for item in evidence.get("candidate_pool", [])
+            if isinstance(item, str) and item.count(":") == 1
+        }
+        attachments = [root / str(evidence.get("pdf_pair", ""))]
+        attachments.extend(
+            root / str(page.get("path", ""))
+            for page in evidence.get("candidate_pages", []) if isinstance(page, dict)
+        )
+        if not candidates or len(attachments) < 2 or len(attachments) > 5 or any(not path.is_file() for path in attachments):
+            raise ValueError(f"{look_id}: incomplete controlled candidate evidence.")
+        prompt = f"""Choose the single Excel card for one PDF look by visible identity.
+
+LOOK: {look_id}
+The first image contains the two PDF-look photographs. The other images are all allowed, currently unclaimed Excel cards, each labelled `EXCEL W:12` or `EXCEL M:9`.
+
+Compare the model, garments, colours, bag, shoes, accessories, pose and crop. Do not use numbers, ordering, filenames, gender or background as evidence. Select only the label that visibly matches both PDF images.
+
+Reply with exactly one JSON object and no Markdown:
+{{"look_id":"{look_id}","excel_sheet":"W or M","excel_look_number":"number","note":"at least two concrete visible identity cues"}}"""
+        raw = provider.run_readonly_agent(prompt, root, timeout=3600, images=attachments)
+        return _parse_codex_rematch_candidate(raw, look_id, candidates)
+
+    def _alternative_evidence_rows(
+        self,
+        root: Path,
+        choices: dict[str, tuple[str, str]],
+    ) -> list[dict[str, str]]:
+        catalog = _read_tsv(root / "control" / "work" / "caption-map-alternatives.tsv")
+        alternatives = {
+            (row.get("look_id", ""), row.get("excel_sheet", ""), row.get("excel_look_number", "")): row
+            for row in catalog
+        }
+        rows: list[dict[str, str]] = []
+        for look_id, (sheet, number) in choices.items():
+            alternative = alternatives.get((look_id, sheet, number))
+            if alternative is None:
+                raise PipelineError(f"{look_id}: controller did not produce the selected exact alternative proof.")
+            rows.append({"look_id": look_id, "evidence_file": alternative["evidence_file"]})
+        return rows
+
+    def _inspect_codex_credit_evidence_parallel(
+        self,
+        provider: CodexProvider,
+        root: Path,
+        rows: list[dict[str, str]],
+    ) -> dict[str, VisionDecision]:
+        decisions: dict[str, VisionDecision] = {}
+        failures: list[str] = []
+        batches = _row_batches(rows, size=5)
+        workers = min(4, len(batches))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="lookbook-alt-proof") as executor:
+            futures = {
+                executor.submit(self._inspect_codex_credit_batch, provider, root, batch): batch
+                for batch in batches
+            }
+            for future in as_completed(futures):
+                batch = futures[future]
+                try:
+                    decisions.update(future.result())
+                except (ProviderError, ValueError, OSError) as error:
+                    failures.append(f"{', '.join(row['look_id'] for row in batch)}: {error}")
+        if failures:
+            raise ReviewRequired("Alternative proof verification did not finish:\n" + "\n".join(failures))
+        return decisions
+
+    @staticmethod
+    def _load_rematch_manifest(path: Path) -> dict[str, object]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise PipelineError(f"Could not read the controlled rematch log: {error}") from error
+        if not isinstance(payload, dict):
+            raise PipelineError("The controlled rematch log has an invalid format.")
+        return payload
+
+    def _append_rematch_attempts(self, manifest: Path, choices: dict[str, tuple[str, str]]) -> None:
+        payload = self._load_rematch_manifest(manifest)
+        raw_attempted = payload.get("attempted_candidates")
+        attempted = dict(raw_attempted) if isinstance(raw_attempted, dict) else {}
+        for look_id, (sheet, number) in choices.items():
+            values = list(attempted.get(look_id, []))
+            value = f"{sheet}:{number}"
+            if value not in values:
+                values.append(value)
+            attempted[look_id] = values
+        payload["attempted_candidates"] = attempted
+        manifest.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def _write_rematch_reserved(self, manifest: Path, pairs: object) -> None:
+        payload = self._load_rematch_manifest(manifest)
+        payload["reserved_candidates"] = sorted({f"{sheet}:{number}" for sheet, number in pairs})
+        manifest.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     def _map_gate(self, project: ProjectRecord, provider: ModelProvider) -> str:
         root = project.project_dir
@@ -1696,6 +1946,35 @@ def _parse_codex_batch_decisions(raw: str, expected_looks: list[str]) -> dict[st
         missing = ", ".join(sorted(expected - set(parsed)))
         raise ProviderError("Codex не вернул решение для всех назначенных LOOK: " + missing)
     return parsed
+
+
+def _parse_codex_rematch_candidate(
+    raw: str,
+    expected_look: str,
+    candidates: set[tuple[str, str]],
+) -> tuple[str, str]:
+    """Validate one read-only selection before it can enter the map.
+
+    The model may describe a plausible card, but only an exact printed label
+    from the supplied controlled candidate board is accepted by the
+    controller. This prevents a broad agent from inventing an Excel number.
+    """
+    text = str(raw).strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        raise ProviderError("Codex did not return JSON for the rematch candidate.")
+    try:
+        payload = json.loads(text[start : end + 1])
+    except json.JSONDecodeError as error:
+        raise ProviderError("Codex returned invalid JSON for the rematch candidate.") from error
+    if not isinstance(payload, dict) or str(payload.get("look_id", "")).strip() != expected_look:
+        raise ProviderError(f"{expected_look}: Codex returned a candidate for another LOOK.")
+    sheet = str(payload.get("excel_sheet", "")).strip().upper()
+    number = str(payload.get("excel_look_number", "")).strip()
+    if sheet not in {"W", "M"} or not number.isdigit() or (sheet, number) not in candidates:
+        raise ProviderError(f"{expected_look}: Codex selected a card outside the supplied candidate board.")
+    _safe_confirmation_note(str(payload.get("note", "")))
+    return sheet, number
 
 
 def _credit_override_batches(

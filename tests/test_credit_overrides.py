@@ -11,6 +11,7 @@ from lookbookbot.pipeline import (
     ReviewRequired,
     _caption_map_duplicate_pairs,
     _credit_override_batches,
+    _parse_codex_rematch_candidate,
     _read_tsv,
     _write_tsv,
 )
@@ -105,6 +106,23 @@ def test_rematch_request_is_durable_and_clears_manual_override(tmp_path: Path) -
     assert store.requested_credit_rematches(project.id) == []
 
 
+def test_rematch_candidate_must_be_a_label_from_the_controlled_board() -> None:
+    candidates = {("W", "7"), ("M", "11")}
+    assert _parse_codex_rematch_candidate(
+        '{"look_id":"LOOK_007","excel_sheet":"W","excel_look_number":"7",'
+        '"note":"garment=blue denim jumpsuit; bag=metallic silver bag"}',
+        "LOOK_007",
+        candidates,
+    ) == ("W", "7")
+    with pytest.raises(Exception, match="outside the supplied candidate board"):
+        _parse_codex_rematch_candidate(
+            '{"look_id":"LOOK_007","excel_sheet":"W","excel_look_number":"8",'
+            '"note":"garment=blue denim jumpsuit; bag=metallic silver bag"}',
+            "LOOK_007",
+            candidates,
+        )
+
+
 def test_swap_batches_are_atomic_and_limited_to_five() -> None:
     current = {
         "LOOK_001": {"excel_sheet": "W", "excel_look_number": "1"},
@@ -161,15 +179,14 @@ def test_targeted_rematch_restores_every_unmarked_map_row(tmp_path: Path, monkey
     engine = PipelineEngine(store)
     monkeypatch.setattr(engine.controller, "script", lambda *_args, **_kwargs: None)
 
-    def simulated_agent(*_args, **_kwargs) -> str:
+    def simulated_rematch(_project, _provider, _targets, _manifest) -> None:
         changed = _read_tsv(map_path)
         changed[0].update({"excel_sheet": "M", "excel_look_number": "9", "excel_image": "nine.jpg", "visual_status": "CONFIRMED"})
         changed[1].update({"excel_sheet": "M", "excel_look_number": "8", "excel_image": "eight.jpg", "visual_status": "CONFIRMED"})
         _write_tsv(map_path, changed)
-        return "confirmed"
 
     provider = CodexProvider()
-    monkeypatch.setattr(provider, "run_agent", simulated_agent)
+    monkeypatch.setattr(engine, "_resolve_codex_targeted_credit_rematch", simulated_rematch)
     result = engine._targeted_credit_rematch(project, provider, ["LOOK_001"])
     after = {row["look_id"]: row for row in _read_tsv(map_path)}
 

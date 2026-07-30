@@ -316,10 +316,11 @@ def require_proof(project: Path, row: dict[str, str]) -> None:
         fail(f"{row['look_id']}: exact three-panel visual proof is missing.")
 
 
-def parse_requested_looks(value: str, action: str) -> list[str]:
+def parse_requested_looks(value: str, action: str, *, maximum: int = 5) -> list[str]:
     requested = [item.strip().upper() for item in value.split(",") if item.strip()]
-    if not requested or len(requested) > 5 or len(set(requested)) != len(requested):
-        fail(f"{action} requires one to five unique comma-separated LOOK_### IDs.")
+    if not requested or len(requested) > maximum or len(set(requested)) != len(requested):
+        quantity = "one to five" if maximum == 5 else f"one to {maximum}"
+        fail(f"{action} requires {quantity} unique comma-separated LOOK_### IDs.")
     if any(not item.startswith("LOOK_") or not item[5:].isdigit() for item in requested):
         fail(f"{action} accepts only exact LOOK_### IDs.")
     return requested
@@ -353,7 +354,7 @@ def alternative_catalog_path(project: Path) -> Path:
     return child(project, "control/work/caption-map-alternatives.tsv")
 
 
-def parse_assignments(value: str) -> dict[str, tuple[str, str]]:
+def parse_assignments(value: str, *, maximum: int = 5) -> dict[str, tuple[str, str]]:
     assignments: dict[str, tuple[str, str]] = {}
     for item in (part.strip() for part in value.split(",") if part.strip()):
         if "=" not in item or item.count(":") != 1:
@@ -366,8 +367,9 @@ def parse_assignments(value: str) -> dict[str, tuple[str, str]]:
         if look_id in assignments:
             fail(f"{look_id}: duplicate alternative assignment.")
         assignments[look_id] = (sheet, number)
-    if not assignments or len(assignments) > 5:
-        fail("--assignments requires one to five explicit alternatives.")
+    if not assignments or len(assignments) > maximum:
+        quantity = "one to five" if maximum == 5 else f"one to {maximum}"
+        fail(f"--assignments requires {quantity} explicit alternatives.")
     if len(set(assignments.values())) != len(assignments):
         fail("Alternative assignments must use different Excel cards.")
     return assignments
@@ -392,6 +394,11 @@ def main() -> None:
     parser.add_argument("--looks", default="", help="comma-separated LOOK_### IDs for one reviewed batch (maximum five)")
     parser.add_argument("--notes", default="", help="LOOK_###=grounded visual description entries separated by ||")
     parser.add_argument("--assignments", default="", help="LOOK_###=W:12 or LOOK_###=M:9 entries separated by commas")
+    parser.add_argument(
+        "--controller-batch",
+        action="store_true",
+        help="Allow LOOKBOOKBOT to atomically save a larger already-inspected rematch batch.",
+    )
     args = parser.parse_args()
     project = args.project.resolve()
     registry = read_rows(child(project, args.registry), REGISTRY_FIELDS)
@@ -421,6 +428,7 @@ def main() -> None:
         })
     map_path = child(project, args.caption_map)
     review = {str(record["look_id"]): record for record in diagnostics if needs_visual_review(record)}
+    batch_limit = 50 if args.controller_batch else 5
     if args.mode == "propose":
         write_rows(map_path, MAP_FIELDS, proposed)
         print(f"PASS caption-map proposal: {len(proposed)} unique Excel cards resolved from image identity. Render proof cards before confirmation.")
@@ -493,8 +501,8 @@ def main() -> None:
         write_rows(map_path, MAP_FIELDS, existing)
         print("CAPTION MAP REPAIRED: " + (", ".join(repaired) if repaired else "no drift found") + ".")
     elif args.mode == "alternative-proofs":
-        requested = parse_requested_looks(args.looks, "alternative-proofs")
-        requested_assignments = parse_assignments(args.assignments)
+        requested = parse_requested_looks(args.looks, "alternative-proofs", maximum=batch_limit)
+        requested_assignments = parse_assignments(args.assignments, maximum=batch_limit)
         if set(requested_assignments) != set(requested):
             fail("alternative-proofs must name the same LOOK_### IDs in --looks and --assignments.")
         existing = read_rows(map_path, MAP_FIELDS)
@@ -536,7 +544,7 @@ def main() -> None:
         )
         print(f"Alternatives: {catalog}")
     elif args.mode == "select-alternatives":
-        assignments = parse_assignments(args.assignments)
+        assignments = parse_assignments(args.assignments, maximum=batch_limit)
         existing = read_rows(map_path, MAP_FIELDS)
         assert_allowed_map(project, existing, proposed)
         by_look = {row["look_id"]: row for row in existing}
