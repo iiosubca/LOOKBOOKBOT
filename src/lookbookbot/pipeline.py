@@ -460,7 +460,10 @@ class PipelineEngine:
                 self.controller.script("render_caption_mapping_evidence.py", root, "--map", "control/work/caption-map.tsv", "--hires", "control/work/_mat/hires", timeout=1800)
             self._confirm_local_credit_proofs(project, provider)
 
-        rows = _read_tsv(caption_map)
+        # ``caption-map.tsv`` is consumed later as a logical Excel-card map,
+        # not as an image list. Repair a rare stale/duplicate assignment here
+        # while the proof cards and visual resolver are still available.
+        rows = self._repair_duplicate_caption_map(project, provider)
         self.store.replace_credits(project.id, rows)
         pending = [row["look_id"] for row in rows if row.get("visual_status") != "CONFIRMED"]
         if pending:
@@ -471,6 +474,65 @@ class PipelineEngine:
         provenance = root / "control" / "work" / "caption-provenance.json"
         self.controller.script("build_verified_caption_data.py", caption_map, workbook, captions, "--provenance", provenance, timeout=600)
         return f"Все {len(rows)} кредитных карточек подтверждены и привязаны один-к-одному."
+
+    def _repair_duplicate_caption_map(
+        self,
+        project: ProjectRecord,
+        provider: ModelProvider,
+    ) -> list[dict[str, str]]:
+        """Recover duplicate logical Excel cards before the caption-data build.
+
+        The visual seeder works with image previews, while the credits builder
+        consumes one logical Excel card identified by ``sheet + look number``.
+        A stale TSV can therefore name the same logical card twice. This is
+        recoverable before InDesign starts: restore the deterministic mapping,
+        then visually re-confirm only the rows that the repair changed.
+        """
+        root = project.project_dir
+        caption_map = root / "control" / "work" / "caption-map.tsv"
+        rows = _read_tsv(caption_map)
+        duplicates = _caption_map_duplicate_pairs(rows)
+        if not duplicates:
+            return rows
+
+        self.log(
+            "Обнаружены повторно назначенные Excel-карточки; "
+            "автоматически восстанавливаю карту: " + _format_caption_map_duplicates(duplicates)
+        )
+        self.controller.script("auto_caption_map.py", root, "--mode", "repair", timeout=1800)
+        self.controller.script(
+            "render_caption_mapping_evidence.py", root,
+            "--map", "control/work/caption-map.tsv", "--hires", "control/work/_mat/hires", timeout=1800,
+        )
+
+        repaired = _read_tsv(caption_map)
+        pending = [row["look_id"] for row in repaired if row.get("visual_status") != "CONFIRMED"]
+        if pending:
+            self.log("Повторно подтверждаю исправленные credit proof-карточки: " + ", ".join(pending))
+            if isinstance(provider, CodexProvider):
+                rejected = self._confirm_codex_credit_proofs_parallel(project, provider)
+            else:
+                self._confirm_local_credit_proofs(project, provider, only_looks=set(pending))
+                rejected = []
+            if rejected:
+                raise ReviewRequired(
+                    "Автоматическая пересверка не подтвердила исправленные credit-карточки: "
+                    + ", ".join(rejected)
+                )
+            repaired = _read_tsv(caption_map)
+
+        remaining = _caption_map_duplicate_pairs(repaired)
+        if remaining:
+            raise PipelineError(
+                "Автоматическое восстановление карты кредитов не устранило повтор карточки Excel: "
+                + _format_caption_map_duplicates(remaining)
+            )
+        pending = [row["look_id"] for row in repaired if row.get("visual_status") != "CONFIRMED"]
+        if pending:
+            raise ReviewRequired(
+                "После автоматического восстановления не подтверждены credit-карточки: " + ", ".join(pending)
+            )
+        return repaired
 
     def _targeted_credit_rematch(
         self,
@@ -548,7 +610,8 @@ class PipelineEngine:
         if changed_non_targets:
             _write_tsv(caption_map, after)
             self.log("Восстановлены замороженные строки карты: " + ", ".join(changed_non_targets))
-        after = _read_tsv(caption_map)
+        after = self._repair_duplicate_caption_map(project, provider)
+        after_by_look = {row["look_id"]: row for row in after}
         pending = [look_id for look_id in targets if after_by_look.get(look_id, {}).get("visual_status") != "CONFIRMED"]
         if pending:
             raise ReviewRequired(
@@ -1464,6 +1527,29 @@ def _write_tsv(path: Path, rows: list[dict[str, str]]) -> None:
         writer.writeheader()
         writer.writerows(rows)
     temporary.replace(path)
+
+
+def _caption_map_duplicate_pairs(rows: list[dict[str, str]]) -> dict[tuple[str, str], list[str]]:
+    """Return duplicate logical Excel cards in a caption map.
+
+    ``excel_image`` is deliberately excluded: a workbook can carry several
+    preview files for a single card, but its credits are still one card.
+    """
+    owners: dict[tuple[str, str], list[str]] = {}
+    for row in rows:
+        sheet = str(row.get("excel_sheet", "")).strip().upper()
+        number = str(row.get("excel_look_number", "")).strip()
+        if sheet not in {"W", "M"} or not number.isdigit():
+            continue
+        owners.setdefault((sheet, number), []).append(str(row.get("look_id", "")))
+    return {pair: looks for pair, looks in owners.items() if len(looks) > 1}
+
+
+def _format_caption_map_duplicates(duplicates: dict[tuple[str, str], list[str]]) -> str:
+    return "; ".join(
+        f"{sheet}/{number}: {', '.join(sorted(looks))}"
+        for (sheet, number), looks in sorted(duplicates.items())
+    )
 
 
 def _latest_cards(root: Path) -> list[Path]:

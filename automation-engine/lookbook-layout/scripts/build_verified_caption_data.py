@@ -103,8 +103,11 @@ def main() -> None:
     parser.add_argument("captions", type=Path)
     parser.add_argument("--provenance", type=Path, required=True)
     args = parser.parse_args()
-    mapping = read_map(args.caption_map)
-    captions = extract_products(args.workbook, mapping)
+    try:
+        mapping = read_map(args.caption_map)
+        captions = extract_products(args.workbook, mapping)
+    except ValueError as error:
+        raise SystemExit(f"BLOCKED: {error}") from error
     args.captions.parent.mkdir(parents=True, exist_ok=True)
     with args.captions.open("w", encoding="utf-8", newline="") as target:
         writer = csv.DictWriter(target, fieldnames=CAPTION_FIELDS, delimiter="\t")

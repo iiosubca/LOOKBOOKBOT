@@ -6,7 +6,14 @@ from pathlib import Path
 import pytest
 
 from lookbookbot.domain import ProviderKind
-from lookbookbot.pipeline import PipelineEngine, ReviewRequired, _credit_override_batches, _read_tsv, _write_tsv
+from lookbookbot.pipeline import (
+    PipelineEngine,
+    ReviewRequired,
+    _caption_map_duplicate_pairs,
+    _credit_override_batches,
+    _read_tsv,
+    _write_tsv,
+)
 from lookbookbot.providers import CodexProvider
 from lookbookbot.state import StateStore
 
@@ -171,6 +178,47 @@ def test_targeted_rematch_restores_every_unmarked_map_row(tmp_path: Path, monkey
     assert after["LOOK_002"]["excel_sheet"] == "W"
     assert after["LOOK_002"]["excel_look_number"] == "2"
     assert store.requested_credit_rematches(project.id) == []
+
+
+def test_duplicate_caption_map_is_repaired_before_caption_data_build(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = StateStore(tmp_path / "state.db")
+    project = _project(store, tmp_path)
+    map_path = project.project_dir / "control" / "work" / "caption-map.tsv"
+    map_path.parent.mkdir(parents=True)
+    rows = [
+        {
+            "look_id": "LOOK_001", "excel_sheet": "W", "excel_look_number": "6", "excel_image": "six-a.jpg",
+            "left_filename": "one-full.jpg", "right_filename": "one-close.jpg", "evidence_file": "control/work/mapping-evidence/LOOK_001.jpg", "visual_status": "CONFIRMED",
+        },
+        {
+            "look_id": "LOOK_002", "excel_sheet": "W", "excel_look_number": "6", "excel_image": "six-b.jpg",
+            "left_filename": "two-full.jpg", "right_filename": "two-close.jpg", "evidence_file": "control/work/mapping-evidence/LOOK_002.jpg", "visual_status": "CONFIRMED",
+        },
+    ]
+    _write_tsv(map_path, rows)
+    engine = PipelineEngine(store)
+
+    def repair(_name: str, *_args, **_kwargs) -> None:
+        if _name != "auto_caption_map.py":
+            return
+        repaired = _read_tsv(map_path)
+        repaired[1].update({"excel_look_number": "5", "excel_image": "five.jpg", "visual_status": "PENDING"})
+        _write_tsv(map_path, repaired)
+
+    monkeypatch.setattr(engine.controller, "script", repair)
+
+    def confirm(_project, _provider):
+        repaired = _read_tsv(map_path)
+        repaired[1]["visual_status"] = "CONFIRMED"
+        _write_tsv(map_path, repaired)
+        return []
+
+    monkeypatch.setattr(engine, "_confirm_codex_credit_proofs_parallel", confirm)
+    repaired = engine._repair_duplicate_caption_map(project, CodexProvider())
+
+    assert _caption_map_duplicate_pairs(repaired) == {}
+    assert repaired[1]["excel_look_number"] == "5"
+    assert repaired[1]["visual_status"] == "CONFIRMED"
 
 
 def test_map_gate_skips_reaccepting_an_unchanged_confirmed_map(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
