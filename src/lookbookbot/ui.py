@@ -134,12 +134,6 @@ class PipelineWorker(QObject):
             )
             if self.caption_revision_audit:
                 engine.prepare_caption_revision(project, Path(self.caption_revision_audit))
-                baseline = engine.finish_review_before_caption_revision(project)
-                if baseline.stopped_at:
-                    raise PipelineError(
-                        "Исходная версия не прошла обязательный выпуск PDF на проверку перед созданием новой ревизии: "
-                        + baseline.message
-                    )
                 engine.begin_caption_revision(project, Path(self.caption_revision_audit))
                 engine.set_caption_revision_visual_mode(project, targeted=self.targeted_caption_visual)
                 if self.caption_revision_action == "create":
@@ -1330,32 +1324,6 @@ class MainWindow(QMainWindow):
             and int(evidence.get("modified_ms", -1)) == int(stat.st_mtime * 1000)
         )
 
-    def _current_caption_revision_review_pdf_passed(self) -> bool:
-        """Return true only for a controller-accepted PDF of the active INDD.
-
-        A similarly named file alone is not enough: it may be stale or an
-        interrupted export.  The correction UI must, however, recognise a
-        verified current revision so it can create the next `_NN` version.
-        """
-        if not self.project:
-            return False
-        root = self.project.project_dir
-        state = read_json(root / "control" / "lookbook-state.json")
-        master = str(state.get("master", "")).strip()
-        evidence = read_json(root / "control" / "evidence" / "pdf.json")
-        expected_pdf = f"{Path(master).stem}_review.pdf" if master else ""
-        reported_master = evidence.get("master") if isinstance(evidence.get("master"), dict) else {}
-        reported_pdf = evidence.get("pdf") if isinstance(evidence.get("pdf"), dict) else {}
-        master_path = root / master
-        pdf_path = root / expected_pdf
-        return bool(
-            master
-            and expected_pdf
-            and evidence.get("passed") is True
-            and MainWindow._evidence_identity_matches(master_path, reported_master)
-            and MainWindow._evidence_identity_matches(pdf_path, reported_pdf)
-        )
-
     def _refresh_caption_draft_status(self) -> None:
         if not hasattr(self, "correction_draft_status"):
             return
@@ -1385,16 +1353,10 @@ class MainWindow(QMainWindow):
                 )
                 return
             if look_ids:
-                if self._current_caption_revision_review_pdf_passed():
-                    self.correction_draft_status.setText(
-                        f"ТЕКУЩАЯ ВЕРСИЯ: {master} → {review_pdf} подтверждён. "
-                        "В черновике есть новые правки — можно создавать следующую версию."
-                    )
-                else:
-                    self.correction_draft_status.setText(
-                        f"ТЕКУЩАЯ ВЕРСИЯ: {master} → {review_pdf}. В черновике есть новые правки для следующей версии; "
-                        "сначала запишите PDF текущей версии."
-                    )
+                self.correction_draft_status.setText(
+                    f"ТЕКУЩАЯ ВЕРСИЯ: {master}. В черновике есть новые правки — можно сразу создавать следующую "
+                    "версию. PDF на проверку записывайте только для версии, которую хотите отправить на проверку."
+                )
             else:
                 self.correction_draft_status.setText(
                     f"ТЕКУЩАЯ ВЕРСИЯ: {master} → {review_pdf}. Создание версии завершено; "
@@ -1574,15 +1536,6 @@ class MainWindow(QMainWindow):
             )
             return
         audit = self._save_caption_correction()
-        if self._caption_revision_is_active() and not self._current_caption_revision_review_pdf_passed():
-            self.correction_draft_status.setText("НОВАЯ ВЕРСИЯ НЕ ЗАПУЩЕНА: сначала напишите PDF текущей версии.")
-            self._append_log("Новая версия не запущена: текущая INDD-версия ещё не имеет подтверждённого review PDF.")
-            QMessageBox.information(
-                self,
-                "Текущая версия уже создана",
-                "Сначала напишите PDF текущей версии. Новые сохранённые правки останутся в черновике и будут применены к следующей версии после её проверки.",
-            )
-            return
         if audit is None:
             self.correction_draft_status.setText("НОВАЯ ВЕРСИЯ НЕ ЗАПУЩЕНА: сохранённых изменений в кредитах нет.")
             self._append_log("Новая версия не запущена: в черновике нет изменений кредитов.")

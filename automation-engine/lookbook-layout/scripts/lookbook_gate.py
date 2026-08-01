@@ -4116,12 +4116,14 @@ def command_set_caption_revision_visual_mode(args: argparse.Namespace) -> None:
     if record is None:
         fail("Caption revision visual mode is available only for a manual credits revision.")
     mode = str(args.mode).strip().lower()
-    if mode not in {"targeted", "scope-only"}:
-        fail("Caption revision visual mode must be targeted or scope-only.")
+    if mode not in {"full", "targeted", "scope-only"}:
+        fail("Caption revision visual mode must be full, targeted, or scope-only.")
     record["visual_check_mode"] = mode
     record["visual_check_configured_at"] = utc_now()
     write_json(revision_record_path(project, state), record)
-    if mode == "targeted":
+    if mode == "full":
+        print("CAPTION REVISION VISUAL MODE: full proof before review PDF; no earlier visual baseline is inherited.")
+    elif mode == "targeted":
         print("CAPTION REVISION VISUAL MODE: targeted proof before review PDF.")
     else:
         print("CAPTION REVISION VISUAL MODE: scope-only audit before review PDF; corrected looks will not be re-rendered.")
@@ -4855,13 +4857,16 @@ def archive_for_revision(project: Path, revision: int, reset_from: str = "visual
 
 
 def _validate_caption_revision_preconditions(project: Path, state: dict[str, Any], audit: Path) -> dict[str, Any]:
-    """Verify that a draft only changes captions after a complete review."""
-    prior_map = read_json(evidence_file(project, "map"))
-    if (
-        prior_map.get("schema") != SCHEMA or prior_map.get("session_id") != state["session_id"]
-        or prior_map.get("gate") != "map" or prior_map.get("passed") is not True
-    ):
-        fail("A caption revision requires the accepted map evidence from the reviewed release.")
+    """Verify the current saved INDD and caption baseline before copying it.
+
+    A correction may be chained before a review PDF exists. The minimum
+    non-negotiable condition is a controller-confirmed current captions gate
+    and an unchanged accepted source map; visual/release/PDF evidence is
+    inherited only when it already exists for this exact master.
+    """
+    prior_map = load_evidence(project, state, "map")
+    if prior_map is None:
+        fail("A caption revision requires current accepted map evidence.")
     for key, artifact_key in (
         ("registry_sha256", "registry"), ("reference_pdf_sha256", "reference_pdf"),
         ("caption_map_sha256", "caption_map"), ("caption_workbook_sha256", "caption_workbook"),
@@ -4873,23 +4878,16 @@ def _validate_caption_revision_preconditions(project: Path, state: dict[str, Any
     if payload.get("before_caption_data_sha256") != prior_map.get("caption_data_sha256"):
         fail("Manual caption revision does not start from the reviewed caption source.")
     validate_caption_revision_draft_baseline(project, state, audit)
-    # The draft is intentionally separate from caption-data.tsv at this point.
-    # Prove the reviewed baseline first, then bind the edited rows only after
-    # copying the next INDD revision.
-    master = state_artifact(project, state, "master")
-    for gate in ("visual", "release", "pdf"):
-        evidence = read_json(evidence_file(project, gate))
-        if (
-            evidence.get("schema") != SCHEMA or evidence.get("session_id") != state["session_id"]
-            or evidence.get("gate") != gate or evidence.get("passed") is not True
-            or not isinstance(evidence.get("master"), dict) or not same_identity(evidence["master"], identity(master))
-        ):
-            fail(f"A caption revision requires a complete reviewed release; {gate} proof is absent or from another master.")
+    if load_evidence(project, state, "captions") is None:
+        fail("A caption revision requires controller-confirmed credits for the current INDD master.")
+    next_gate = current_gate(project, state)
+    if next_gate not in {"visual", "release", "pdf", None}:
+        fail(f"A caption revision can begin only after current credits; next required gate is {next_gate}.")
     return prior_map
 
 
 def command_prepare_caption_revision(args: argparse.Namespace) -> None:
-    """Restore a legacy UI draft before the old reviewed master is released."""
+    """Restore only legacy direct-TSV drafts before copying a revision."""
     project = project_path(args.project)
     state = load_state(project)
     audit = child_of(project, str(args.caption_audit).strip())
@@ -4915,14 +4913,16 @@ def command_begin_revision(args: argparse.Namespace) -> None:
             fail("A captions revision requires --caption-audit from LOOKBOOKBOT corrections.")
         caption_audit = child_of(project, raw_audit)
         # CLI callers receive the same legacy-draft recovery as the desktop
-        # pipeline.  It never discards edits; it only restores the reviewed
-        # source so release/PDF evidence can be completed before the copy.
+        # pipeline. It never discards edits; modern saved drafts are already
+        # separate from caption-data.tsv and therefore leave the source intact.
         restore_caption_revision_draft_baseline(project, state, caption_audit)
         prior_map = _validate_caption_revision_preconditions(project, state, caption_audit)
-        # Capture the complete, accepted visual bundle before it is moved into
-        # immutable history. A credits-only correction may reuse it only via a
-        # native unchanged-look comparison and a new proof of changed looks.
-        prior_visual_manifest = read_json(visual_proof_manifest_path(project))
+        # Reuse visual proof only when it is already current and controller
+        # accepted. A revision created before that point has no visual
+        # baseline, so its own later visual gate will be full rather than
+        # pretending to be a targeted continuation.
+        if load_evidence(project, state, "visual") is not None:
+            prior_visual_manifest = validate_visual_proof(project, state)
     elif current_gate(project, state) is not None:
         fail("A revision can begin only after the current review PDF has passed every gate and complete has been run.")
     notes = args.notes.strip()
@@ -4984,7 +4984,15 @@ def command_begin_revision(args: argparse.Namespace) -> None:
         # new master publish a separately verified final set after reapproval.
         revision_record["superseded_final_publication"] = _relative_project_path(project, archived_final)
     if caption_audit is not None:
-        assert prior_visual_manifest is not None
+        revision_record.update({
+            "kind": "captions", "changed_looks": sorted(changes),
+            # The physical INDD copy exists at this point, but it is not a
+            # finished user-visible revision until the native captions gate
+            # has saved and verified its exact text against this audit.
+            "caption_application": "pending",
+            "visual_check_mode": "targeted" if prior_visual_manifest is not None else "full",
+        })
+    if caption_audit is not None and prior_visual_manifest is not None:
         archived_visual_evidence = archive / "evidence" / "visual.json"
         archived_visual_manifest = archive / "visual" / "proof" / "manifest.json"
         source_proof_relative = Path(str(prior_visual_manifest.get("proof_pdf", "")))
@@ -5001,11 +5009,6 @@ def command_begin_revision(args: argparse.Namespace) -> None:
             if not item.is_file():
                 fail(f"Caption revision cannot preserve {label}: {item}")
         revision_record.update({
-            "kind": "captions", "changed_looks": sorted(changes),
-            # The physical INDD copy exists at this point, but it is not a
-            # finished user-visible revision until the native captions gate
-            # has saved and verified its exact text against this audit.
-            "caption_application": "pending",
             "source_visual_evidence": _relative_project_path(project, archived_visual_evidence),
             "source_visual_evidence_sha256": digest(archived_visual_evidence),
             "source_visual_manifest": _relative_project_path(project, archived_visual_manifest),
@@ -5016,6 +5019,8 @@ def command_begin_revision(args: argparse.Namespace) -> None:
             # explicitly switch this to scope-only before the visual gate.
             "visual_check_mode": "targeted",
         })
+    elif caption_audit is not None:
+        revision_record["visual_baseline"] = "not-yet-confirmed"
     write_json(control_path(project) / "revisions" / f"revision-{revision:02}.json", revision_record)
     if current_gate(project, state) != reset_from:
         fail(f"Revision safety reset failed: {reset_from} was not unlocked for the new master.")
@@ -5708,9 +5713,9 @@ def parser() -> argparse.ArgumentParser:
     revision_proof = commands.add_parser("render-revision-visual-proof", help="export and check only manually corrected look pairs")
     revision_proof.add_argument("project")
     revision_proof.set_defaults(func=command_render_revision_visual_proof)
-    revision_mode = commands.add_parser("set-caption-revision-visual-mode", help="choose targeted or scope-only check for the current caption revision")
+    revision_mode = commands.add_parser("set-caption-revision-visual-mode", help="choose full, targeted, or scope-only check for the current caption revision")
     revision_mode.add_argument("project")
-    revision_mode.add_argument("--mode", required=True, choices=("targeted", "scope-only"))
+    revision_mode.add_argument("--mode", required=True, choices=("full", "targeted", "scope-only"))
     revision_mode.set_defaults(func=command_set_caption_revision_visual_mode)
     revision_scope_record = commands.add_parser("record-caption-revision-scope-visual", help="record an explicit no-render visual route after native caption-revision scope audit")
     revision_scope_record.add_argument("project")

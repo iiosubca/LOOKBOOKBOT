@@ -257,7 +257,14 @@ class PipelineEngine:
         state = read_json(root / "control" / "lookbook-state.json")
         if not state.get("manual_caption_revision"):
             raise PipelineError("Целевой визуальный контроль доступен только для созданной ревизии кредитов.")
-        mode = "targeted" if targeted else "scope-only"
+        # A revision may be copied before its source has received a visual
+        # proof or review PDF. Such a source has no safe evidence to inherit,
+        # therefore its first visual gate must be complete regardless of the
+        # optional targeted-check toggle.
+        if not self._caption_revision_has_inherited_visual_baseline(root):
+            mode = "full"
+        else:
+            mode = "targeted" if targeted else "scope-only"
         self.controller.gate("set-caption-revision-visual-mode", root, "--mode", mode, timeout=120)
 
     def caption_revision_ready_message(self, project: ProjectRecord) -> str:
@@ -328,20 +335,6 @@ class PipelineEngine:
             "--caption-audit", str(relative_audit),
             timeout=120,
         )
-
-    def finish_review_before_caption_revision(self, project: ProjectRecord) -> PipelineResult:
-        """Finish the unedited master before copying a caption revision.
-
-        A correction draft may be saved while the original review PDF still
-        lacks its release evidence.  The draft itself is deliberately outside
-        the reviewed TSV, so it is safe to resume only the release/PDF stage
-        here.  Resetting the local stage marker prevents an old failed or
-        falsely-completed desktop status from skipping the controller proof.
-        """
-        if evidence_passed(project.project_dir, "pdf"):
-            return PipelineResult((), None, "Исходный PDF на проверку уже подтверждён контроллером.")
-        self.store.reset_from(project.id, "review")
-        return self.run(project, "review", continue_after=False, stop_after="review")
 
     def _provider(self, project: ProjectRecord) -> ModelProvider:
         return make_provider(
@@ -928,7 +921,8 @@ Reply with exactly one JSON object and no Markdown:
     def _visual(self, project: ProjectRecord, provider: ModelProvider) -> str:
         if evidence_passed(project.project_dir, "visual"):
             return "Визуальная проверка уже подтверждена текущим master."
-        if self._has_manual_caption_revision(project.project_dir):
+        manual_revision = self._has_manual_caption_revision(project.project_dir)
+        if manual_revision and self._caption_revision_has_inherited_visual_baseline(project.project_dir):
             if self._caption_revision_targeted_visual_enabled(project.project_dir):
                 self._run_targeted_caption_revision_visual(project, provider)
                 message = (
@@ -945,12 +939,22 @@ Reply with exactly one JSON object and no Markdown:
             if not evidence_passed(project.project_dir, "visual"):
                 raise ReviewRequired(visual_audit_blocker_message(project.project_dir))
             return message
+        if manual_revision:
+            self.log(
+                "У исходной версии нет подтверждённого visual-proof, поэтому для этой цепочки правок "
+                "выполняется полная визуальная проверка перед первым PDF."
+            )
         if isinstance(provider, CodexProvider):
             self._run_parallel_codex_visual(project, provider)
         else:
             self._run_local_visual(project, provider)
         if not evidence_passed(project.project_dir, "visual"):
             raise ReviewRequired(visual_audit_blocker_message(project.project_dir))
+        if manual_revision:
+            return (
+                "Для новой цепочки правок выполнена полная визуальная проверка: предыдущая версия "
+                "ещё не имела подтверждённого visual-proof."
+            )
         return "Все развороты подтверждены: порядок фото, ссылки, кредиты, safe area и clearance."
 
     @staticmethod
@@ -963,6 +967,8 @@ Reply with exactly one JSON object and no Markdown:
     @staticmethod
     def _caption_revision_targeted_visual_enabled(root: Path) -> bool:
         """Keep the safer targeted proof as the compatibility/default mode."""
+        if not PipelineEngine._caption_revision_has_inherited_visual_baseline(root):
+            return False
         state = read_json(root / "control" / "lookbook-state.json")
         try:
             revision = int(state.get("current_revision", 1))
@@ -970,6 +976,20 @@ Reply with exactly one JSON object and no Markdown:
             return True
         record = read_json(root / "control" / "revisions" / f"revision-{revision:02}.json")
         return str(record.get("visual_check_mode", "targeted")) != "scope-only"
+
+    @staticmethod
+    def _caption_revision_has_inherited_visual_baseline(root: Path) -> bool:
+        """Return whether the revision can safely reuse an earlier visual proof."""
+        try:
+            state = read_json(root / "control" / "lookbook-state.json")
+            revision = int(state.get("current_revision", 1))
+            record = read_json(root / "control" / "revisions" / f"revision-{revision:02}.json")
+        except (OSError, ValueError, TypeError):
+            return False
+        return all(
+            bool(str(record.get(key, "")).strip())
+            for key in ("source_visual_evidence", "source_visual_manifest", "source_visual_proof")
+        )
 
     def _record_scope_only_caption_revision_visual(self, project: ProjectRecord) -> None:
         """Accept the explicit no-render option only after native scope proof.

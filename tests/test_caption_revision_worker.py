@@ -22,7 +22,7 @@ def test_create_caption_revision_worker_reports_ready_result_without_name_error(
             return None
 
         def finish_review_before_caption_revision(self, _project) -> PipelineResult:
-            return PipelineResult((), None, "Исходный PDF уже готов.")
+            raise AssertionError("Creating a revision must not require the prior review PDF.")
 
         def begin_caption_revision(self, _project, _audit) -> None:
             return None
