@@ -5513,6 +5513,52 @@ def reconcile_gender_cover_final_exports(
     return archived
 
 
+def reconcile_final_output_attestations(project: Path, manifest: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """Repair absent or externally changed final PDFs before a resumed export.
+
+    A final manifest may outlive a file that was manually moved, removed, or
+    replaced.  A missing file is simply re-exported from the unchanged
+    approved master.  A different file is preserved under the controlled work
+    archive before it is rebuilt.  Files whose content hash still matches keep
+    their attestation even if only their filesystem timestamp changed.
+    """
+    outputs = manifest.get("outputs")
+    if not isinstance(outputs, list):
+        fail("Existing final-deliverables record has no outputs.")
+    archive_root = work_path(project) / "superseded-final-pdf" / utc_now().replace(":", "-")
+    restored_missing: list[str] = []
+    archived_changed: list[str] = []
+    for entry in outputs:
+        if not isinstance(entry, dict) or "identity" not in entry:
+            continue
+        relative = str(entry.get("path", ""))
+        destination = child_of(project, relative)
+        expected_hash = str(entry.get("sha256", ""))
+        if not destination.exists():
+            restored_missing.append(relative)
+        elif expected_hash and digest(destination) == expected_hash:
+            # A file copy can alter modified time without altering its bytes;
+            # refresh the non-semantic identity rather than blocking release.
+            entry["identity"] = identity(destination)
+            continue
+        else:
+            backup = archive_root / relative
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(destination), str(backup))
+            archived_changed.append(relative)
+        for key in ("identity", "sha256", "page_count", "rendered_samples", "verified_at"):
+            entry.pop(key, None)
+    if restored_missing or archived_changed:
+        manifest["status"] = "in_progress"
+        manifest.pop("completed_at", None)
+        manifest.pop("passed", None)
+        manifest.pop("complete", None)
+        manifest["final_attestation_reconciled_at"] = utc_now()
+        manifest["restored_missing_final_outputs"] = restored_missing
+        manifest["superseded_changed_final_outputs"] = archived_changed
+    return restored_missing, archived_changed
+
+
 def command_publish_final(args: argparse.Namespace) -> None:
     project = project_path(args.project)
     assert_project_root_clean(project)
@@ -5545,6 +5591,11 @@ def command_publish_final(args: argparse.Namespace) -> None:
             entry["image_compression"] = "jpeg"
             entry["jpeg_quality"] = "medium"
             entry["export_format"] = FINAL_EXPORT_FORMAT
+        restored_missing, archived_changed = reconcile_final_output_attestations(project, manifest)
+        if restored_missing:
+            print("FINAL OUTPUT RECOVERY: missing approved PDFs will be re-exported: " + ", ".join(restored_missing))
+        if archived_changed:
+            print("FINAL OUTPUT RECOVERY: externally changed PDFs were archived and will be rebuilt: " + ", ".join(archived_changed))
         write_json(manifest_path, manifest)
     else:
         for spec in specs:
@@ -5976,6 +6027,22 @@ def command_self_test(_: argparse.Namespace) -> None:
             fail("Self-test failure: coverless Gender PDFs were not selectively archived.")
         if old_manifest.get("status") != "in_progress" or any("identity" in item for item in old_manifest["outputs"] if item["key"] in {"male_300ppi", "female_300ppi"}):
             fail("Self-test failure: Gender cover upgrade retained stale final attestations.")
+        attestation_manifest = {"outputs": [dict(item) for item in specs], "status": "complete"}
+        for item in attestation_manifest["outputs"]:
+            if item["key"] not in {"full_10mb", "full_20mb", "full_40mb"}:
+                continue
+            destination = child_of(project, item["path"])
+            destination.write_bytes((item["key"] + " verified").encode("utf-8"))
+            item["identity"] = identity(destination)
+            item["sha256"] = digest(destination)
+        child_of(project, "master_01_10mb.pdf").unlink()
+        child_of(project, "master_01_20mb.pdf").write_bytes(b"externally changed")
+        missing_outputs, archived_outputs = reconcile_final_output_attestations(project, attestation_manifest)
+        if missing_outputs != ["master_01_10mb.pdf"] or archived_outputs != ["master_01_20mb.pdf"]:
+            fail("Self-test failure: final attestation recovery did not classify missing and changed PDFs.")
+        repaired_by_key = {item["key"]: item for item in attestation_manifest["outputs"]}
+        if "identity" in repaired_by_key["full_10mb"] or "identity" in repaired_by_key["full_20mb"] or "identity" not in repaired_by_key["full_40mb"]:
+            fail("Self-test failure: final attestation recovery retained an invalid output identity.")
         before_caption_hash = digest(captions)
         captions.write_text(
             "\t".join(CAPTION_FIELDS) + "\n"
