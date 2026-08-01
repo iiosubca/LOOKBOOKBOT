@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from lookbookbot.domain import ProviderKind
+from lookbookbot.domain import ProviderKind, StageStatus
 from lookbookbot.pipeline import (
     PipelineEngine,
     ReviewRequired,
@@ -205,6 +205,32 @@ def test_rematch_can_transfer_a_provisional_card_and_resolve_only_the_displaced_
     saved = json.loads(manifest.read_text(encoding="utf-8"))
     assert saved["reserved_candidates"] == []
     assert "W:1" in saved["attempted_candidates"]["LOOK_001"]
+
+
+def test_coverless_completed_gender_exports_are_returned_to_the_final_stage(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    project = _project(store, tmp_path)
+    control = project.project_dir / "control"
+    control.mkdir(parents=True)
+    (control / "lookbook-state.json").write_text('{"expected_pages":102}', encoding="utf-8")
+    (control / "final-deliverables.json").write_text(
+        json.dumps({
+            "status": "complete",
+            "outputs": [
+                {"key": "full_10mb", "page_range": "ALL"},
+                {"key": "full_20mb", "page_range": "ALL"},
+                {"key": "full_40mb", "page_range": "ALL"},
+                {"key": "male_300ppi", "page_range": "4-49"},
+                {"key": "female_300ppi", "page_range": "2-101"},
+            ],
+        }),
+        encoding="utf-8",
+    )
+    store.set_stage(project.id, "final", StageStatus.PASSED)
+    engine = PipelineEngine(store)
+
+    assert engine.invalidate_coverless_gender_final_exports(project)
+    assert store.stage_rows(project.id)["final"]["status"] == StageStatus.PENDING.value
 
 
 def test_swap_batches_are_atomic_and_limited_to_five() -> None:

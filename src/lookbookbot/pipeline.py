@@ -1288,6 +1288,33 @@ Reply with exactly one JSON object and no Markdown:
             raise PipelineError("Контроллер не подтвердил комплект финальных PDF.")
         return "Финальные 10mb/20mb/40mb и Gender M/W PDF записаны и проверены."
 
+    def invalidate_coverless_gender_final_exports(self, project: ProjectRecord) -> bool:
+        """Make an older coverless Gender plan eligible for a safe final-only upgrade."""
+        root = project.project_dir
+        try:
+            state = read_json(root / "control" / "lookbook-state.json")
+            manifest = read_json(root / "control" / "final-deliverables.json")
+            expected_last_page = int(state["expected_pages"])
+        except (OSError, ValueError, TypeError, KeyError):
+            return False
+        outputs = manifest.get("outputs")
+        if not isinstance(outputs, list):
+            return False
+        by_key = {str(item.get("key", "")): item for item in outputs if isinstance(item, dict)}
+        gender = [by_key.get("male_300ppi"), by_key.get("female_300ppi")]
+        if any(not item for item in gender):
+            return False
+        missing_covers = any(
+            not _page_range_contains(str(item.get("page_range", "")), 1)
+            or not _page_range_contains(str(item.get("page_range", "")), expected_last_page)
+            for item in gender
+        )
+        if not missing_covers:
+            return False
+        self.store.reset_from(project.id, "final")
+        self.log("Обнаружены прежние Gender PDF без общих обложек. Подготовлен безопасный перевыпуск только Gender M/W.")
+        return True
+
     def _delegate_codex(self, project: ProjectRecord, provider: CodexProvider, stage: str) -> None:
         prompts = {
             "credits_map": """Заверши только визуальное сопоставление кредитов текущего проекта по встроенному протоколу LOOKBOOKBOT. PDF-порядок уже находится в control/work/look-register.tsv. Если существует control/work/ui-overrides/caption-overrides.json, это вручную подтверждённые оператором выборы Excel: каждый такой LOOK_### обязан получить exact alternative proof, быть реально просмотрен на нём, затем выбран только через штатный select-alternatives в безопасной группе не более пяти связанных LOOK_###. Никогда не заменяй этот выбор автоматическим seed. После выбора перерисуй обычные трёхпанельные proof cards, просмотри их партиями не более пяти и подтверди только реально просмотренные совпадения. Закончи с нулём PENDING. Не переходи к init или InDesign.""",
@@ -2220,6 +2247,22 @@ def _parse_codex_rematch_candidate(
         raise ProviderError(f"{expected_look}: Codex selected a card outside the supplied candidate board.")
     _safe_confirmation_note(str(payload.get("note", "")))
     return selected
+
+
+def _page_range_contains(page_range: str, page: int) -> bool:
+    """Return whether an Adobe-style comma/range page list includes one page."""
+    for token in str(page_range).split(","):
+        value = token.strip()
+        if not value:
+            continue
+        if "-" not in value:
+            if value.isdigit() and int(value) == page:
+                return True
+            continue
+        start, end = (part.strip() for part in value.split("-", 1))
+        if start.isdigit() and end.isdigit() and int(start) <= page <= int(end):
+            return True
+    return False
 
 
 def _credit_override_batches(

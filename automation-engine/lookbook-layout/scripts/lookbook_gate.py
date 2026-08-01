@@ -4830,7 +4830,7 @@ def compact_page_range(pages: list[int]) -> str:
 
 
 def final_output_specs(project: Path, state: dict[str, Any]) -> list[dict[str, Any]]:
-    """Build the five exact post-approval output specifications from frozen data."""
+    """Build the five exact post-approval outputs, retaining both common covers in Gender PDFs."""
     master = state_artifact(project, state, "master")
     registry = validate_registry(state_artifact(project, state, "registry"), int(state["look_count"]), state_artifact(project, state, "hires"))
     mapping = csv_rows(state_artifact(project, state, "caption_map"), CAPTION_MAP_FIELDS)
@@ -4844,11 +4844,17 @@ def final_output_specs(project: Path, state: dict[str, Any]) -> list[dict[str, A
         if look is None or gender not in gender_pages:
             fail(f"{row['look_id']}: caption-map excel_sheet must be M or W for gender export.")
         gender_pages[gender].extend([int(look["indd_left_page"]), int(look["indd_right_page"])])
+    expected_pages = int(state["expected_pages"])
+    front_cover, back_cover = 1, expected_pages
     for gender, pages in gender_pages.items():
         if not pages:
             fail(f"Gender export has no {gender} looks; both M and W PDFs are required.")
+        # A Gender edition is a complete editorial publication, not a bare
+        # selection of content pages: retain the shared front and back covers,
+        # then include only the corresponding two-page look spreads between
+        # them. ``compact_page_range`` preserves their original PDF order.
+        gender_pages[gender] = [front_cover, *pages, back_cover]
     stem = master.stem
-    expected_pages = int(state["expected_pages"])
     return [
         {"key": "full_10mb", "path": f"{stem}_10mb.pdf", "raster_ppi": 120, "page_range": "ALL", "expected_pages": expected_pages, "image_compression": "jpeg", "jpeg_quality": "medium", "export_format": FINAL_EXPORT_FORMAT},
         {"key": "full_20mb", "path": f"{stem}_20mb.pdf", "raster_ppi": 220, "page_range": "ALL", "expected_pages": expected_pages, "image_compression": "jpeg", "jpeg_quality": "medium", "export_format": FINAL_EXPORT_FORMAT},
@@ -5444,6 +5450,69 @@ def supersede_legacy_final_exports(project: Path, manifest: dict[str, Any]) -> l
     return archived
 
 
+def reconcile_gender_cover_final_exports(
+    project: Path,
+    manifest: dict[str, Any],
+    specs: list[dict[str, Any]],
+) -> list[str]:
+    """Safely upgrade completed Gender PDFs when their common covers were absent.
+
+    The normal full PDFs remain byte-for-byte valid.  Only the two Gender
+    outputs whose page ranges change are moved to the project-local archive,
+    then re-exported from the same approved master.  This allows an existing
+    approved lookbook to receive the corrected editions without a new review
+    or any destructive overwrite.
+    """
+    spec_keys = ("key", "path", "raster_ppi", "page_range", "expected_pages")
+    previous = manifest.get("outputs")
+    if not isinstance(previous, list):
+        fail("Existing final-deliverables record has no output plan.")
+    previous_by_key = {str(entry.get("key", "")): entry for entry in previous if isinstance(entry, dict)}
+    planned_by_key = {str(entry.get("key", "")): entry for entry in specs}
+    if set(previous_by_key) != set(planned_by_key):
+        fail("Existing final-deliverables plan has a different output set.")
+
+    changed = [
+        key for key, spec in planned_by_key.items()
+        if {field: previous_by_key[key].get(field) for field in spec_keys}
+        != {field: spec.get(field) for field in spec_keys}
+    ]
+    if not changed:
+        return []
+    if any(key not in {"male_300ppi", "female_300ppi"} for key in changed):
+        fail("Existing final-deliverables plan does not match current filenames or general PDF settings.")
+
+    archive_root = work_path(project) / "superseded-final-pdf" / utc_now().replace(":", "-")
+    archived: list[str] = []
+    reconciled: list[dict[str, Any]] = []
+    for spec in specs:
+        key = str(spec["key"])
+        old = previous_by_key[key]
+        if key not in changed:
+            preserved = dict(old)
+            preserved.update(spec)
+            reconciled.append(preserved)
+            continue
+        relative = str(old["path"])
+        destination = child_of(project, relative)
+        if destination.exists():
+            backup = archive_root / relative
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(destination), str(backup))
+            archived.append(relative)
+        # Start a fresh attestation for the changed page range.  The remaining
+        # PDFs retain their existing verified identities.
+        reconciled.append(dict(spec))
+    manifest["outputs"] = reconciled
+    manifest["status"] = "in_progress"
+    manifest.pop("completed_at", None)
+    manifest.pop("passed", None)
+    manifest.pop("complete", None)
+    manifest["gender_cover_upgrade_at"] = utc_now()
+    manifest["superseded_gender_exports"] = archived
+    return archived
+
+
 def command_publish_final(args: argparse.Namespace) -> None:
     project = project_path(args.project)
     assert_project_root_clean(project)
@@ -5466,14 +5535,9 @@ def command_publish_final(args: argparse.Namespace) -> None:
             fail("Existing final-deliverables record belongs to another master or session.")
         if manifest.get("release_evidence_sha256") != digest(evidence_file(project, "release")):
             fail("Release evidence changed after final publishing began.")
-        # Earlier releases used a different export profile. Their page plan
-        # remains valid, but each output must be rebuilt when either the PDF
-        # engine or requested JPEG quality changes.
-        spec_keys = ("key", "path", "raster_ppi", "page_range", "expected_pages")
-        existing_specs = [{key: entry.get(key) for key in spec_keys} for entry in manifest.get("outputs", [])]
-        planned_specs = [{key: entry.get(key) for key in spec_keys} for entry in specs]
-        if existing_specs != planned_specs:
-            fail("Existing final-deliverables plan does not match current gender mapping or required filenames.")
+        gender_archived = reconcile_gender_cover_final_exports(project, manifest, specs)
+        if gender_archived:
+            print("GENDER COVER UPGRADE: archived coverless Gender PDFs and will rebuild them with both common covers: " + ", ".join(gender_archived))
         archived = supersede_legacy_final_exports(project, manifest)
         if archived:
             print("FINAL EXPORT UPGRADE: archived prior interactive-PDF files and will rebuild them as Adobe PDF (Print): " + ", ".join(archived))
@@ -5889,12 +5953,29 @@ def command_self_test(_: argparse.Namespace) -> None:
             ("full_10mb", "master_01_10mb.pdf", 120, "ALL", 6),
             ("full_20mb", "master_01_20mb.pdf", 220, "ALL", 6),
             ("full_40mb", "master_01_40mb.pdf", 300, "ALL", 6),
-            ("male_300ppi", "Gender/master_01_M.pdf", 300, "4-5", 2),
-            ("female_300ppi", "Gender/master_01_W.pdf", 300, "2-3", 2),
+            ("male_300ppi", "Gender/master_01_M.pdf", 300, "1,4-6", 4),
+            ("female_300ppi", "Gender/master_01_W.pdf", 300, "1-3,6", 4),
         ]
         actual_specs = [(item["key"], item["path"], item["raster_ppi"], item["page_range"], item["expected_pages"]) for item in specs]
         if actual_specs != expected_specs:
             fail(f"Self-test failure: final output plan was {actual_specs!r}.")
+        old_gender_specs = [dict(item) for item in specs]
+        for item in old_gender_specs:
+            if item["key"] == "male_300ppi":
+                item.update({"page_range": "4-5", "expected_pages": 2, "identity": {"path": "old"}})
+            elif item["key"] == "female_300ppi":
+                item.update({"page_range": "2-3", "expected_pages": 2, "identity": {"path": "old"}})
+        for item in old_gender_specs:
+            if item["key"] in {"male_300ppi", "female_300ppi"}:
+                destination = child_of(project, item["path"])
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(b"old gender PDF")
+        old_manifest = {"outputs": old_gender_specs, "status": "complete", "completed_at": utc_now()}
+        archived_gender = reconcile_gender_cover_final_exports(project, old_manifest, specs)
+        if sorted(archived_gender) != ["Gender/master_01_M.pdf", "Gender/master_01_W.pdf"]:
+            fail("Self-test failure: coverless Gender PDFs were not selectively archived.")
+        if old_manifest.get("status") != "in_progress" or any("identity" in item for item in old_manifest["outputs"] if item["key"] in {"male_300ppi", "female_300ppi"}):
+            fail("Self-test failure: Gender cover upgrade retained stale final attestations.")
         before_caption_hash = digest(captions)
         captions.write_text(
             "\t".join(CAPTION_FIELDS) + "\n"

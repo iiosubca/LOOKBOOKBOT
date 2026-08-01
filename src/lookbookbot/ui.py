@@ -711,6 +711,10 @@ class MainWindow(QMainWindow):
         if index >= 0:
             self.provider_combo.setCurrentIndex(index)
         self.model_combo.setCurrentText(self.project.model)
+        # Version 0.2.57 adds the shared front/back covers to Gender PDFs.
+        # Older completed projects are safely returned to the final-only stage
+        # so the controller can archive and replace just those two outputs.
+        PipelineEngine(self.store, log=self._append_log).invalidate_coverless_gender_final_exports(self.project)
         self.approved.blockSignals(True)
         self.approved.setChecked(self.store.is_approved(self.project.id))
         self.approved.blockSignals(False)
