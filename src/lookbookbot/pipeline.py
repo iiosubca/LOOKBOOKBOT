@@ -257,6 +257,22 @@ class PipelineEngine:
         state = read_json(root / "control" / "lookbook-state.json")
         if not state.get("manual_caption_revision"):
             raise PipelineError("Целевой визуальный контроль доступен только для созданной ревизии кредитов.")
+        try:
+            revision = int(state.get("current_revision", 1))
+            bound_revision = int(state.get("structure_revision", 0))
+        except (TypeError, ValueError) as error:
+            raise PipelineError(f"Некорректный маркер структуры ревизии: {error}") from error
+        if revision > 1 and bound_revision != revision:
+            # A copied INDD has new document-local item IDs. Rebind the
+            # already-proven layout before configuring later visual work; do
+            # not route the copy through the four-page structure constructor.
+            self._bind_copied_revision_structure(project, "captions")
+            self.store.confirm_prior_stages(
+                project.id,
+                "captions",
+                reason="Контроллер перепривязал структуру скопированной INDD-версии.",
+            )
+            self.store.reset_from(project.id, "captions")
         # A revision may be copied before its source has received a visual
         # proof or review PDF. Such a source has no safe evidence to inherit,
         # therefore its first visual gate must be complete regardless of the
@@ -359,16 +375,23 @@ class PipelineEngine:
                 # The controller will provide the authoritative diagnostic if
                 # this marker is malformed; do not silently skip recovery.
                 recovery_pending = True
+        if (
+            not recovery_pending
+            and master_name
+            and (root / master_name).is_file()
+            and structure_revision != revision
+        ):
+            # Version 0.2.46 did not yet write a marker. Its legacy archive is
+            # still enough to distinguish an interrupted missing-master
+            # recovery from an ordinary newly copied revision, which is
+            # expected to await the separate read-only rebind.
+            history = root / "control" / "history"
+            recovery_pending = any(history.glob(f"missing-master-recovery-{revision:02}-*"))
         # A legacy interrupted recovery can already have recreated the INDD
         # while its structure revision still points at the old version.  It
         # must resume the recovery controller path instead of silently
         # continuing from the template-only structure gate.
-        if (
-            master_name
-            and (root / master_name).is_file()
-            and structure_revision == revision
-            and not recovery_pending
-        ):
+        if master_name and (root / master_name).is_file() and not recovery_pending:
             return
         if master_name and (root / master_name).is_file():
             self.log("Продолжаю прерванное восстановление текущей INDD-версии без пересборки разворотов.")
@@ -376,6 +399,14 @@ class PipelineEngine:
             self.log("Текущая INDD-версия отсутствует; восстанавливаю её из подписанной предыдущей версии.")
         self.controller.gate("recover-missing-caption-revision-master", root, timeout=180)
         self.store.set_approved(project.id, False)
+        # The controller just proved map through images against the recovered
+        # master. Clear any stale desktop-only failure (notably the old
+        # template-structure attempt) before returning to captions.
+        self.store.confirm_prior_stages(
+            project.id,
+            "captions",
+            reason="Контроллер подтвердил восстановленную версию до этапа кредитов.",
+        )
         self.store.reset_from(project.id, "captions")
         restored = self.run(project, "captions", continue_after=False, stop_after="captions")
         if restored.stopped_at:

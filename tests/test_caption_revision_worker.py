@@ -31,7 +31,7 @@ def test_create_caption_revision_worker_reports_ready_result_without_name_error(
             return None
 
         def set_caption_revision_visual_mode(self, _project, *, targeted: bool) -> None:
-            assert targeted is True
+            raise AssertionError("Creating a revision must configure visual mode only after the credits pass.")
 
         def run(self, _project, _start_key, *, continue_after: bool, stop_after: str) -> PipelineResult:
             assert continue_after is False

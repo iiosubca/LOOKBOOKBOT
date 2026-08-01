@@ -136,7 +136,6 @@ class PipelineWorker(QObject):
                 engine.recover_missing_caption_revision_master(project)
                 engine.prepare_caption_revision(project, Path(self.caption_revision_audit))
                 engine.begin_caption_revision(project, Path(self.caption_revision_audit))
-                engine.set_caption_revision_visual_mode(project, targeted=self.targeted_caption_visual)
                 if self.caption_revision_action == "create":
                     result = engine.run(project, "captions", continue_after=False, stop_after="captions")
                     if not result.stopped_at:

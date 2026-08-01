@@ -262,6 +262,25 @@ class StateStore:
                     (StageStatus.PENDING.value, project_id, key),
                 )
 
+    def confirm_prior_stages(self, project_id: str, stage_key: str, *, reason: str) -> None:
+        """Align the desktop timeline with controller-proofed earlier gates."""
+        keys = [stage.key for stage in STAGES]
+        stop = keys.index(stage_key)
+        now = utc_now()
+        details = json.dumps({"controller_reconciled": True, "reason": reason}, ensure_ascii=False)
+        with self.connect() as db:
+            for key in keys[:stop]:
+                db.execute(
+                    """
+                    UPDATE stages
+                    SET status=?, started_at=COALESCE(started_at, ?), completed_at=?,
+                        error='', details_json=?
+                    WHERE project_id=? AND stage_key=?
+                    """,
+                    (StageStatus.PASSED.value, now, now, details, project_id, key),
+                )
+            db.execute("UPDATE projects SET updated_at = ? WHERE id = ?", (now, project_id))
+
     def replace_looks(self, project_id: str, rows: list[dict[str, str]]) -> None:
         with self.connect() as db:
             db.execute("DELETE FROM looks WHERE project_id = ?", (project_id,))

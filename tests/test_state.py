@@ -25,6 +25,28 @@ def test_state_resumes_first_incomplete_stage(tmp_path: Path) -> None:
     assert store.first_incomplete_stage(project.id) == "looks"
 
 
+def test_controller_reconciliation_clears_stale_prior_failure(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    project = store.save_project(
+        name="TSUM_FS-0260830",
+        source_dir=tmp_path / "sources",
+        output_root=tmp_path,
+        project_dir=tmp_path / "TSUM_FS-0260830",
+        show_date=date(2026, 8, 30),
+        provider=ProviderKind.CODEX,
+        model="",
+    )
+    store.set_stage(project.id, "structure", StageStatus.FAILED, error="old template failure")
+
+    store.confirm_prior_stages(project.id, "captions", reason="controller proof")
+
+    rows = store.stage_rows(project.id)
+    for key in ("prepare", "looks", "credits_map", "map", "structure", "dates", "frames", "images"):
+        assert rows[key]["status"] == StageStatus.PASSED.value
+        assert rows[key]["error"] == ""
+    assert store.first_incomplete_stage(project.id) == "captions"
+
+
 def test_manual_rows_are_persistent(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state.db")
     project = store.save_project(
@@ -41,4 +63,3 @@ def test_manual_rows_are_persistent(tmp_path: Path) -> None:
 
     assert store.looks(project.id)[0]["left_filename"] == "new-full.jpg"
     assert store.looks(project.id)[0]["status"] == "manual"
-

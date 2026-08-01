@@ -68,7 +68,11 @@ def test_unreviewed_caption_revision_uses_a_full_visual_proof(tmp_path: Path, mo
     revisions = root / "control" / "revisions"
     revisions.mkdir(parents=True)
     (root / "control" / "lookbook-state.json").write_text(
-        json.dumps({"manual_caption_revision": "control/revisions/manual.json", "current_revision": 2}),
+            json.dumps({
+                "manual_caption_revision": "control/revisions/manual.json",
+                "current_revision": 2,
+                "structure_revision": 2,
+            }),
         encoding="utf-8",
     )
     (revisions / "revision-02.json").write_text(

@@ -150,6 +150,9 @@ def test_pending_recovery_marker_replays_captions_before_another_revision(tmp_pa
         def set_approved(self, *args) -> None:
             self.calls.append(("approved", *args))
 
+        def confirm_prior_stages(self, *args, **kwargs) -> None:
+            self.calls.append(("confirmed", *args))
+
         def reset_from(self, *args) -> None:
             self.calls.append(("reset", *args))
 
@@ -169,5 +172,30 @@ def test_pending_recovery_marker_replays_captions_before_another_revision(tmp_pa
     engine.recover_missing_caption_revision_master(SimpleNamespace(id="project", project_dir=project_dir))
 
     assert controller.calls[0][0] == "recover-missing-caption-revision-master"
+    assert ("confirmed", "project", "captions") in store.calls
     assert ("reset", "project", "captions") in store.calls
     assert json.loads(marker.read_text(encoding="utf-8"))["status"] == "captions-verified"
+
+
+def test_ordinary_copied_revision_is_not_mistaken_for_missing_master_recovery(tmp_path: Path) -> None:
+    project_dir = tmp_path / "project"
+    control = project_dir / "control"
+    control.mkdir(parents=True)
+    master = project_dir / "TSUM_FS-0260830_LB_WA_03.indd"
+    master.write_bytes(b"ordinary copied revision")
+    (control / "lookbook-state.json").write_text(
+        json.dumps({"master": master.name, "current_revision": 3, "structure_revision": 2}),
+        encoding="utf-8",
+    )
+
+    class Store:
+        def set_approved(self, *_args) -> None:
+            raise AssertionError("ordinary revision must not enter missing-master recovery")
+
+    engine = PipelineEngine(Store())  # type: ignore[arg-type]
+    engine.controller = SimpleNamespace(
+        gate=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected recovery"))
+    )
+    engine.run = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected captions replay"))  # type: ignore[method-assign]
+
+    engine.recover_missing_caption_revision_master(SimpleNamespace(id="project", project_dir=project_dir))
