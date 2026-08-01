@@ -1692,7 +1692,15 @@ function Invoke-Gate([string]$ProjectPath, [string]$GateName) {
             return
         }
         if ($GateName -eq 'release') {
-            $compositionSources = Get-CompositionImageSources $control $registry
+            # A correction revision may explicitly choose the native
+            # scope-only route before its review PDF.  That route proves that
+            # the registry sources and every unchanged image link are intact,
+            # but deliberately does not create a visual composition plan.
+            # Release must validate the same frozen registry links directly
+            # instead of treating the absent optional plan as an error.
+            $visualEvidence = Read-Json (Join-Path $control 'evidence\visual.json')
+            $scopeOnly = ([string]$visualEvidence.mode -eq 'caption-revision-scope-only')
+            $compositionSources = if ($scopeOnly) { $null } else { Get-CompositionImageSources $control $registry }
             $captionGeometryPath = Join-Path $control 'evidence\caption-geometry.json'
             $visualCaptionCorrectionPath = Join-Path $control 'visual\clearance-correction-plan.json'
             $visualCaptionCorrections = Get-VisualCaptionCorrections $visualCaptionCorrectionPath $state

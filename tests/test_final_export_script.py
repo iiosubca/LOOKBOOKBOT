@@ -32,3 +32,11 @@ def test_final_export_uses_adobe_print_pdf_jpeg_downsampling() -> None:
     assert "$Preferences.ColorBitmapSamplingDPI = $Resolution" in source
     assert "$Preferences.GrayscaleBitmapSamplingDPI = $Resolution" in source
     assert "$COMPRESSION_QUALITY_MEDIUM = 1701727588" in source
+
+
+def test_scope_only_review_release_does_not_require_optional_composition_plan() -> None:
+    source = SCRIPT.read_text(encoding="utf-8")
+
+    assert "$scopeOnly = ([string]$visualEvidence.mode -eq 'caption-revision-scope-only')" in source
+    assert "$compositionSources = if ($scopeOnly) { $null } else { Get-CompositionImageSources $control $registry }" in source
+    assert "Assert-Images $doc $registry $compositionSources" in source
