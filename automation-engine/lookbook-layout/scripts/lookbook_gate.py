@@ -5114,8 +5114,14 @@ def command_begin_revision(args: argparse.Namespace) -> None:
         # accepted. A revision created before that point has no visual
         # baseline, so its own later visual gate will be full rather than
         # pretending to be a targeted continuation.
-        if load_evidence(project, state, "visual") is not None:
-            prior_visual_manifest = validate_visual_proof(project, state)
+        prior_visual = load_evidence(project, state, "visual")
+        if prior_visual is not None:
+            # A prior no-render caption revision has valid, native scope-only
+            # evidence but intentionally owns no current-master rendered
+            # proof/manifest. It is a safe source for the next revision, just
+            # not a visual baseline that a targeted check may inherit.
+            if prior_visual.get("mode") != "caption-revision-scope-only":
+                prior_visual_manifest = validate_visual_proof(project, state)
     elif current_gate(project, state) is not None:
         fail("A revision can begin only after the current review PDF has passed every gate and complete has been run.")
     notes = args.notes.strip()

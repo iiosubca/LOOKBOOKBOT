@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 from argparse import Namespace
 from pathlib import Path
@@ -68,3 +69,49 @@ def test_post_final_revision_archives_manifest_without_removing_prior_pdfs(tmp_p
     assert json.loads(archived[0].read_text(encoding="utf-8"))["status"] == "complete"
     revision = json.loads((control / "revisions" / "revision-02.json").read_text(encoding="utf-8"))
     assert revision["superseded_final_publication"].startswith("control/history/")
+
+
+def test_scope_only_caption_revision_can_start_the_next_caption_revision(tmp_path: Path, monkeypatch) -> None:
+    """A no-render review has no manifest to pass into a later revision."""
+    project = tmp_path / "TSUM_FS-0260809"
+    control = project / "control"
+    work = control / "work"
+    control.mkdir(parents=True)
+    (control / "visual").mkdir()
+    master = project / "TSUM_FS-0260809_LB_WA_02.indd"
+    master.write_bytes(b"scope-only reviewed master")
+    captions = work / "caption-data.tsv"
+    captions.parent.mkdir(parents=True)
+    captions.write_text(
+        "look_id\ttype\tbrand\tprice\tarticle\nLOOK_001\tОчки\tBRAND\t100 ₽\t0001\n",
+        encoding="utf-8",
+    )
+    audit = work / "manual-caption-revisions" / "draft.json"
+    audit.parent.mkdir(parents=True)
+    product = {"type": "Очки", "brand": "BRAND", "price": "100 ₽", "article": "0001"}
+    changed = {"type": "Очки", "brand": "BRAND", "price": "200 ₽", "article": "0002"}
+    gate.write_json(audit, {
+        "schema": "lookbookbot-caption-revision-v1", "look_ids": ["LOOK_001"],
+        "before_caption_data_sha256": hashlib.sha256(captions.read_bytes()).hexdigest(),
+        "after_caption_data_sha256": "pending", "changes": [{"look_id": "LOOK_001", "before": [product], "after": [changed]}],
+    })
+    state = {"master": master.name, "current_revision": 2, "captions": str(captions.relative_to(project))}
+    monkeypatch.setattr(gate, "load_state", lambda _project: state)
+    monkeypatch.setattr(gate, "restore_caption_revision_draft_baseline", lambda *_args: False)
+    monkeypatch.setattr(gate, "_validate_caption_revision_preconditions", lambda *_args: {})
+    monkeypatch.setattr(gate, "load_evidence", lambda *_args: {"mode": "caption-revision-scope-only"})
+    monkeypatch.setattr(gate, "current_gate", lambda *_args: "captions")
+
+    def unexpected_manifest(*_args):
+        raise AssertionError("scope-only evidence must not require visual proof manifest")
+
+    monkeypatch.setattr(gate, "validate_visual_proof", unexpected_manifest)
+
+    gate.command_begin_revision(Namespace(
+        project=str(project), reset_from="captions", caption_audit=str(audit.relative_to(project)),
+        notes="Правка кредитов после scope-only review PDF.",
+    ))
+
+    record = json.loads((control / "revisions" / "revision-03.json").read_text(encoding="utf-8"))
+    assert record["visual_baseline"] == "not-yet-confirmed"
+    assert record["visual_check_mode"] == "full"
