@@ -4823,11 +4823,20 @@ def revision_target(source: Path) -> tuple[int, Path]:
 
 
 def archive_for_revision(project: Path, revision: int, reset_from: str = "visual") -> Path:
+    """Move superseded controller evidence into immutable revision history.
+
+    A completed final publication is an immutable release of the old INDD
+    version, not a lock on the project. The final PDFs keep their revision
+    number in their filenames and therefore remain in place. Only their
+    controller manifest moves into history so that the next revision master
+    receives an independent publication record and cannot overwrite them.
+    """
     control = control_path(project)
     archive = control / "history" / f"revision-{revision:02}-{utc_now().replace(':', '-') }"
     relative_paths = [
         "visual", "evidence/visual.json", "evidence/release.json", "evidence/pdf.json",
         "arms/visual.json", "arms/release.json", "arms/pdf.json", "progress/composition.json", "export-permit.json",
+        "final-deliverables.json",
     ]
     if reset_from == "captions":
         relative_paths.extend((
@@ -4916,8 +4925,6 @@ def command_begin_revision(args: argparse.Namespace) -> None:
         prior_visual_manifest = read_json(visual_proof_manifest_path(project))
     elif current_gate(project, state) is not None:
         fail("A revision can begin only after the current review PDF has passed every gate and complete has been run.")
-    if final_deliverables_file(project).exists():
-        fail("This version is already approved and published. Start a new requested lookbook revision instead of changing an approved master.")
     notes = args.notes.strip()
     if len(notes) < 8:
         fail("--notes must record the received page-by-page correction request.")
@@ -4970,6 +4977,12 @@ def command_begin_revision(args: argparse.Namespace) -> None:
         "master": identity(target), "corrections": notes, "archived_proof": str(archive), "reset_from": reset_from,
         "manual_caption_revision": str(archived_audit.relative_to(project)) if caption_audit is not None else None,
     }
+    archived_final = archive / "final-deliverables.json"
+    if archived_final.is_file():
+        # The old files stay available under their original _NN names. This
+        # record simply makes their release manifest immutable and lets the
+        # new master publish a separately verified final set after reapproval.
+        revision_record["superseded_final_publication"] = _relative_project_path(project, archived_final)
     if caption_audit is not None:
         assert prior_visual_manifest is not None
         archived_visual_evidence = archive / "evidence" / "visual.json"
