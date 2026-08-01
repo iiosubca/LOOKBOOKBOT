@@ -272,15 +272,24 @@ class PipelineEngine:
                 "captions",
                 reason="Контроллер перепривязал структуру скопированной INDD-версии.",
             )
+            # ``confirm_prior_stages`` updates the durable store directly.
+            # Mirror that reconciliation through the progress callback as
+            # well, otherwise an already-correct desktop timeline can keep
+            # stale white squares until the next application reload.
+            for key in ("prepare", "looks", "credits_map", "map", "structure", "dates", "frames", "images"):
+                self.progress(key, StageStatus.PASSED, "Контроллер подтвердил сохранённую INDD-версию.")
             self.store.reset_from(project.id, "captions")
-        # A revision may be copied before its source has received a visual
-        # proof or review PDF. Such a source has no safe evidence to inherit,
-        # therefore its first visual gate must be complete regardless of the
-        # optional targeted-check toggle.
-        if not self._caption_revision_has_inherited_visual_baseline(root):
-            mode = "full"
+        # An unchecked option explicitly means that no visual render/review is
+        # requested before the review PDF. The controller will still run its
+        # native scope audit (links, unchanged spreads and credit overflow).
+        # A targeted render is possible only when a reviewed visual baseline
+        # exists; otherwise an explicitly requested check becomes full.
+        if not targeted:
+            mode = "scope-only"
+        elif self._caption_revision_has_inherited_visual_baseline(root):
+            mode = "targeted"
         else:
-            mode = "targeted" if targeted else "scope-only"
+            mode = "full"
         self.controller.gate("set-caption-revision-visual-mode", root, "--mode", mode, timeout=120)
 
     def caption_revision_ready_message(self, project: ProjectRecord) -> str:
@@ -407,6 +416,8 @@ class PipelineEngine:
             "captions",
             reason="Контроллер подтвердил восстановленную версию до этапа кредитов.",
         )
+        for key in ("prepare", "looks", "credits_map", "map", "structure", "dates", "frames", "images"):
+            self.progress(key, StageStatus.PASSED, "Контроллер подтвердил восстановленную INDD-версию.")
         self.store.reset_from(project.id, "captions")
         restored = self.run(project, "captions", continue_after=False, stop_after="captions")
         if restored.stopped_at:
@@ -1007,28 +1018,36 @@ Reply with exactly one JSON object and no Markdown:
         if evidence_passed(project.project_dir, "visual"):
             return "Визуальная проверка уже подтверждена текущим master."
         manual_revision = self._has_manual_caption_revision(project.project_dir)
-        if manual_revision and self._caption_revision_has_inherited_visual_baseline(project.project_dir):
-            if self._caption_revision_targeted_visual_enabled(project.project_dir):
+        if manual_revision:
+            if not self._caption_revision_targeted_visual_enabled(project.project_dir):
+                self._record_scope_only_caption_revision_visual(project)
+                message = (
+                    "Проверка изменённых луков отключена для этой ревизии. "
+                    "Перед PDF выполнен только native scope-аудит структуры, ссылок и кредитов — без визуального рендера."
+                )
+            elif self._caption_revision_has_inherited_visual_baseline(project.project_dir):
                 self._run_targeted_caption_revision_visual(project, provider)
                 message = (
                     "После правки кредитов перепроверены только изменённые луки; "
                     "остальные подтверждены сравнением с предыдущей версией."
                 )
             else:
-                self._record_scope_only_caption_revision_visual(project)
-                message = (
-                    "Целевая визуальная проверка изменённых луков отключена для этой ревизии. "
-                    "Перед PDF выполнен native scope-аудит: неизменность остальных разворотов, "
-                    "ссылки изображений и отсутствие переполнения кредитов подтверждены."
+                self.log(
+                    "Для исходной версии нет наследуемого visual-proof, поэтому включённая проверка требует полного visual-прохода."
+                )
+                if isinstance(provider, CodexProvider):
+                    self._run_parallel_codex_visual(project, provider)
+                else:
+                    self._run_local_visual(project, provider)
+                if not evidence_passed(project.project_dir, "visual"):
+                    raise ReviewRequired(visual_audit_blocker_message(project.project_dir))
+                return (
+                    "Для этой цепочки правок выполнена полная визуальная проверка: "
+                    "включённая проверка не могла использовать наследуемый visual-proof."
                 )
             if not evidence_passed(project.project_dir, "visual"):
                 raise ReviewRequired(visual_audit_blocker_message(project.project_dir))
             return message
-        if manual_revision:
-            self.log(
-                "У исходной версии нет подтверждённого visual-proof, поэтому для этой цепочки правок "
-                "выполняется полная визуальная проверка перед первым PDF."
-            )
         if isinstance(provider, CodexProvider):
             self._run_parallel_codex_visual(project, provider)
         else:

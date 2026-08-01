@@ -567,10 +567,10 @@ class MainWindow(QMainWindow):
             "Включено: перед PDF проверяются только изменённые луки.\n"
             "Выключено: перед PDF выполняется только native scope-аудит — без нового визуального рендера изменённых луков."
         )
-        self.create_caption_revision_button = QPushButton("СОЗДАТЬ НОВУЮ ВЕРСИЮ")
+        self.create_caption_revision_button = QPushButton("НОВАЯ ВЕРСИЯ")
         self.create_caption_revision_button.setObjectName("Primary")
         self.create_caption_revision_button.clicked.connect(self._create_caption_revision)
-        self.export_correction_button = QPushButton("НАПИСАТЬ PDF ВЫБРАННОЙ ВЕРСИИ")
+        self.export_correction_button = QPushButton("НАПИСАТЬ PDF")
         self.export_correction_button.clicked.connect(self._export_caption_revision_pdf)
         buttons.addWidget(self.save_correction_button)
         editor_layout.addWidget(self.targeted_caption_visual_check)

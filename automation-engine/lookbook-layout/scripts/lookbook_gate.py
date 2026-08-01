@@ -1018,19 +1018,23 @@ def validate_caption_revision_scope_only_visual(project: Path, state: dict[str, 
         or int(scope.get("unchanged_count", -1)) != int(state["look_count"]) - len(record["changed_looks"])
     ):
         fail("Native revision scope audit does not prove the requested scope-only PDF release.")
-    for label in ("source_visual_evidence", "source_visual_manifest", "source_visual_proof"):
-        raw = str(record.get(label, ""))
-        source = child_of(project, raw)
-        if not raw or not source.is_file() or record.get(f"{label}_sha256") != digest(source):
-            fail(f"Scope-only visual evidence lost its inherited {label.replace('_', ' ')}.")
-    if (
-        evidence.get("changed_looks") != record["changed_looks"]
-        or evidence.get("revision_scope_sha256") != digest(scope_path)
-        or evidence.get("source_visual_evidence_sha256") != record["source_visual_evidence_sha256"]
-        or evidence.get("source_visual_manifest_sha256") != record["source_visual_manifest_sha256"]
-        or evidence.get("source_visual_proof_sha256") != record["source_visual_proof_sha256"]
-    ):
+    inherited = all(str(record.get(label, "")).strip() for label in (
+        "source_visual_evidence", "source_visual_manifest", "source_visual_proof",
+    ))
+    if inherited:
+        for label in ("source_visual_evidence", "source_visual_manifest", "source_visual_proof"):
+            source = child_of(project, str(record.get(label, "")))
+            if not source.is_file() or record.get(f"{label}_sha256") != digest(source):
+                fail(f"Scope-only visual evidence lost its inherited {label.replace('_', ' ')}.")
+    if evidence.get("changed_looks") != record["changed_looks"] or evidence.get("revision_scope_sha256") != digest(scope_path):
         fail("Scope-only visual evidence no longer matches the caption revision record.")
+    if inherited and any(
+        evidence.get(f"{label}_sha256") != record.get(f"{label}_sha256")
+        for label in ("source_visual_evidence", "source_visual_manifest", "source_visual_proof")
+    ):
+        fail("Scope-only visual evidence no longer matches the inherited reviewed proof.")
+    if not inherited and evidence.get("native_scope_only") is not True:
+        fail("Scope-only visual evidence without an inherited proof must be explicitly native-scope-only.")
 
 
 def targeted_visual_mode(project: Path, state: dict[str, Any], manifest: dict[str, Any] | None = None) -> bool:
@@ -4156,22 +4160,32 @@ def command_record_caption_revision_scope_visual(args: argparse.Namespace) -> No
         or int(scope.get("unchanged_count", -1)) != int(state["look_count"]) - len(record["changed_looks"])
     ):
         fail("Native revision scope audit is incomplete; scope-only review PDF is not safe to record.")
-    # All inherited artefacts are hash-bound, so a manually deleted or swapped
-    # reviewed proof cannot be used as the page-order basis for the new PDF.
-    for label in ("source_visual_evidence", "source_visual_manifest", "source_visual_proof"):
-        source = child_of(project, str(record.get(label, "")))
-        if not source.is_file() or record.get(f"{label}_sha256") != digest(source):
-            fail(f"Scope-only visual evidence is missing inherited {label.replace('_', ' ')}.")
+    # When a reviewed visual proof exists, retain its hash-bound order
+    # baseline. Older projects can legitimately start their first controlled
+    # caption revision without one; in that explicit operator-selected case
+    # the native scope audit remains the only pre-PDF check.
+    inherited = all(str(record.get(label, "")).strip() for label in (
+        "source_visual_evidence", "source_visual_manifest", "source_visual_proof",
+    ))
+    if inherited:
+        for label in ("source_visual_evidence", "source_visual_manifest", "source_visual_proof"):
+            source = child_of(project, str(record.get(label, "")))
+            if not source.is_file() or record.get(f"{label}_sha256") != digest(source):
+                fail(f"Scope-only visual evidence is missing inherited {label.replace('_', ' ')}.")
     evidence = {
         "schema": SCHEMA, "session_id": state["session_id"], "gate": "visual", "passed": True,
         "nonce": armed["nonce"], "created_at": utc_now(), "master": identity(master),
         "mode": "caption-revision-scope-only", "changed_looks": record["changed_looks"],
         "revision_scope_sha256": digest(scope_path),
-        "source_visual_evidence_sha256": record["source_visual_evidence_sha256"],
-        "source_visual_manifest_sha256": record["source_visual_manifest_sha256"],
-        "source_visual_proof_sha256": record["source_visual_proof_sha256"],
+        "native_scope_only": not inherited,
         "notes": "Operator disabled the optional targeted visual check; native scope audit confirms unchanged looks, image links and non-overset credits.",
     }
+    if inherited:
+        evidence.update({
+            "source_visual_evidence_sha256": record["source_visual_evidence_sha256"],
+            "source_visual_manifest_sha256": record["source_visual_manifest_sha256"],
+            "source_visual_proof_sha256": record["source_visual_proof_sha256"],
+        })
     write_json(evidence_file(project, "visual"), evidence)
     print(f"PASS visual (scope-only): {len(record['changed_looks'])} corrected look(s) were not re-rendered by operator choice; native revision scope audit passed.")
 
@@ -4348,7 +4362,9 @@ def verify_exported_pdf_order(project: Path, state: dict[str, Any], review_pdf: 
     reference_manifest = validate_reference_order(project, state)
     visual_evidence = read_json(evidence_file(project, "visual"))
     scope_only = visual_evidence.get("mode") == "caption-revision-scope-only"
+    native_scope_only = False
     visual_manifest: dict[str, Any] | None = None
+    proof_pdf: Path | None = None
     if scope_only:
         # The operator has deliberately skipped the optional re-render of the
         # corrected looks.  Their pair order is still anchored to the reviewed
@@ -4358,9 +4374,11 @@ def verify_exported_pdf_order(project: Path, state: dict[str, Any], review_pdf: 
         record = caption_revision_record(project, state)
         if record is None:
             fail("Scope-only review-PDF order proof has no caption revision record.")
-        proof_pdf = child_of(project, str(record["source_visual_proof"]))
-        if not proof_pdf.is_file() or record.get("source_visual_proof_sha256") != digest(proof_pdf):
-            fail("Inherited reviewed proof PDF is missing or changed; review-PDF order cannot be verified.")
+        native_scope_only = visual_evidence.get("native_scope_only") is True
+        if not native_scope_only:
+            proof_pdf = child_of(project, str(record["source_visual_proof"]))
+            if not proof_pdf.is_file() or record.get("source_visual_proof_sha256") != digest(proof_pdf):
+                fail("Inherited reviewed proof PDF is missing or changed; review-PDF order cannot be verified.")
     else:
         visual_manifest = validate_visual_proof(project, state)
         proof_pdf = child_of(project, str(visual_manifest.get("proof_pdf", "")))
@@ -4370,6 +4388,31 @@ def verify_exported_pdf_order(project: Path, state: dict[str, Any], review_pdf: 
         state_artifact(project, state, "registry"), int(state["look_count"]), state_artifact(project, state, "hires")
     )
     pages = sorted({int(row[key]) for row in registry for key in ("indd_left_page", "indd_right_page")})
+    if native_scope_only:
+        # The operator explicitly requested a review PDF without any visual
+        # rerender. Native scope/release checks still bind the unchanged
+        # structure and links; page count is validated by verify-pdf before
+        # this order record is written.
+        return {
+            "schema": REFERENCE_ORDER_SCHEMA, "generator": "lookbook_gate.py:verify-exported-pdf-order",
+            "reference_order_manifest_sha256": digest(reference_order_manifest_path(project)),
+            "reference_order_confirmation_fingerprint": reference_order_confirmation_fingerprint(project, state),
+            "reference_pdf_sha256": reference_manifest["reference_pdf_sha256"],
+            "current_master_proof_pdf_sha256": None, "review_pdf_sha256": digest(review_pdf),
+            "proof_mode": "caption-revision-native-scope-only",
+            "items": [
+                {
+                    "look_id": row["look_id"], "reference_page": int(row["pdf_spread"]) + 1,
+                    "pages": [
+                        {"side": "left", "page": int(row["indd_left_page"])},
+                        {"side": "right", "page": int(row["indd_right_page"])},
+                    ],
+                }
+                for row in registry
+            ],
+        }
+    if proof_pdf is None:
+        fail("Review-PDF order proof has no current visual proof PDF.")
     stamp = utc_now().replace(":", "-")
     root = control_path(project) / "visual" / "pdf-order" / stamp
     review_pages = render_pdf_pages(review_pdf, root / "review-pdf", pages, 96)

@@ -61,7 +61,7 @@ def test_scope_only_revision_mode_is_persisted_in_the_revision_record(tmp_path: 
     assert PipelineEngine._caption_revision_targeted_visual_enabled(root) is True
 
 
-def test_unreviewed_caption_revision_uses_a_full_visual_proof(tmp_path: Path, monkeypatch) -> None:
+def test_unreviewed_caption_revision_can_disable_visual_render_before_pdf(tmp_path: Path, monkeypatch) -> None:
     store = StateStore(tmp_path / "state.db")
     project = _project(store, tmp_path)
     root = project.project_dir
@@ -90,7 +90,7 @@ def test_unreviewed_caption_revision_uses_a_full_visual_proof(tmp_path: Path, mo
 
     engine.set_caption_revision_visual_mode(project, targeted=False)
 
-    assert calls == [("set-caption-revision-visual-mode", ("--mode", "full"))]
+    assert calls == [("set-caption-revision-visual-mode", ("--mode", "scope-only"))]
     assert PipelineEngine._caption_revision_has_inherited_visual_baseline(root) is False
     assert PipelineEngine._caption_revision_targeted_visual_enabled(root) is False
 
