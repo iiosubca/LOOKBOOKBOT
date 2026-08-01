@@ -1070,9 +1070,12 @@ Reply with exactly one JSON object and no Markdown:
 
     @staticmethod
     def _caption_revision_targeted_visual_enabled(root: Path) -> bool:
-        """Keep the safer targeted proof as the compatibility/default mode."""
-        if not PipelineEngine._caption_revision_has_inherited_visual_baseline(root):
-            return False
+        """Return the persisted operator choice, independently of its baseline.
+
+        A checked option with no inherited proof intentionally selects a full
+        visual pass.  Treating that state as disabled would silently turn an
+        explicit visual check into the no-render route.
+        """
         state = read_json(root / "control" / "lookbook-state.json")
         try:
             revision = int(state.get("current_revision", 1))
@@ -1110,6 +1113,25 @@ Reply with exactly one JSON object and no Markdown:
             raise PipelineError(arm.text)
         self.controller.gate("audit-caption-revision-scope", root, timeout=900)
         self.controller.gate("record-caption-revision-scope-visual", root, timeout=180)
+
+    def complete_caption_revision_scope_only_audit(self, project: ProjectRecord) -> str:
+        """Run the optional no-render pre-PDF audit without entering visual UI.
+
+        This method is deliberately called before ``run(..., 'review')`` by
+        the correction-PDF command.  The desktop therefore shows the review
+        PDF stage, not a misleading full visual review, while native
+        integrity checks still remain mandatory.
+        """
+        root = project.project_dir
+        if not self._has_manual_caption_revision(root):
+            raise PipelineError("Native scope-аудит доступен только для созданной ревизии кредитов.")
+        if self._caption_revision_targeted_visual_enabled(root):
+            raise PipelineError("Для этой версии включена проверка изменённых луков; native scope-аудит не выбран.")
+        if not evidence_passed(root, "visual"):
+            self._record_scope_only_caption_revision_visual(project)
+        if not evidence_passed(root, "visual"):
+            raise PipelineError("Контроллер не подтвердил native scope-аудит перед PDF.")
+        return "Native scope-аудит перед PDF завершён: структура, ссылки и кредиты подтверждены без визуального рендера."
 
     def _run_targeted_caption_revision_visual(self, project: ProjectRecord, provider: ModelProvider) -> None:
         """Recheck only corrected pairs after native COM proves all others unchanged."""

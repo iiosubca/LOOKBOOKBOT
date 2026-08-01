@@ -92,7 +92,35 @@ def test_unreviewed_caption_revision_can_disable_visual_render_before_pdf(tmp_pa
 
     assert calls == [("set-caption-revision-visual-mode", ("--mode", "scope-only"))]
     assert PipelineEngine._caption_revision_has_inherited_visual_baseline(root) is False
-    assert PipelineEngine._caption_revision_targeted_visual_enabled(root) is False
+
+
+def test_unreviewed_caption_revision_uses_full_visual_when_requested(tmp_path: Path, monkeypatch) -> None:
+    store = StateStore(tmp_path / "state.db")
+    project = _project(store, tmp_path)
+    root = project.project_dir
+    revisions = root / "control" / "revisions"
+    revisions.mkdir(parents=True)
+    (root / "control" / "lookbook-state.json").write_text(
+        json.dumps({"manual_caption_revision": "control/revisions/manual.json", "current_revision": 2, "structure_revision": 2}),
+        encoding="utf-8",
+    )
+    (revisions / "revision-02.json").write_text(
+        json.dumps({"visual_check_mode": "full", "visual_baseline": "not-yet-confirmed"}),
+        encoding="utf-8",
+    )
+    engine = PipelineEngine(store)
+    calls: list[tuple[str, tuple[str, ...]]] = []
+
+    def gate(action: str, _root: Path, *args: str, **_kwargs):
+        calls.append((action, args))
+        return SimpleNamespace(returncode=0, text="PASS")
+
+    monkeypatch.setattr(engine.controller, "gate", gate)
+
+    engine.set_caption_revision_visual_mode(project, targeted=True)
+
+    assert calls == [("set-caption-revision-visual-mode", ("--mode", "full"))]
+    assert PipelineEngine._caption_revision_targeted_visual_enabled(root) is True
 
 
 def test_scope_only_visual_route_runs_scope_audit_without_rendering_pairs(tmp_path: Path, monkeypatch) -> None:

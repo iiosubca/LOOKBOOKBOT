@@ -149,7 +149,26 @@ class PipelineWorker(QObject):
             elif self.caption_revision_action == "export-review":
                 engine.recover_missing_caption_revision_master(project)
                 engine.set_caption_revision_visual_mode(project, targeted=self.targeted_caption_visual)
-                result = engine.run(project, None, continue_after=True, stop_after="review")
+                if not self.targeted_caption_visual:
+                    try:
+                        message = engine.complete_caption_revision_scope_only_audit(project)
+                    except Exception as error:
+                        self.store.set_stage(project.id, "visual", StageStatus.FAILED, error=str(error))
+                        self.stage.emit("visual", StageStatus.FAILED.value, str(error))
+                        raise
+                    self.store.set_stage(
+                        project.id,
+                        "visual",
+                        StageStatus.PASSED,
+                        details={"message": message, "mode": "native-scope-only"},
+                    )
+                    # The short internal audit is logged but intentionally not
+                    # surfaced as a running "Visual check" stage.  The next
+                    # visible work is the requested review-PDF export.
+                    self.log.emit(message)
+                    result = engine.run(project, "review", continue_after=True, stop_after="review")
+                else:
+                    result = engine.run(project, None, continue_after=True, stop_after="review")
             else:
                 result = engine.run(
                     project, self.start_key, continue_after=self.continue_after, stop_after=self.stop_after,
