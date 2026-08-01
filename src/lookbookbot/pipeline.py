@@ -341,22 +341,36 @@ class PipelineEngine:
 
         The controller accepts this only when both the source INDD identity and
         the already-applied caption audit are signed. It then returns the
-        project to the structure gate so every native stage through captions is
-        saved and rechecked on the reconstructed file.
+        project to the captions gate. The reconstructed master is an exact copy
+        of a previous completed lookbook, so its proven 102-page structure must
+        never be treated as a four-page automation template.
         """
         root = project.project_dir
         state = read_json(root / "control" / "lookbook-state.json")
         master_name = str(state.get("master", "")).strip()
-        if master_name and (root / master_name).is_file():
+        revision = int(state.get("current_revision", 0) or 0)
+        structure_revision = int(state.get("structure_revision", 0) or 0)
+        # A legacy interrupted recovery can already have recreated the INDD
+        # while its structure revision still points at the old version.  It
+        # must resume the recovery controller path instead of silently
+        # continuing from the template-only structure gate.
+        if (
+            master_name
+            and (root / master_name).is_file()
+            and structure_revision == revision
+        ):
             return
-        self.log("Текущая INDD-версия отсутствует; восстанавливаю её из подписанной предыдущей версии.")
+        if master_name and (root / master_name).is_file():
+            self.log("Продолжаю прерванное восстановление текущей INDD-версии без пересборки разворотов.")
+        else:
+            self.log("Текущая INDD-версия отсутствует; восстанавливаю её из подписанной предыдущей версии.")
         self.controller.gate("recover-missing-caption-revision-master", root, timeout=180)
         self.store.set_approved(project.id, False)
-        self.store.reset_from(project.id, "structure")
-        restored = self.run(project, "structure", continue_after=False, stop_after="captions")
+        self.store.reset_from(project.id, "captions")
+        restored = self.run(project, "captions", continue_after=False, stop_after="captions")
         if restored.stopped_at:
             raise PipelineError(
-                "Автовосстановление текущей INDD-версии не завершило проверку структуры и кредитов: "
+                "Автовосстановление текущей INDD-версии не завершило проверку кредитов: "
                 + restored.message
             )
         self.log("Текущая INDD-версия восстановлена и повторно проверена до этапа кредитов.")

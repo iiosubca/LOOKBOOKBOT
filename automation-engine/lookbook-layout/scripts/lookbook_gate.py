@@ -4904,15 +4904,13 @@ def command_recover_missing_caption_revision_master(args: argparse.Namespace) ->
     This is deliberately narrower than a general file recovery: the current
     INDD must be absent, its exact prior master must still match the immutable
     revision record, and the archived caption audit must still match the
-    controlled TSV.  The pipeline then reruns the native gates from structure
-    through captions before it is allowed to copy a new revision.
+    controlled TSV.  A copy of a completed lookbook is not a four-page
+    template, so recovery retains the verified structure/date/frame/image
+    evidence and replays only the captions gate on the restored master.
     """
     project = project_path(args.project)
     state = load_state(project)
     target = state_artifact(project, state, "master")
-    if target.is_file():
-        print(f"MISSING MASTER RECOVERY: current master is present; no recovery needed: {target.name}")
-        return
     record = caption_revision_record(project, state)
     if record is None or record.get("kind") != "captions":
         fail("Current INDD master is missing and has no signed caption-revision record for safe reconstruction.")
@@ -4940,40 +4938,113 @@ def command_recover_missing_caption_revision_master(args: argparse.Namespace) ->
     if source.with_name(f"{source.name}.idlk").exists():
         fail("Caption-revision source master is open in InDesign; close the controlled document before reconstructing its saved copy.")
 
-    try:
-        shutil.copy2(source, target)
-    except OSError as error:
-        fail(f"Cannot reconstruct missing master {target.name} from {source.name}: {error}")
-
     control = control_path(project)
     revision = int(state["current_revision"])
-    archive = control / "history" / f"missing-master-recovery-{revision:02}-{utc_now().replace(':', '-')}"
+    marker_path = control / "revisions" / f"missing-master-recovery-{revision:02}.json"
+    preserved_paths = (
+        "evidence/structure.json", "evidence/dates.json", "evidence/frames.json", "evidence/images.json",
+        "arms/structure.json", "arms/dates.json", "arms/frames.json", "arms/images.json",
+    )
     stale_paths = (
         "visual",
-        "evidence/structure.json", "evidence/dates.json", "evidence/frames.json",
-        "evidence/images.json", "evidence/captions.json", "evidence/caption-geometry.json",
+        "evidence/captions.json", "evidence/caption-geometry.json",
         "evidence/visual.json", "evidence/release.json", "evidence/pdf.json",
-        "arms/structure.json", "arms/dates.json", "arms/frames.json", "arms/images.json",
         "arms/captions.json", "arms/visual.json", "arms/release.json", "arms/pdf.json",
         "progress/images.json", "progress/captions.json", "progress/caption-repair.json",
         "progress/composition.json", "progress/composition-delta.json",
         "export-permit.json", "final-deliverables.json",
     )
-    for relative in stale_paths:
-        stale = control / relative
-        if not stale.exists():
-            continue
-        destination = archive / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(stale), str(destination))
+
+    def move_active(paths: tuple[str, ...], archive: Path, bucket: str = "") -> None:
+        for relative in paths:
+            stale = control / relative
+            if not stale.exists():
+                continue
+            destination = archive / bucket / relative if bucket else archive / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(stale), str(destination))
+
+    def recovery_archive() -> Path | None:
+        if marker_path.is_file():
+            marker = read_json(marker_path)
+            raw = str(marker.get("archive", "")).strip()
+            if raw:
+                try:
+                    return child_of(project, raw)
+                except GateError:
+                    return None
+        candidates = sorted(
+            (path for path in (control / "history").glob(f"missing-master-recovery-{revision:02}-*") if path.is_dir()),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        return candidates[0] if candidates else None
+
+    archive = recovery_archive()
+    if target.is_file():
+        if int(state.get("structure_revision", 0)) == revision:
+            print(f"MISSING MASTER RECOVERY: current master is present; no recovery needed: {target.name}")
+            return
+        if archive is None or not archive.is_dir():
+            fail("A recovered INDD is waiting for captions, but its signed pre-caption evidence archive is missing.")
+        # Version 0.2.46 incorrectly reset a completed lookbook to the
+        # template-only structure gate. Recover that interrupted attempt by
+        # restoring the already-proven pre-caption gates, never by duplicating
+        # its 50 working spreads again.
+        retry_bucket = f"retry-{utc_now().replace(':', '-')}"
+        for relative in preserved_paths:
+            archived = archive / relative
+            active = control / relative
+            if not archived.exists():
+                fail(f"Recovered INDD is missing signed pre-caption evidence: {relative}")
+            if active.exists() and digest(active) != digest(archived):
+                # A legacy recovery may have armed the template-only
+                # structure gate after the master was copied.  Its arm is
+                # evidence of the failed retry, not an alternative signed
+                # baseline.  Preserve it for diagnostics and restore the
+                # exact pre-caption proof that was archived before recovery.
+                displaced = archive / retry_bucket / relative
+                displaced.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(active), str(displaced))
+            if not active.exists():
+                active.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(archived, active)
+        move_active(stale_paths, archive, retry_bucket)
+        state["structure_revision"] = revision
+        write_json(state_file(project), state)
+        write_json(marker_path, {
+            "schema": SCHEMA, "revision": revision, "target": target.name,
+            "source": source.name, "archive": _relative_project_path(project, archive),
+            "status": "awaiting-captions", "resumed_at": utc_now(),
+        })
+        if current_gate(project, state) != "captions":
+            fail("Recovered INDD could not restore the controller to captions safely.")
+        print(
+            f"MISSING MASTER RECOVERY RESUMED: {target.name} kept its proven 102-page structure; "
+            "only native captions verification is required."
+        )
+        return
+
+    try:
+        shutil.copy2(source, target)
+    except OSError as error:
+        fail(f"Cannot reconstruct missing master {target.name} from {source.name}: {error}")
+
+    archive = control / "history" / f"missing-master-recovery-{revision:02}-{utc_now().replace(':', '-')}"
+    move_active(stale_paths, archive)
     (control / "visual").mkdir(parents=True, exist_ok=True)
-    state["structure_revision"] = revision - 1
+    state["structure_revision"] = revision
     write_json(state_file(project), state)
-    if current_gate(project, state) != "structure":
-        fail("Missing-master recovery could not reset the controller to structure safely.")
+    write_json(marker_path, {
+        "schema": SCHEMA, "revision": revision, "target": target.name,
+        "source": source.name, "archive": _relative_project_path(project, archive),
+        "status": "awaiting-captions", "created_at": utc_now(),
+    })
+    if current_gate(project, state) != "captions":
+        fail("Missing-master recovery could not reset the controller to captions safely.")
     print(
         f"MISSING MASTER RECOVERED: {target.name} recreated from signed source {source.name}; "
-        "native structure-through-captions verification is required before further revisions."
+        "only native captions verification is required before further revisions."
     )
 
 

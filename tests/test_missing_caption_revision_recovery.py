@@ -47,13 +47,80 @@ def test_missing_verified_caption_revision_is_rebuilt_from_its_signed_source(tmp
     (control / "visual" / "proof" / "stale.pdf").write_bytes(b"stale proof")
 
     monkeypatch.setattr(gate, "manual_caption_revision_audit", lambda *_args: (project / audit_ref, {}))
-    monkeypatch.setattr(gate, "current_gate", lambda *_args: "structure")
+    monkeypatch.setattr(gate, "current_gate", lambda *_args: "captions")
 
     gate.command_recover_missing_caption_revision_master(Namespace(project=str(project)))
 
     assert target.read_bytes() == source.read_bytes()
     recovered = gate.read_json(control / "lookbook-state.json")
-    assert recovered["structure_revision"] == 1
+    assert recovered["structure_revision"] == 2
     assert (control / "visual").is_dir()
     assert not (control / "visual" / "proof" / "stale.pdf").exists()
     assert list((control / "history").glob("missing-master-recovery-02-*/visual/proof/stale.pdf"))
+
+
+def test_interrupted_recovery_restores_pre_caption_evidence_without_rebuilding_structure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = tmp_path / "project"
+    control = project / "control"
+    revisions = control / "revisions"
+    revisions.mkdir(parents=True)
+    source = project / "TSUM_FS-0260830_LB_WA_01.indd"
+    target = project / "TSUM_FS-0260830_LB_WA_02.indd"
+    source.write_bytes(b"verified source master")
+    target.write_bytes(b"recovered source master")
+    audit_ref = "control/history/revision-02/manual-caption-revision.json"
+    state = {
+        "schema": gate.SCHEMA,
+        "gates": list(gate.GATES),
+        "master": target.name,
+        "current_revision": 2,
+        "manual_caption_revision": audit_ref,
+        "structure_revision": 1,
+    }
+    gate.write_json(control / "lookbook-state.json", state)
+    gate.write_json(
+        revisions / "revision-02.json",
+        {
+            "schema": gate.SCHEMA,
+            "kind": "captions",
+            "caption_application": "ready",
+            "master": {"name": target.name},
+            "source_master": gate.identity(source),
+            "manual_caption_revision": audit_ref,
+            "changed_looks": ["LOOK_001"],
+        },
+    )
+    archive = control / "history" / "missing-master-recovery-02-legacy"
+    for relative, content in {
+        "evidence/structure.json": b"structure",
+        "evidence/dates.json": b"dates",
+        "evidence/frames.json": b"frames",
+        "evidence/images.json": b"images",
+        "arms/structure.json": b"structure arm",
+        "arms/dates.json": b"dates arm",
+        "arms/frames.json": b"frames arm",
+        "arms/images.json": b"images arm",
+    }.items():
+        file = archive / relative
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_bytes(content)
+    (control / "visual" / "proof").mkdir(parents=True)
+    (control / "visual" / "proof" / "stale.pdf").write_bytes(b"stale proof")
+    (control / "arms").mkdir(parents=True)
+    (control / "arms" / "structure.json").write_bytes(b"wrong template arm")
+
+    monkeypatch.setattr(gate, "manual_caption_revision_audit", lambda *_args: (project / audit_ref, {}))
+    monkeypatch.setattr(gate, "current_gate", lambda *_args: "captions")
+
+    gate.command_recover_missing_caption_revision_master(Namespace(project=str(project)))
+
+    recovered = gate.read_json(control / "lookbook-state.json")
+    assert recovered["structure_revision"] == 2
+    assert (control / "evidence" / "structure.json").read_bytes() == b"structure"
+    assert (control / "arms" / "images.json").read_bytes() == b"images arm"
+    assert (control / "arms" / "structure.json").read_bytes() == b"structure arm"
+    assert list(archive.glob("retry-*/arms/structure.json"))
+    assert not (control / "visual" / "proof" / "stale.pdf").exists()
+    assert (revisions / "missing-master-recovery-02.json").is_file()
