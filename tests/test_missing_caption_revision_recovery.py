@@ -4,6 +4,9 @@ import importlib.util
 import json
 from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
+
+from lookbookbot.pipeline import PipelineEngine, PipelineResult
 
 
 GATE_PATH = Path(__file__).parents[1] / "automation-engine" / "lookbook-layout" / "scripts" / "lookbook_gate.py"
@@ -124,3 +127,47 @@ def test_interrupted_recovery_restores_pre_caption_evidence_without_rebuilding_s
     assert list(archive.glob("retry-*/arms/structure.json"))
     assert not (control / "visual" / "proof" / "stale.pdf").exists()
     assert (revisions / "missing-master-recovery-02.json").is_file()
+
+
+def test_pending_recovery_marker_replays_captions_before_another_revision(tmp_path: Path) -> None:
+    project_dir = tmp_path / "project"
+    control = project_dir / "control"
+    revisions = control / "revisions"
+    revisions.mkdir(parents=True)
+    master = project_dir / "TSUM_FS-0260830_LB_WA_02.indd"
+    master.write_bytes(b"recovered master")
+    (control / "lookbook-state.json").write_text(
+        json.dumps({"master": master.name, "current_revision": 2, "structure_revision": 2}),
+        encoding="utf-8",
+    )
+    marker = revisions / "missing-master-recovery-02.json"
+    marker.write_text(json.dumps({"status": "awaiting-captions"}), encoding="utf-8")
+
+    class Store:
+        def __init__(self) -> None:
+            self.calls: list[tuple[object, ...]] = []
+
+        def set_approved(self, *args) -> None:
+            self.calls.append(("approved", *args))
+
+        def reset_from(self, *args) -> None:
+            self.calls.append(("reset", *args))
+
+    class Controller:
+        def __init__(self) -> None:
+            self.calls: list[tuple[object, ...]] = []
+
+        def gate(self, *args, **kwargs) -> None:
+            self.calls.append(args)
+
+    store = Store()
+    engine = PipelineEngine(store)  # type: ignore[arg-type]
+    controller = Controller()
+    engine.controller = controller  # type: ignore[assignment]
+    engine.run = lambda *_args, **_kwargs: PipelineResult(("captions",), None, "ok")  # type: ignore[method-assign]
+
+    engine.recover_missing_caption_revision_master(SimpleNamespace(id="project", project_dir=project_dir))
+
+    assert controller.calls[0][0] == "recover-missing-caption-revision-master"
+    assert ("reset", "project", "captions") in store.calls
+    assert json.loads(marker.read_text(encoding="utf-8"))["status"] == "captions-verified"

@@ -350,6 +350,15 @@ class PipelineEngine:
         master_name = str(state.get("master", "")).strip()
         revision = int(state.get("current_revision", 0) or 0)
         structure_revision = int(state.get("structure_revision", 0) or 0)
+        marker_path = root / "control" / "revisions" / f"missing-master-recovery-{revision:02}.json"
+        recovery_pending = False
+        if marker_path.is_file():
+            try:
+                recovery_pending = str(read_json(marker_path).get("status", "")) == "awaiting-captions"
+            except (OSError, ValueError, json.JSONDecodeError):
+                # The controller will provide the authoritative diagnostic if
+                # this marker is malformed; do not silently skip recovery.
+                recovery_pending = True
         # A legacy interrupted recovery can already have recreated the INDD
         # while its structure revision still points at the old version.  It
         # must resume the recovery controller path instead of silently
@@ -358,6 +367,7 @@ class PipelineEngine:
             master_name
             and (root / master_name).is_file()
             and structure_revision == revision
+            and not recovery_pending
         ):
             return
         if master_name and (root / master_name).is_file():
@@ -373,6 +383,11 @@ class PipelineEngine:
                 "Автовосстановление текущей INDD-версии не завершило проверку кредитов: "
                 + restored.message
             )
+        if marker_path.is_file():
+            marker = read_json(marker_path)
+            if marker.get("status") == "awaiting-captions":
+                marker["status"] = "captions-verified"
+                marker_path.write_text(json.dumps(marker, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         self.log("Текущая INDD-версия восстановлена и повторно проверена до этапа кредитов.")
 
     def _provider(self, project: ProjectRecord) -> ModelProvider:
