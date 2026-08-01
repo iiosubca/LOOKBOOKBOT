@@ -53,7 +53,7 @@ from .caption_editor import (
 from .controller import read_json
 from .discovery import discover_sources, infer_output_root
 from .domain import ProviderKind, STAGES, StageStatus, project_code
-from .pipeline import PipelineEngine, PipelineError
+from .pipeline import PipelineEngine, PipelineError, PipelineResult
 from .project_import import ExistingProjectError, open_existing_project
 from .providers import ProviderError, make_provider
 from .secrets import get_google_api_key, save_google_api_key
