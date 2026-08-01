@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import date
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from lookbookbot.pipeline import (
     _write_tsv,
 )
 from lookbookbot.providers import CodexProvider
+from lookbookbot.providers import VisionDecision
 from lookbookbot.state import StateStore
 
 
@@ -121,6 +123,88 @@ def test_rematch_candidate_must_be_a_label_from_the_controlled_board() -> None:
             "LOOK_007",
             candidates,
         )
+
+
+def test_rematch_candidate_accepts_a_zero_padded_rendering_of_a_board_label() -> None:
+    assert _parse_codex_rematch_candidate(
+        '{"look_id":"LOOK_007","excel_sheet":"w","excel_look_number":"7",'
+        '"note":"garment=blue pleated blouse; bag=straw tote"}',
+        "LOOK_007",
+        {("W", "007")},
+    ) == ("W", "007")
+
+
+def test_rematch_selection_repairs_an_out_of_board_provider_answer(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    engine = PipelineEngine(store)
+    root = tmp_path / "project"
+    folder = root / "control" / "work" / "rematch-evidence" / "LOOK_007"
+    folder.mkdir(parents=True)
+    (folder / "pdf-pair.jpg").write_bytes(b"proof")
+    (folder / "candidates-01.jpg").write_bytes(b"proof")
+    (folder / "manifest.json").write_text(
+        '{"candidate_pool":["W:7"],"pdf_pair":"control/work/rematch-evidence/LOOK_007/pdf-pair.jpg",'
+        '"candidate_pages":[{"path":"control/work/rematch-evidence/LOOK_007/candidates-01.jpg"}]}',
+        encoding="utf-8",
+    )
+
+    class Provider:
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        def run_readonly_agent(self, prompt: str, *_args, **_kwargs) -> str:
+            self.prompts.append(prompt)
+            if len(self.prompts) == 1:
+                return '{"look_id":"LOOK_007","excel_sheet":"W","excel_look_number":"8","note":"blue blouse and straw tote"}'
+            return '{"look_id":"LOOK_007","excel_sheet":"W","excel_look_number":"7","note":"blue blouse and straw tote"}'
+
+    provider = Provider()
+    assert engine._inspect_codex_rematch_candidate(provider, root, "LOOK_007") == ("W", "7")
+    assert len(provider.prompts) == 2
+    assert "The only valid labels are: W:7." in provider.prompts[0]
+    assert "Return one of these exact labels only: W:7." in provider.prompts[1]
+
+
+def test_rematch_can_transfer_a_provisional_card_and_resolve_only_the_displaced_look(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = StateStore(tmp_path / "state.db")
+    engine = PipelineEngine(store)
+    root = tmp_path / "project"
+    manifest = root / "control" / "work" / "ui-overrides" / "targeted-credit-rematch.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text('{"attempted_candidates":{},"reserved_candidates":[]}', encoding="utf-8")
+
+    choices = iter([
+        {"LOOK_001": ("W", "1"), "LOOK_002": ("M", "1")},
+        {"LOOK_002": ("W", "1")},
+        {"LOOK_001": ("M", "1")},
+    ])
+    decisions = iter([
+        {
+            "LOOK_001": VisionDecision(True, "blue dress", ""),
+            "LOOK_002": VisionDecision(False, "wrong dark jacket", ""),
+        },
+        {"LOOK_002": VisionDecision(True, "blue jumpsuit", "")},
+        {"LOOK_001": VisionDecision(True, "dark jacket", "")},
+    ])
+    script_calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(engine.controller, "script", lambda *args, **_kwargs: script_calls.append(args))
+    monkeypatch.setattr(engine, "_choose_codex_rematch_candidates", lambda *_args: next(choices))
+    monkeypatch.setattr(engine, "_alternative_evidence_rows", lambda _root, selected: [
+        {"look_id": look_id, "evidence_file": f"{look_id}.jpg"} for look_id in selected
+    ])
+    monkeypatch.setattr(engine, "_inspect_codex_credit_evidence_parallel", lambda *_args: next(decisions))
+
+    resolved = engine._choose_and_verify_codex_rematch_candidates(
+        CodexProvider(), root, ["LOOK_001", "LOOK_002"], manifest,
+    )
+
+    assert resolved == {"LOOK_002": ("W", "1"), "LOOK_001": ("M", "1")}
+    assert len([call for call in script_calls if call[0] == "build_targeted_rematch_proofs.py"]) == 3
+    saved = json.loads(manifest.read_text(encoding="utf-8"))
+    assert saved["reserved_candidates"] == []
+    assert "W:1" in saved["attempted_candidates"]["LOOK_001"]
 
 
 def test_swap_batches_are_atomic_and_limited_to_five() -> None:

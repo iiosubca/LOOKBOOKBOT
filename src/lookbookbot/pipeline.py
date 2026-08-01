@@ -820,13 +820,20 @@ class PipelineEngine:
 
         Each candidate can be tried once per LOOK. If the exact alternative
         card is rejected, only that LOOK returns to the remaining candidate
-        pool. The completion bound is the controlled catalogue, rather than a
-        random number of retries.
+        pool. Provisional matches deliberately stay visible to unresolved
+        LOOKs: a later proof may correctly claim the same card and displace
+        its provisional owner. This avoids a greedy dead end where the final
+        LOOK is shown only visually impossible cards because earlier choices
+        were hidden too soon.
         """
         remaining = sorted(set(targets))
         accepted: dict[str, tuple[str, str]] = {}
         while remaining:
-            self._write_rematch_reserved(manifest, accepted.values())
+            # ``accepted`` is only provisional until every target is resolved.
+            # Do not reserve it from later candidate boards: a matching proof
+            # is allowed to transfer a card to the LOOK that actually matches
+            # it, after which the former owner is re-evaluated.
+            self._write_rematch_reserved(manifest, [])
             self.controller.script(
                 "build_targeted_rematch_proofs.py", root,
                 "--looks", ",".join(remaining),
@@ -837,18 +844,21 @@ class PipelineEngine:
             duplicate_pairs: dict[tuple[str, str], list[str]] = {}
             for look_id, pair in choices.items():
                 duplicate_pairs.setdefault(pair, []).append(look_id)
-            collisions = [
-                look_id
-                for _pair, look_ids in duplicate_pairs.items() if len(look_ids) > 1
-                for look_id in sorted(look_ids)[1:]
-            ]
+            collisions: dict[str, tuple[str, str]] = {}
+            for pair, look_ids in duplicate_pairs.items():
+                # One Excel card cannot be assigned twice. Keep one candidate
+                # for exact proof and let each other contender choose a new
+                # card on the next controlled board. This is a one-to-one
+                # constraint, not a visual rejection of the retained choice.
+                for look_id in sorted(look_ids)[1:]:
+                    collisions[look_id] = pair
+                    choices.pop(look_id, None)
             if collisions:
-                # The colliding LOOKs lose only the duplicate candidate. The
-                # whole current batch is then re-read so no unverified choice
-                # can be silently dropped from the atomic selection.
-                self._append_rematch_attempts(manifest, {look_id: choices[look_id] for look_id in collisions})
-                remaining = sorted(set(remaining))
-                continue
+                self._append_rematch_attempts(manifest, collisions)
+                self.log(
+                    "Resolved simultaneous alternative-card collisions: "
+                    + ", ".join(f"{look_id}={sheet}:{number}" for look_id, (sheet, number) in sorted(collisions.items()))
+                )
 
             assignment_text = ",".join(
                 f"{look_id}={sheet}:{number}"
@@ -868,10 +878,25 @@ class PipelineEngine:
             ]
             if rejected:
                 self._append_rematch_attempts(manifest, {look_id: choices[look_id] for look_id in rejected})
+            accepted_by_pair = {pair: look_id for look_id, pair in accepted.items()}
+            displaced: list[str] = []
             for look_id, pair in choices.items():
                 if look_id not in rejected:
+                    former_owner = accepted_by_pair.get(pair)
+                    if former_owner and former_owner != look_id:
+                        # The newly inspected exact proof has priority over a
+                        # merely provisional reservation. Re-evaluate only the
+                        # displaced owner; its old pair is unavailable from now
+                        # on because the one-to-one assignment has transferred.
+                        accepted.pop(former_owner, None)
+                        self._append_rematch_attempts(manifest, {former_owner: pair})
+                        displaced.append(former_owner)
+                        self.log(
+                            f"Alternative proof transferred {pair[0]}:{pair[1]} from {former_owner} to {look_id}; "
+                            f"only {former_owner} is being re-evaluated."
+                        )
                     accepted[look_id] = pair
-            remaining = rejected
+            remaining = sorted(set(rejected + displaced + list(collisions)))
         self._write_rematch_reserved(manifest, [])
         return accepted
 
@@ -923,17 +948,35 @@ class PipelineEngine:
         )
         if not candidates or len(attachments) < 2 or len(attachments) > 5 or any(not path.is_file() for path in attachments):
             raise ValueError(f"{look_id}: incomplete controlled candidate evidence.")
+        allowed_labels = ", ".join(f"{sheet}:{number}" for sheet, number in sorted(candidates, key=lambda pair: (pair[0], int(pair[1]))))
         prompt = f"""Choose the single Excel card for one PDF look by visible identity.
 
 LOOK: {look_id}
 The first image contains the two PDF-look photographs. The other images are all allowed, currently unclaimed Excel cards, each labelled `EXCEL W:12` or `EXCEL M:9`.
+This is a closed candidate board. The only valid labels are: {allowed_labels}.
 
-Compare the model, garments, colours, bag, shoes, accessories, pose and crop. Do not use numbers, ordering, filenames, gender or background as evidence. Select only the label that visibly matches both PDF images.
+Compare the model, garments, colours, bag, shoes, accessories, pose and crop. Model presentation is a valid visible cue; do not use card numbers, ordering, filenames or background as evidence. Select only the label that visibly matches both PDF images.
 
 Reply with exactly one JSON object and no Markdown:
 {{"look_id":"{look_id}","excel_sheet":"W or M","excel_look_number":"number","note":"at least two concrete visible identity cues"}}"""
         raw = provider.run_readonly_agent(prompt, root, timeout=3600, images=attachments)
-        return _parse_codex_rematch_candidate(raw, look_id, candidates)
+        try:
+            return _parse_codex_rematch_candidate(raw, look_id, candidates)
+        except ProviderError as first_error:
+            # This is a schema repair, not another visual guess: the same
+            # pixels and the same closed board are supplied again, now with an
+            # explicit instruction to return one printed board label.
+            repair_prompt = prompt + (
+                "\n\nYour previous response could not be applied because it named a label outside this closed board. "
+                f"Return one of these exact labels only: {allowed_labels}. Do not invent or reuse another card."
+            )
+            repaired = provider.run_readonly_agent(repair_prompt, root, timeout=3600, images=attachments)
+            try:
+                return _parse_codex_rematch_candidate(repaired, look_id, candidates)
+            except ProviderError as repair_error:
+                raise ProviderError(
+                    f"{look_id}: the provider did not return a valid closed-board choice after schema repair ({repair_error})."
+                ) from first_error
 
     def _alternative_evidence_rows(
         self,
@@ -2160,10 +2203,23 @@ def _parse_codex_rematch_candidate(
         raise ProviderError(f"{expected_look}: Codex returned a candidate for another LOOK.")
     sheet = str(payload.get("excel_sheet", "")).strip().upper()
     number = str(payload.get("excel_look_number", "")).strip()
-    if sheet not in {"W", "M"} or not number.isdigit() or (sheet, number) not in candidates:
+    board: dict[tuple[str, str], tuple[str, str]] = {}
+    for candidate_sheet, candidate_number in candidates:
+        canonical_sheet = str(candidate_sheet).strip().upper()
+        raw_number = str(candidate_number).strip()
+        if canonical_sheet not in {"W", "M"} or not raw_number.isdigit():
+            raise ProviderError(f"{expected_look}: the controlled candidate board is invalid.")
+        canonical = (canonical_sheet, str(int(raw_number)))
+        if canonical in board and board[canonical] != (candidate_sheet, candidate_number):
+            raise ProviderError(f"{expected_look}: the controlled candidate board contains duplicate logical labels.")
+        board[canonical] = (candidate_sheet, candidate_number)
+    if sheet not in {"W", "M"} or not number.isdigit():
+        raise ProviderError(f"{expected_look}: Codex selected a card outside the supplied candidate board.")
+    selected = board.get((sheet, str(int(number))))
+    if selected is None:
         raise ProviderError(f"{expected_look}: Codex selected a card outside the supplied candidate board.")
     _safe_confirmation_note(str(payload.get("note", "")))
-    return sheet, number
+    return selected
 
 
 def _credit_override_batches(
