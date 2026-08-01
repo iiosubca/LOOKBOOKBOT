@@ -21,6 +21,9 @@ def test_create_caption_revision_worker_reports_ready_result_without_name_error(
         def prepare_caption_revision(self, _project, _audit) -> None:
             return None
 
+        def recover_missing_caption_revision_master(self, _project) -> None:
+            return None
+
         def finish_review_before_caption_revision(self, _project) -> PipelineResult:
             raise AssertionError("Creating a revision must not require the prior review PDF.")
 

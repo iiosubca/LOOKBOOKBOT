@@ -133,6 +133,7 @@ class PipelineWorker(QObject):
                 progress=lambda key, status, message: self.stage.emit(key, status.value, message),
             )
             if self.caption_revision_audit:
+                engine.recover_missing_caption_revision_master(project)
                 engine.prepare_caption_revision(project, Path(self.caption_revision_audit))
                 engine.begin_caption_revision(project, Path(self.caption_revision_audit))
                 engine.set_caption_revision_visual_mode(project, targeted=self.targeted_caption_visual)
@@ -147,6 +148,7 @@ class PipelineWorker(QObject):
                 else:
                     result = engine.run(project, "captions", continue_after=True, stop_after="review")
             elif self.caption_revision_action == "export-review":
+                engine.recover_missing_caption_revision_master(project)
                 engine.set_caption_revision_visual_mode(project, targeted=self.targeted_caption_visual)
                 result = engine.run(project, None, continue_after=True, stop_after="review")
             else:

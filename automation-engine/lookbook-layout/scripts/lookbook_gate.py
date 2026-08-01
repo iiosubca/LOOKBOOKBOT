@@ -4898,6 +4898,85 @@ def command_prepare_caption_revision(args: argparse.Namespace) -> None:
         print("CAPTION REVISION DRAFT READY: reviewed caption-data.tsv is unchanged; the saved correction draft is retained for the next INDD revision.")
 
 
+def command_recover_missing_caption_revision_master(args: argparse.Namespace) -> None:
+    """Rebuild a missing saved caption-revision master from signed inputs only.
+
+    This is deliberately narrower than a general file recovery: the current
+    INDD must be absent, its exact prior master must still match the immutable
+    revision record, and the archived caption audit must still match the
+    controlled TSV.  The pipeline then reruns the native gates from structure
+    through captions before it is allowed to copy a new revision.
+    """
+    project = project_path(args.project)
+    state = load_state(project)
+    target = state_artifact(project, state, "master")
+    if target.is_file():
+        print(f"MISSING MASTER RECOVERY: current master is present; no recovery needed: {target.name}")
+        return
+    record = caption_revision_record(project, state)
+    if record is None or record.get("kind") != "captions":
+        fail("Current INDD master is missing and has no signed caption-revision record for safe reconstruction.")
+    if str(record.get("caption_application", "")) != "ready":
+        fail("Current INDD master is missing before its caption revision was verified; automatic reconstruction is unsafe.")
+    expected_target = record.get("master")
+    if not isinstance(expected_target, dict) or str(expected_target.get("name", "")) != target.name:
+        fail("Current INDD master is missing and the revision record names a different target.")
+    source_identity = record.get("source_master")
+    if not isinstance(source_identity, dict):
+        fail("Current INDD master is missing and the revision record has no signed source master.")
+    source_name = str(source_identity.get("name", "")).strip()
+    if not source_name or Path(source_name).name != source_name:
+        fail("Caption-revision source master name is invalid; automatic reconstruction is unsafe.")
+    source = project / source_name
+    if not source.is_file() or not same_identity(source_identity, identity(source)):
+        fail("Caption-revision source master is absent or changed; automatic reconstruction is unsafe.")
+    state_audit = str(state.get("manual_caption_revision", "")).strip()
+    if not state_audit or record.get("manual_caption_revision") != state_audit:
+        fail("Caption-revision audit does not match the missing master; automatic reconstruction is unsafe.")
+    try:
+        manual_caption_revision_audit(project, state)
+    except (GateError, OSError) as error:
+        fail(f"Caption-revision audit cannot prove the current credits baseline: {error}")
+    if source.with_name(f"{source.name}.idlk").exists():
+        fail("Caption-revision source master is open in InDesign; close the controlled document before reconstructing its saved copy.")
+
+    try:
+        shutil.copy2(source, target)
+    except OSError as error:
+        fail(f"Cannot reconstruct missing master {target.name} from {source.name}: {error}")
+
+    control = control_path(project)
+    revision = int(state["current_revision"])
+    archive = control / "history" / f"missing-master-recovery-{revision:02}-{utc_now().replace(':', '-')}"
+    stale_paths = (
+        "visual",
+        "evidence/structure.json", "evidence/dates.json", "evidence/frames.json",
+        "evidence/images.json", "evidence/captions.json", "evidence/caption-geometry.json",
+        "evidence/visual.json", "evidence/release.json", "evidence/pdf.json",
+        "arms/structure.json", "arms/dates.json", "arms/frames.json", "arms/images.json",
+        "arms/captions.json", "arms/visual.json", "arms/release.json", "arms/pdf.json",
+        "progress/images.json", "progress/captions.json", "progress/caption-repair.json",
+        "progress/composition.json", "progress/composition-delta.json",
+        "export-permit.json", "final-deliverables.json",
+    )
+    for relative in stale_paths:
+        stale = control / relative
+        if not stale.exists():
+            continue
+        destination = archive / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(stale), str(destination))
+    (control / "visual").mkdir(parents=True, exist_ok=True)
+    state["structure_revision"] = revision - 1
+    write_json(state_file(project), state)
+    if current_gate(project, state) != "structure":
+        fail("Missing-master recovery could not reset the controller to structure safely.")
+    print(
+        f"MISSING MASTER RECOVERED: {target.name} recreated from signed source {source.name}; "
+        "native structure-through-captions verification is required before further revisions."
+    )
+
+
 def command_begin_revision(args: argparse.Namespace) -> None:
     project = project_path(args.project)
     state = load_state(project)
@@ -4929,6 +5008,11 @@ def command_begin_revision(args: argparse.Namespace) -> None:
     if len(notes) < 8:
         fail("--notes must record the received page-by-page correction request.")
     source = state_artifact(project, state, "master")
+    if not source.is_file():
+        fail(
+            f"Current INDD master is missing: {source.name}. "
+            "Run recover-missing-caption-revision-master before creating another revision."
+        )
     revision, target = revision_target(source)
     shutil.copy2(source, target)
     archive = archive_for_revision(project, revision, reset_from)
@@ -5762,6 +5846,9 @@ def parser() -> argparse.ArgumentParser:
     prepare_revision.add_argument("project")
     prepare_revision.add_argument("--caption-audit", required=True, help="current LOOKBOOKBOT draft correction manifest")
     prepare_revision.set_defaults(func=command_prepare_caption_revision)
+    recover_revision = commands.add_parser("recover-missing-caption-revision-master", help="recreate a missing verified caption-revision INDD from its signed source")
+    recover_revision.add_argument("project")
+    recover_revision.set_defaults(func=command_recover_missing_caption_revision_master)
     rebind_structure = commands.add_parser("rebind-revision-structure", help="refresh copied-INDD frame IDs and geometry before captions")
     rebind_structure.add_argument("project")
     rebind_structure.set_defaults(func=command_rebind_revision_structure)

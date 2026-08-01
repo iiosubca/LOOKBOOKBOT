@@ -336,6 +336,31 @@ class PipelineEngine:
             timeout=120,
         )
 
+    def recover_missing_caption_revision_master(self, project: ProjectRecord) -> None:
+        """Restore a vanished saved caption revision before copying it again.
+
+        The controller accepts this only when both the source INDD identity and
+        the already-applied caption audit are signed. It then returns the
+        project to the structure gate so every native stage through captions is
+        saved and rechecked on the reconstructed file.
+        """
+        root = project.project_dir
+        state = read_json(root / "control" / "lookbook-state.json")
+        master_name = str(state.get("master", "")).strip()
+        if master_name and (root / master_name).is_file():
+            return
+        self.log("Текущая INDD-версия отсутствует; восстанавливаю её из подписанной предыдущей версии.")
+        self.controller.gate("recover-missing-caption-revision-master", root, timeout=180)
+        self.store.set_approved(project.id, False)
+        self.store.reset_from(project.id, "structure")
+        restored = self.run(project, "structure", continue_after=False, stop_after="captions")
+        if restored.stopped_at:
+            raise PipelineError(
+                "Автовосстановление текущей INDD-версии не завершило проверку структуры и кредитов: "
+                + restored.message
+            )
+        self.log("Текущая INDD-версия восстановлена и повторно проверена до этапа кредитов.")
+
     def _provider(self, project: ProjectRecord) -> ModelProvider:
         return make_provider(
             project.provider,
