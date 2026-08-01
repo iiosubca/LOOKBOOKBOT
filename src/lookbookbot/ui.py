@@ -148,6 +148,7 @@ class PipelineWorker(QObject):
                     result = engine.run(project, "captions", continue_after=True, stop_after="review")
             elif self.caption_revision_action == "export-review":
                 engine.recover_missing_caption_revision_master(project)
+                engine.ensure_caption_revision_captions(project)
                 engine.set_caption_revision_visual_mode(project, targeted=self.targeted_caption_visual)
                 if not self.targeted_caption_visual:
                     try:

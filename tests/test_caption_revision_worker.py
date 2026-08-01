@@ -61,3 +61,51 @@ def test_create_caption_revision_worker_reports_ready_result_without_name_error(
     assert len(completed) == 1
     assert completed[0].completed == ("captions",)
     assert completed[0].message == "Версия TSUM_FS-0261115_LB_WA_02.indd готова к просмотру."
+
+
+def test_export_revision_finishes_pending_captions_before_visual_or_pdf(monkeypatch) -> None:
+    """A direct PDF click after restart must not skip the copied revision's captions gate."""
+
+    calls: list[str] = []
+
+    class Store:
+        def get_project(self, _project_id: str):
+            return SimpleNamespace(project_dir="C:/project")
+
+    class Engine:
+        def __init__(self, _store, *, log, progress) -> None:
+            self.log = log
+            self.progress = progress
+
+        def recover_missing_caption_revision_master(self, _project) -> None:
+            calls.append("recover")
+
+        def ensure_caption_revision_captions(self, _project) -> None:
+            calls.append("captions")
+
+        def set_caption_revision_visual_mode(self, _project, *, targeted: bool) -> None:
+            assert targeted is True
+            calls.append("visual-mode")
+
+        def run(self, _project, start_key, *, continue_after: bool, stop_after: str) -> PipelineResult:
+            assert start_key is None
+            assert continue_after is True
+            assert stop_after == "review"
+            calls.append("review")
+            return PipelineResult(("review",), None, "PDF готов.")
+
+    monkeypatch.setattr(ui, "PipelineEngine", Engine)
+    worker = ui.PipelineWorker(
+        Store(), "project-id", None, True,
+        caption_revision_action="export-review", targeted_caption_visual=True,
+    )
+    completed: list[PipelineResult] = []
+    failures: list[str] = []
+    worker.finished.connect(completed.append)
+    worker.failed.connect(failures.append)
+
+    worker.run()
+
+    assert not failures
+    assert calls == ["recover", "captions", "visual-mode", "review"]
+    assert completed[0].message == "PDF готов."

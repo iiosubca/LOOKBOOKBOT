@@ -375,6 +375,28 @@ class PipelineEngine:
         master_name = str(state.get("master", "")).strip()
         revision = int(state.get("current_revision", 0) or 0)
         structure_revision = int(state.get("structure_revision", 0) or 0)
+        if state.get("manual_caption_revision") and revision >= 3:
+            reconciliation = self.controller.gate(
+                "reconcile-caption-revision-history", root, timeout=120,
+            )
+            if "CAPTION REVISION HISTORY REPAIRED:" in getattr(reconciliation, "text", ""):
+                # A legacy revision was copied before its cumulative audit was
+                # recorded. The controller has now proved the pre-captions
+                # state again, so the desktop must not retain the old map/
+                # captions failure after restart.
+                self.store.set_approved(project.id, False)
+                self.store.confirm_prior_stages(
+                    project.id,
+                    "captions",
+                    reason="Контроллер восстановил полный журнал последовательных правок кредитов.",
+                )
+                for key in ("prepare", "looks", "credits_map", "map", "structure", "dates", "frames", "images"):
+                    self.progress(key, StageStatus.PASSED, "Контроллер подтвердил восстановленный журнал правок.")
+                self.store.reset_from(project.id, "captions")
+                state = read_json(root / "control" / "lookbook-state.json")
+                master_name = str(state.get("master", "")).strip()
+                revision = int(state.get("current_revision", 0) or 0)
+                structure_revision = int(state.get("structure_revision", 0) or 0)
         marker_path = root / "control" / "revisions" / f"missing-master-recovery-{revision:02}.json"
         recovery_pending = False
         if marker_path.is_file():
@@ -431,6 +453,27 @@ class PipelineEngine:
                 marker["status"] = "captions-verified"
                 marker_path.write_text(json.dumps(marker, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         self.log("Текущая INDD-версия восстановлена и повторно проверена до этапа кредитов.")
+
+    def ensure_caption_revision_captions(self, project: ProjectRecord) -> None:
+        """Finish a pending copied revision before routing it to review PDF.
+
+        This matters when LOOKBOOKBOT was closed after creating a revision or
+        an older release stopped between copying the INDD and the captions
+        proof.  A direct click on ``НАПИСАТЬ PDF`` must complete the one
+        required native captions pass first instead of failing later at visual
+        or release with a stale controller state.
+        """
+        root = project.project_dir
+        try:
+            state = read_json(root / "control" / "lookbook-state.json")
+        except (OSError, ValueError) as error:
+            raise PipelineError(f"Не удалось прочитать состояние ревизии: {error}") from error
+        if not state.get("manual_caption_revision") or evidence_passed(root, "captions"):
+            return
+        self.store.reset_from(project.id, "captions")
+        result = self.run(project, "captions", continue_after=False, stop_after="captions")
+        if result.stopped_at:
+            raise PipelineError("Не удалось завершить обязательную проверку кредитов перед PDF: " + result.message)
 
     def _provider(self, project: ProjectRecord) -> ModelProvider:
         return make_provider(

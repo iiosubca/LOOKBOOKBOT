@@ -10,6 +10,7 @@ checked and rendered before the session can be completed.
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import hashlib
 import io
@@ -433,6 +434,46 @@ def manual_caption_changes(payload: dict[str, Any]) -> dict[str, dict[str, Any]]
     if sorted(changes) != sorted(str(value).strip().upper() for value in look_ids):
         fail("Manual caption revision has a duplicated or incomplete LOOK list.")
     return changes
+
+
+def merge_caption_revision_history(
+    previous: dict[str, Any] | None,
+    draft: dict[str, Any],
+    *,
+    previous_reference: str = "",
+) -> dict[str, Any]:
+    """Build the immutable cumulative audit for the next caption revision.
+
+    Each INDD revision contains the full current caption TSV, not just its
+    latest delta.  A later correction must therefore retain every earlier
+    manual deviation from the Excel-derived baseline.  The current draft is
+    still a delta: its ``before`` rows have to match the effective ``after``
+    rows from the previous audit when the same LOOK is edited again.
+
+    The returned manifest is saved only in revision history.  The work-area
+    draft remains one-shot and continues to describe the current operator
+    action, which keeps visual rechecks limited to the newly changed looks.
+    """
+    current = manual_caption_changes(draft)
+    inherited = manual_caption_changes(previous) if previous is not None else {}
+    merged: dict[str, dict[str, Any]] = copy.deepcopy(inherited)
+    for look_id, change in current.items():
+        existing = merged.get(look_id)
+        if existing is not None:
+            if manual_caption_rows(look_id, existing["after"]) != manual_caption_rows(look_id, change["before"]):
+                fail(f"{look_id}: new correction does not start from the latest signed caption revision.")
+            existing["after"] = copy.deepcopy(change["after"])
+        else:
+            merged[look_id] = copy.deepcopy(change)
+    payload = copy.deepcopy(draft)
+    payload["look_ids"] = sorted(merged)
+    payload["changes"] = [
+        {"look_id": look_id, "before": merged[look_id]["before"], "after": merged[look_id]["after"]}
+        for look_id in sorted(merged)
+    ]
+    if previous_reference:
+        payload["previous_manual_caption_revision"] = previous_reference
+    return payload
 
 
 def manual_caption_rows(look_id: str, products: list[Any]) -> list[dict[str, str]]:
@@ -4941,6 +4982,87 @@ def command_prepare_caption_revision(args: argparse.Namespace) -> None:
         print("CAPTION REVISION DRAFT READY: reviewed caption-data.tsv is unchanged; the saved correction draft is retained for the next INDD revision.")
 
 
+def command_reconcile_caption_revision_history(args: argparse.Namespace) -> None:
+    """Repair only the pre-history legacy revision record, when provable.
+
+    Older desktop builds saved a second revision audit as a delta but left the
+    first revision's altered caption rows in the working TSV.  The controller
+    correctly rejected that mismatch at the map/captions boundary.  A project
+    can recover without human re-entry when both signed audits and the current
+    TSV prove the cumulative result exactly.  New revisions already carry the
+    ``previous_manual_caption_revision`` marker and are never rewritten.
+    """
+    project = project_path(args.project)
+    state = load_state(project)
+    record = caption_revision_record(project, state)
+    if record is None or record.get("kind") != "captions":
+        print("CAPTION REVISION HISTORY: no active manual credits revision needs reconciliation.")
+        return
+    try:
+        revision = int(state.get("current_revision", 1))
+    except (TypeError, ValueError) as error:
+        fail(f"Caption revision number is invalid: {error}")
+    # A valid completed/current revision already has a usable map gate.  Never
+    # mutate immutable evidence merely because the command is called again.
+    if current_gate(project, state) != "map":
+        print("CAPTION REVISION HISTORY: current controller evidence is already coherent.")
+        return
+    audit_path, current_payload = manual_caption_revision_audit(project, state)
+    if revision <= 2 or current_payload.get("previous_manual_caption_revision"):
+        print("CAPTION REVISION HISTORY: no provable legacy chain is pending.")
+        return
+    previous_record_path = control_path(project) / "revisions" / f"revision-{revision - 1:02}.json"
+    if not previous_record_path.is_file():
+        fail("Caption revision history cannot be reconciled: previous revision record is missing.")
+    previous_record = read_json(previous_record_path)
+    previous_reference = str(previous_record.get("manual_caption_revision", "")).strip()
+    if not previous_reference:
+        fail("Caption revision history cannot be reconciled: previous revision has no signed caption audit.")
+    previous_audit = child_of(project, previous_reference)
+    previous_payload = read_json(previous_audit)
+    manual_caption_changes(previous_payload)
+    merged = merge_caption_revision_history(
+        previous_payload,
+        current_payload,
+        previous_reference=_relative_project_path(project, previous_audit),
+    )
+    # The current master has already been copied, but its captions gate never
+    # passed.  Rewriting this one pending audit is safe only if the cumulative
+    # result validates against the still-frozen Excel map and every unchanged
+    # look remains untouched.
+    merged["after_caption_data_sha256"] = current_payload.get("after_caption_data_sha256")
+    merged["applied_at"] = current_payload.get("applied_at", utc_now())
+    merged["applied_master"] = current_payload.get("applied_master", state_artifact(project, state, "master").name)
+    audit_before = audit_path.read_bytes()
+    map_path = evidence_file(project, "map")
+    if not map_path.is_file():
+        fail("Caption revision history cannot be reconciled: map evidence is missing.")
+    map_before = map_path.read_bytes()
+    try:
+        write_json(audit_path, merged)
+        map_evidence = read_json(map_path)
+        map_evidence["caption_data_sha256"] = digest(state_artifact(project, state, "captions"))
+        map_evidence["manual_caption_revision_sha256"] = digest(audit_path)
+        map_evidence["manual_caption_revision"] = _relative_project_path(project, audit_path)
+        map_evidence["created_at"] = utc_now()
+        write_json(map_path, map_evidence)
+        validate_manual_caption_revision_inputs(project, state)
+        if load_evidence(project, state, "map") is None:
+            fail("Caption revision history repair did not restore current map evidence.")
+    except Exception:
+        audit_path.write_bytes(audit_before)
+        map_path.write_bytes(map_before)
+        raise
+    repair = control_path(project) / "history" / f"revision-{revision:02}-history-repair.json"
+    write_json(repair, {
+        "schema": SCHEMA, "created_at": utc_now(), "revision": revision,
+        "audit": _relative_project_path(project, audit_path),
+        "previous_audit": _relative_project_path(project, previous_audit),
+        "reason": "Reconciled a legacy delta-only caption audit before its first captions PASS.",
+    })
+    print(f"CAPTION REVISION HISTORY REPAIRED: revision {revision:02} now retains {len(merged['changes'])} cumulative manual look correction(s).")
+
+
 def command_recover_missing_caption_revision_master(args: argparse.Namespace) -> None:
     """Rebuild a missing saved caption-revision master from signed inputs only.
 
@@ -5099,6 +5221,7 @@ def command_begin_revision(args: argparse.Namespace) -> None:
         fail("Revision reset must begin from visual or captions.")
     caption_audit: Path | None = None
     prior_map: dict[str, Any] | None = None
+    prior_manual_caption_audit: tuple[Path, dict[str, Any]] | None = None
     prior_visual_manifest: dict[str, Any] | None = None
     if reset_from == "captions":
         raw_audit = str(getattr(args, "caption_audit", "")).strip()
@@ -5110,6 +5233,11 @@ def command_begin_revision(args: argparse.Namespace) -> None:
         # separate from caption-data.tsv and therefore leave the source intact.
         restore_caption_revision_draft_baseline(project, state, caption_audit)
         prior_map = _validate_caption_revision_preconditions(project, state, caption_audit)
+        # A later correction starts from the already-corrected caption TSV.
+        # Preserve the complete accepted history in its new immutable audit;
+        # otherwise the new master contains earlier edits which no longer have
+        # a signed explanation and the captions/release gates must reject it.
+        prior_manual_caption_audit = manual_caption_revision_audit(project, state)
         # Reuse visual proof only when it is already current and controller
         # accepted. A revision created before that point has no visual
         # baseline, so its own later visual gate will be full rather than
@@ -5141,6 +5269,14 @@ def command_begin_revision(args: argparse.Namespace) -> None:
         archived_audit.parent.mkdir(parents=True, exist_ok=True)
         draft_payload = read_json(caption_audit)
         changes = manual_caption_changes(draft_payload)
+        merged_audit = merge_caption_revision_history(
+            prior_manual_caption_audit[1] if prior_manual_caption_audit is not None else None,
+            draft_payload,
+            previous_reference=(
+                _relative_project_path(project, prior_manual_caption_audit[0])
+                if prior_manual_caption_audit is not None else ""
+            ),
+        )
         captions = state_artifact(project, state, "captions")
         baseline_bytes = captions.read_bytes()
         shutil.copy2(captions, archive / "caption-data-before.tsv")
@@ -5149,10 +5285,10 @@ def command_begin_revision(args: argparse.Namespace) -> None:
             revised_rows = replace_caption_look(revised_rows, look_id, manual_caption_rows(look_id, change["after"]))
         try:
             write_caption_rows(captions, revised_rows)
-            draft_payload["after_caption_data_sha256"] = digest(captions)
-            draft_payload["applied_at"] = utc_now()
-            draft_payload["applied_master"] = target.name
-            write_json(archived_audit, draft_payload)
+            merged_audit["after_caption_data_sha256"] = digest(captions)
+            merged_audit["applied_at"] = utc_now()
+            merged_audit["applied_master"] = target.name
+            write_json(archived_audit, merged_audit)
         except Exception:
             captions.write_bytes(baseline_bytes)
             raise
@@ -5825,6 +5961,68 @@ def command_self_test(_: argparse.Namespace) -> None:
         scope_order = verify_exported_pdf_order(project, load_state(project), project / output)
         if scope_order.get("proof_mode") != "caption-revision-scope-only":
             fail("Self-test failure: scope-only revision did not retain inherited PDF-order proof.")
+        # A no-render correction is a complete review route in its own right.
+        # Prove the next correction can start from it without accidentally
+        # asking for the intentionally absent current-master visual proof.
+        scope_state = load_state(project)
+        command_arm(argparse.Namespace(project=str(project), gate="release"))
+        release_arm = read_json(arm_file(project, "release"))
+        write_json(evidence_file(project, "release"), {
+            "schema": SCHEMA, "session_id": scope_state["session_id"], "gate": "release", "passed": True,
+            "nonce": release_arm["nonce"], "created_at": utc_now(), "master": identity(revised_master),
+        })
+        command_confirm(argparse.Namespace(project=str(project), gate="release"))
+        command_pre_export(argparse.Namespace(project=str(project), pdf=output, quarantine_existing=True))
+        write_order_test_pdf(project / output, [1, 2, 3, 4, 5, 6])
+        command_verify_pdf(argparse.Namespace(project=str(project), pdf=output))
+        command_complete(argparse.Namespace(project=str(project)))
+        if current_gate(project, load_state(project)) is not None:
+            fail("Self-test failure: scope-only route did not reach review-ready state.")
+        before_second_caption_hash = digest(captions)
+        second_audit = work / "manual-caption-revisions" / "second-draft.json"
+        write_json(second_audit, {
+            "schema": "lookbookbot-caption-revision-v1", "created_at": utc_now(),
+            "look_ids": ["LOOK_002"], "before_caption_data_sha256": before_second_caption_hash,
+            "after_caption_data_sha256": "pending", "changes": [{
+                "look_id": "LOOK_002", "before": [{"type": "TYPE", "brand": "BRAND", "price": "2 000 ₽", "article": "B"}],
+                "after": [{"type": "TYPE", "brand": "REVISED BRAND", "price": "2 000 ₽", "article": "B"}],
+            }],
+        })
+        command_begin_revision(argparse.Namespace(
+            project=str(project), notes="Page 4: correct a second manual credit.", reset_from="captions",
+            caption_audit="control/work/manual-caption-revisions/second-draft.json",
+        ))
+        second_state = load_state(project)
+        second_record = read_json(control_path(project) / "revisions" / "revision-03.json")
+        if (
+            second_state["master"] != "master_03.indd" or not (project / "master_03.indd").is_file()
+            or current_gate(project, second_state) != "captions"
+            or second_record.get("visual_check_mode") != "full"
+            or second_record.get("visual_baseline") != "not-yet-confirmed"
+            or any(second_record.get(key) for key in ("source_visual_evidence", "source_visual_manifest", "source_visual_proof"))
+        ):
+            fail("Self-test failure: a chained scope-only revision inherited a missing visual proof.")
+        second_master = state_artifact(project, second_state, "master")
+        command_arm(argparse.Namespace(project=str(project), gate="captions"))
+        second_caption_arm = read_json(arm_file(project, "captions"))
+        write_json(evidence_file(project, "captions"), {
+            "schema": SCHEMA, "session_id": second_state["session_id"], "gate": "captions", "passed": True,
+            "nonce": second_caption_arm["nonce"], "created_at": utc_now(), "master": identity(second_master),
+        })
+        command_set_caption_revision_visual_mode(argparse.Namespace(project=str(project), mode="scope-only"))
+        command_arm(argparse.Namespace(project=str(project), gate="visual"))
+        second_scope_path = caption_revision_scope_audit_path(project, load_state(project))
+        write_json(second_scope_path, {
+            "schema": SCHEMA, "generator": "run_lookbook_gate_com.ps1:AuditCaptionRevisionScope",
+            "session_id": second_state["session_id"], "created_at": utc_now(), "passed": True,
+            "source_master": identity(revised_master), "master": identity(second_master),
+            "changed_looks": ["LOOK_002"], "unchanged_count": 1,
+            "checked": [{"look_id": "LOOK_001", "changed": False}, {"look_id": "LOOK_002", "changed": True}],
+        })
+        command_record_caption_revision_scope_visual(argparse.Namespace(project=str(project)))
+        native_scope_order = verify_exported_pdf_order(project, load_state(project), project / output)
+        if native_scope_order.get("proof_mode") != "caption-revision-native-scope-only":
+            fail("Self-test failure: chained native scope-only revision required an absent visual proof.")
     print("SELF-TEST PASS")
 
 
@@ -5966,6 +6164,9 @@ def parser() -> argparse.ArgumentParser:
     prepare_revision.add_argument("project")
     prepare_revision.add_argument("--caption-audit", required=True, help="current LOOKBOOKBOT draft correction manifest")
     prepare_revision.set_defaults(func=command_prepare_caption_revision)
+    reconcile_revision = commands.add_parser("reconcile-caption-revision-history", help="repair a provable legacy chained caption audit before its first captions PASS")
+    reconcile_revision.add_argument("project")
+    reconcile_revision.set_defaults(func=command_reconcile_caption_revision_history)
     recover_revision = commands.add_parser("recover-missing-caption-revision-master", help="recreate a missing verified caption-revision INDD from its signed source")
     recover_revision.add_argument("project")
     recover_revision.set_defaults(func=command_recover_missing_caption_revision_master)
