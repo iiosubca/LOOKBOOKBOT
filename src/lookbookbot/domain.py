@@ -17,6 +17,7 @@ class StageStatus(StrEnum):
 
 class ProviderKind(StrEnum):
     CODEX = "codex"
+    OPENAI = "openai"
     GOOGLE = "google"
     OLLAMA = "ollama"
     LLAMACPP = "llamacpp"

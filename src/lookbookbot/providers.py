@@ -247,6 +247,81 @@ class GoogleAiStudioProvider(ModelProvider):
         return self._decision(result)
 
 
+class OpenAiApiProvider(ModelProvider):
+    """Direct OpenAI Responses API provider for text and proof-card vision."""
+
+    kind = ProviderKind.OPENAI
+    endpoint = "https://api.openai.com/v1/responses"
+    models_endpoint = "https://api.openai.com/v1/models"
+
+    def __init__(self, model: str, api_key: str = "") -> None:
+        super().__init__(model or "gpt-5.6")
+        self.api_key = api_key.strip() or os.environ.get("OPENAI_API_KEY", "").strip()
+
+    def _require_key(self) -> str:
+        if not self.api_key:
+            raise ProviderError("Введите ключ OpenAI API или задайте переменную окружения OPENAI_API_KEY.")
+        return self.api_key
+
+    def health(self) -> str:
+        key = self._require_key()
+        url = self.models_endpoint + "/" + urllib.parse.quote(self.model, safe=".-_")
+        request = urllib.request.Request(url, method="GET", headers={"Authorization": f"Bearer {key}"})
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8", errors="replace")
+            raise ProviderError(f"OpenAI API {error.code}: {detail[-1200:]}") from error
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+            raise ProviderError(f"OpenAI API недоступен для {self.model}: {error}") from error
+        if data.get("id") != self.model:
+            raise ProviderError(f"OpenAI API не подтвердил модель {self.model}.")
+        return f"OpenAI API: {self.model}"
+
+    def list_models(self) -> list[str]:
+        # The editable combobox retains the model explicitly chosen by the
+        # user.  Avoid a second billed or permission-sensitive API call after
+        # the health check merely to populate a one-item list.
+        return [self.model]
+
+    def _responses(self, input_data: str | list[dict[str, Any]], timeout: int) -> str:
+        key = self._require_key()
+        request = urllib.request.Request(
+            self.endpoint,
+            data=json.dumps({"model": self.model, "input": input_data}).encode("utf-8"),
+            method="POST",
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8", errors="replace")
+            raise ProviderError(f"OpenAI API {error.code}: {detail[-1200:]}") from error
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+            raise ProviderError(f"OpenAI API: {error}") from error
+        return _openai_response_text(data)
+
+    def run_agent(self, prompt: str, workspace: Path, timeout: int = 7200) -> str:
+        del workspace
+        return self._responses(prompt, timeout)
+
+    def inspect_proof(self, prompt: str, images: list[Path]) -> VisionDecision:
+        prompt = read_only_vision_prompt(prompt)
+        content: list[dict[str, Any]] = [{"type": "input_text", "text": prompt}]
+        for path in images:
+            mime = "image/png" if path.suffix.casefold() == ".png" else "image/jpeg"
+            encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+            content.append({
+                "type": "input_image",
+                "image_url": f"data:{mime};base64,{encoded}",
+                "detail": "high",
+            })
+        result = self._responses([{"role": "user", "content": content}], 600)
+        return HttpVisionProvider._decision(result)
+
+
 class HttpVisionProvider(ModelProvider):
     endpoint: str
 
@@ -372,6 +447,32 @@ def _google_usage_tokens(payload: dict[str, Any]) -> tuple[int | None, int | Non
     return _optional_int(prompt), _optional_int(completion)
 
 
+def _openai_response_text(payload: dict[str, Any]) -> str:
+    """Extract the public Responses API text shape without an SDK dependency."""
+    direct = payload.get("output_text")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+    texts: list[str] = []
+    output = payload.get("output")
+    if isinstance(output, list):
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict) or part.get("type") != "output_text":
+                    continue
+                text = part.get("text")
+                if isinstance(text, str) and text.strip():
+                    texts.append(text.strip())
+    result = "\n".join(texts).strip()
+    if not result:
+        raise ProviderError(f"OpenAI API вернул ответ без текста: {str(payload)[:800]}")
+    return result
+
+
 def _optional_int(value: Any) -> int | None:
     try:
         return int(value) if value is not None else None
@@ -386,6 +487,7 @@ def make_provider(
     ollama_endpoint: str = "http://127.0.0.1:11434",
     llama_endpoint: str = "http://127.0.0.1:8080",
     google_api_key: str = "",
+    openai_api_key: str = "",
     usage_store: Any | None = None,
 ) -> ModelProvider:
     if kind == ProviderKind.CODEX:
@@ -394,4 +496,6 @@ def make_provider(
         return OllamaProvider(model, ollama_endpoint)
     if kind == ProviderKind.GOOGLE:
         return GoogleAiStudioProvider(model, google_api_key, usage_store)
+    if kind == ProviderKind.OPENAI:
+        return OpenAiApiProvider(model, openai_api_key)
     return LlamaCppProvider(model, llama_endpoint)

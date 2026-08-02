@@ -12,6 +12,7 @@ except ImportError:  # The application still works with GOOGLE_API_KEY during se
 
 _SERVICE = "LOOKBOOKBOT"
 _GOOGLE_ACCOUNT = "google-ai-studio"
+_OPENAI_ACCOUNT = "openai-api"
 
 
 def get_google_api_key() -> str:
@@ -36,6 +37,33 @@ def save_google_api_key(value: str) -> bool:
         return False
     try:
         keyring.set_password(_SERVICE, _GOOGLE_ACCOUNT, key)
+    except Exception:
+        return False
+    return True
+
+
+def get_openai_api_key() -> str:
+    """Read the OpenAI API key from Credential Manager or the environment."""
+    if keyring is not None:
+        try:
+            saved = keyring.get_password(_SERVICE, _OPENAI_ACCOUNT)
+            if saved:
+                return saved.strip()
+        except Exception:
+            pass
+    return os.environ.get("OPENAI_API_KEY", "").strip()
+
+
+def save_openai_api_key(value: str) -> bool:
+    """Persist a non-empty OpenAI API key outside project files and the DB."""
+    key = value.strip()
+    if not key:
+        return False
+    os.environ["OPENAI_API_KEY"] = key
+    if keyring is None:
+        return False
+    try:
+        keyring.set_password(_SERVICE, _OPENAI_ACCOUNT, key)
     except Exception:
         return False
     return True

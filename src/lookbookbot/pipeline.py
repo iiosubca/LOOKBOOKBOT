@@ -24,7 +24,7 @@ from .domain import (
     visible_date_text,
 )
 from .providers import CodexProvider, ModelProvider, ProviderError, VisionDecision, make_provider
-from .secrets import get_google_api_key
+from .secrets import get_google_api_key, get_openai_api_key
 from .state import StateStore
 from .visual_audit import visual_audit_blocker_message
 
@@ -482,6 +482,7 @@ class PipelineEngine:
             ollama_endpoint=self.store.get_setting("ollama_endpoint", "http://127.0.0.1:11434"),
             llama_endpoint=self.store.get_setting("llama_endpoint", "http://127.0.0.1:8080"),
             google_api_key=get_google_api_key(),
+            openai_api_key=get_openai_api_key(),
             usage_store=self.store,
         )
 

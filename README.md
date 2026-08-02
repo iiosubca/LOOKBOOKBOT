@@ -1,5 +1,9 @@
 # LOOKBOOKBOT for Windows
 
+## Version 0.2.59
+
+Added **OpenAI API** as a separate AI provider. Select it in the `ИИ` list, enter an `OPENAI_API_KEY` in the field that appears, choose a model (by default `gpt-5.6`) and press `Проверить модель`. The key is stored in Windows Credential Manager rather than the project database or lookbook folder. Text requests and image-proof checks use the direct OpenAI Responses API; Codex is not required for this mode.
+
 ## Version 0.2.37
 
 Every new project now freezes a project-local source snapshot before the INDD master is created: the PDF reference, Excel catalogue, all hires and the automation template live under `control/work/_mat`. On resume, LOOKBOOKBOT verifies and uses only that snapshot; it neither reads nor overwrites from the currently selected SOURCES folder. Legacy projects gain the same protection as soon as their preparation step is opened again.

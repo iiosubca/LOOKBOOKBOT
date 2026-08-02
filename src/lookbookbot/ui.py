@@ -56,7 +56,7 @@ from .domain import ProviderKind, STAGES, StageStatus, project_code
 from .pipeline import PipelineEngine, PipelineError, PipelineResult
 from .project_import import ExistingProjectError, open_existing_project
 from .providers import ProviderError, make_provider
-from .secrets import get_google_api_key, save_google_api_key
+from .secrets import get_google_api_key, get_openai_api_key, save_google_api_key, save_openai_api_key
 from .state import StateStore
 from .visual_audit import load_visual_audit
 
@@ -291,6 +291,7 @@ class MainWindow(QMainWindow):
         self.date_edit.setDisplayFormat("dd.MM.yyyy")
         self.provider_combo = QComboBox()
         self.provider_combo.addItem("Codex", ProviderKind.CODEX.value)
+        self.provider_combo.addItem("OpenAI API", ProviderKind.OPENAI.value)
         self.provider_combo.addItem("Google AI Studio", ProviderKind.GOOGLE.value)
         self.provider_combo.addItem("Ollama", ProviderKind.OLLAMA.value)
         self.provider_combo.addItem("llama.cpp", ProviderKind.LLAMACPP.value)
@@ -298,11 +299,10 @@ class MainWindow(QMainWindow):
         self.model_combo = QComboBox()
         self.model_combo.setEditable(True)
         self.model_combo.setMinimumWidth(180)
-        self.google_key_label = QLabel("Google API key")
-        self.google_key_edit = QLineEdit()
-        self.google_key_edit.setPlaceholderText("Ключ AI Studio")
-        self.google_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.google_key_edit.setMinimumWidth(170)
+        self.provider_key_label = QLabel("API key")
+        self.provider_key_edit = QLineEdit()
+        self.provider_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.provider_key_edit.setMinimumWidth(170)
         self.google_quota = QLabel()
         self.google_quota.setObjectName("Muted")
         test_provider = QPushButton("Проверить модель")
@@ -333,8 +333,8 @@ class MainWindow(QMainWindow):
         model_row.addWidget(self.provider_combo)
         model_row.addWidget(self.model_combo)
         model_row.addSpacing(14)
-        model_row.addWidget(self.google_key_label)
-        model_row.addWidget(self.google_key_edit)
+        model_row.addWidget(self.provider_key_label)
+        model_row.addWidget(self.provider_key_edit)
         model_row.addWidget(self.google_quota, 1)
         model_row.addWidget(test_provider)
         model_row.addWidget(create)
@@ -695,7 +695,6 @@ class MainWindow(QMainWindow):
         if index >= 0:
             self.provider_combo.setCurrentIndex(index)
         self.model_combo.setCurrentText(self.store.get_setting(f"model_{provider}", ""))
-        self.google_key_edit.setText(get_google_api_key())
         self._provider_changed()
 
     def _load_project(self) -> None:
@@ -751,7 +750,7 @@ class MainWindow(QMainWindow):
         project_dir = output_root / project_code(show_date)
         provider = ProviderKind(str(self.provider_combo.currentData()))
         model = self.model_combo.currentText().strip()
-        self._save_google_key_if_supplied(provider)
+        self._save_provider_key_if_supplied(provider)
         self.project = self.store.save_project(
             name=project_code(show_date), source_dir=source.resolve(), output_root=output_root,
             project_dir=project_dir, show_date=show_date, provider=provider, model=model,
@@ -784,6 +783,7 @@ class MainWindow(QMainWindow):
         self.model_combo.clear()
         defaults = {
             ProviderKind.CODEX: ["", "gpt-5.6-sol", "gpt-5.5"],
+            ProviderKind.OPENAI: ["gpt-5.6"],
             ProviderKind.GOOGLE: ["gemini-3.5-flash-lite"],
             ProviderKind.OLLAMA: [saved] if saved else [],
             ProviderKind.LLAMACPP: [saved or "local"],
@@ -791,15 +791,27 @@ class MainWindow(QMainWindow):
         self.model_combo.addItems([item for item in defaults[kind] if item or kind == ProviderKind.CODEX])
         self.model_combo.setCurrentText(saved or defaults[kind][0])
         is_google = kind == ProviderKind.GOOGLE
-        self.google_key_label.setVisible(is_google)
-        self.google_key_edit.setVisible(is_google)
+        is_openai = kind == ProviderKind.OPENAI
+        needs_key = is_google or is_openai
+        self.provider_key_label.setVisible(needs_key)
+        self.provider_key_edit.setVisible(needs_key)
         self.google_quota.setVisible(is_google)
         if is_google:
+            self.provider_key_label.setText("Google API key")
+            self.provider_key_edit.setPlaceholderText("Ключ AI Studio")
+            self.provider_key_edit.setText(get_google_api_key())
             self._refresh_google_quota()
+        elif is_openai:
+            self.provider_key_label.setText("OpenAI API key")
+            self.provider_key_edit.setPlaceholderText("sk-...")
+            self.provider_key_edit.setText(get_openai_api_key())
 
-    def _save_google_key_if_supplied(self, provider: ProviderKind) -> None:
-        if provider == ProviderKind.GOOGLE and self.google_key_edit.text().strip():
-            save_google_api_key(self.google_key_edit.text())
+    def _save_provider_key_if_supplied(self, provider: ProviderKind) -> None:
+        value = self.provider_key_edit.text()
+        if provider == ProviderKind.GOOGLE and value.strip():
+            save_google_api_key(value)
+        elif provider == ProviderKind.OPENAI and value.strip():
+            save_openai_api_key(value)
 
     def _refresh_google_quota(self) -> None:
         usage = self.store.google_usage_status()
@@ -812,12 +824,13 @@ class MainWindow(QMainWindow):
 
     def _test_provider(self) -> None:
         kind = ProviderKind(str(self.provider_combo.currentData()))
-        self._save_google_key_if_supplied(kind)
+        self._save_provider_key_if_supplied(kind)
         provider = make_provider(
             kind, self.model_combo.currentText().strip(),
             ollama_endpoint=self.store.get_setting("ollama_endpoint", "http://127.0.0.1:11434"),
             llama_endpoint=self.store.get_setting("llama_endpoint", "http://127.0.0.1:8080"),
             google_api_key=get_google_api_key(),
+            openai_api_key=get_openai_api_key(),
             usage_store=self.store,
         )
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
@@ -842,7 +855,7 @@ class MainWindow(QMainWindow):
         if self.project is None:
             QMessageBox.information(self, "Сначала создайте проект", "Выберите исходники, дату и нажмите «Создать / открыть проект».")
             return
-        self._save_google_key_if_supplied(ProviderKind(str(self.provider_combo.currentData())))
+        self._save_provider_key_if_supplied(ProviderKind(str(self.provider_combo.currentData())))
         selected = self.stage_list.selectedItems()
         start_key = str(selected[0].data(Qt.ItemDataRole.UserRole)) if selected else None
         # A deliberately selected stage is an explicit request to rebuild it
