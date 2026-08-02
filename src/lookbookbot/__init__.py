@@ -1,3 +1,3 @@
 """LOOKBOOKBOT Windows desktop application."""
 
-__version__ = "0.2.59"
+__version__ = "0.2.60"

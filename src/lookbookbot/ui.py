@@ -264,7 +264,7 @@ class MainWindow(QMainWindow):
         title_box.setSpacing(2)
         title = QLabel("LOOKBOOKBOT")
         title.setObjectName("Title")
-        subtitle = QLabel("Управляемая вёрстка лукбука в Adobe InDesign")
+        subtitle = QLabel("Автоматизированная вёрстка лукбука в Adobe InDesign")
         subtitle.setObjectName("Muted")
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
