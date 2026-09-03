@@ -17,6 +17,8 @@ def test_development_engine_is_internal_to_the_application() -> None:
 
 def test_windows_build_excludes_codex_skill_metadata() -> None:
     build = (ROOT / "build_windows.bat").read_text(encoding="utf-8")
+    spec = (ROOT / "LOOKBOOKBOT.spec").read_text(encoding="utf-8")
 
-    assert "automation-engine\\lookbook-layout\\scripts;automation-engine\\core\\scripts" in build
+    assert "LOOKBOOKBOT.spec" in build
+    assert r"automation-engine\\lookbook-layout\\scripts', 'automation-engine\\core\\scripts" in spec
     assert "automation-engine\\lookbook-layout;automation-engine\\lookbook-layout" not in build

@@ -59,6 +59,24 @@ class ModelProvider(ABC):
     def inspect_proof(self, prompt: str, images: list[Path]) -> VisionDecision:
         raise ProviderError(f"{self.kind.value} не поддерживает прямую проверку изображений.")
 
+    def run_readonly_vision(
+        self,
+        prompt: str,
+        workspace: Path,
+        *,
+        images: list[Path],
+        timeout: int = 3600,
+    ) -> str:
+        """Return the raw read-only vision response for closed-board choices.
+
+        HTTP vision providers already expose a parsed ``inspect_proof`` method;
+        the raw response is retained there so the controller can validate a
+        closed candidate label itself.  Codex overrides this to use its
+        read-only CLI sandbox.
+        """
+        del workspace, timeout
+        return self.inspect_proof(prompt, images).raw
+
 
 class CodexProvider(ModelProvider):
     kind = ProviderKind.CODEX
@@ -105,6 +123,16 @@ class CodexProvider(ModelProvider):
         return self._run_agent(
             read_only_vision_prompt(prompt), workspace, timeout=timeout, sandbox="read-only", images=attachments,
         )
+
+    def run_readonly_vision(
+        self,
+        prompt: str,
+        workspace: Path,
+        *,
+        images: list[Path],
+        timeout: int = 3600,
+    ) -> str:
+        return self.run_readonly_agent(prompt, workspace, timeout=timeout, images=images)
 
     def _run_agent(
         self,
@@ -349,6 +377,101 @@ class HttpVisionProvider(ModelProvider):
         return VisionDecision(accepted, note, cleaned)
 
 
+class OpenRouterProvider(HttpVisionProvider):
+    """OpenRouter's OpenAI-compatible chat API for text and image proofs."""
+
+    kind = ProviderKind.OPENROUTER
+    endpoint = "https://openrouter.ai/api/v1/chat/completions"
+    models_endpoint = "https://openrouter.ai/api/v1/models"
+
+    def __init__(self, model: str, api_key: str = "") -> None:
+        super().__init__(model or "google/gemini-3.8-flash")
+        self.api_key = api_key.strip() or os.environ.get("OPENROUTER_API_KEY", "").strip()
+
+    def _require_key(self) -> str:
+        if not self.api_key:
+            raise ProviderError("Введите ключ OpenRouter API или задайте переменную окружения OPENROUTER_API_KEY.")
+        return self.api_key
+
+    def _request_openrouter(
+        self,
+        url: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        method: str = "GET",
+        timeout: int = 20,
+    ) -> Any:
+        key = self._require_key()
+        data = json.dumps(payload).encode("utf-8") if payload is not None else None
+        request = urllib.request.Request(
+            url,
+            data=data,
+            method=method,
+            headers={
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://github.com/lookbookbot",
+                "X-OpenRouter-Title": "LOOKBOOKBOT",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8", errors="replace")
+            raise ProviderError(f"OpenRouter API {error.code}: {detail[-1600:]}") from error
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+            raise ProviderError(f"OpenRouter API недоступен: {error}") from error
+
+    def health(self) -> str:
+        body = self._request_openrouter(self.models_endpoint)
+        models = body.get("data", []) if isinstance(body, dict) else []
+        available = {str(item.get("id", "")) for item in models if isinstance(item, dict)}
+        if self.model not in available:
+            raise ProviderError(f"OpenRouter не подтвердил модель {self.model}.")
+        return f"OpenRouter: {self.model}"
+
+    def list_models(self) -> list[str]:
+        return [self.model]
+
+    @staticmethod
+    def _message_text(body: Any) -> str:
+        choices = body.get("choices", []) if isinstance(body, dict) else []
+        if not choices or not isinstance(choices[0], dict):
+            raise ProviderError(f"OpenRouter вернул ответ без choices: {str(body)[:800]}")
+        message = choices[0].get("message", {})
+        content = message.get("content", "") if isinstance(message, dict) else ""
+        if isinstance(content, list):
+            content = "".join(
+                str(part.get("text", "")) for part in content if isinstance(part, dict)
+            )
+        text = str(content).strip()
+        if not text:
+            raise ProviderError(f"OpenRouter вернул ответ без текста: {str(body)[:800]}")
+        return text
+
+    def _chat(self, messages: list[dict[str, Any]], timeout: int) -> str:
+        return self._message_text(self._request_openrouter(
+            self.endpoint,
+            {"model": self.model, "temperature": 0, "messages": messages},
+            method="POST",
+            timeout=timeout,
+        ))
+
+    def run_agent(self, prompt: str, workspace: Path, timeout: int = 7200) -> str:
+        del workspace
+        return self._chat([{"role": "user", "content": prompt}], timeout)
+
+    def inspect_proof(self, prompt: str, images: list[Path]) -> VisionDecision:
+        prompt = read_only_vision_prompt(prompt)
+        content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+        for path in images:
+            mime = "image/png" if path.suffix.casefold() == ".png" else "image/jpeg"
+            encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+            content.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}})
+        return self._decision(self._chat([{"role": "user", "content": content}], 600))
+
+
 class OllamaProvider(HttpVisionProvider):
     kind = ProviderKind.OLLAMA
 
@@ -488,6 +611,7 @@ def make_provider(
     llama_endpoint: str = "http://127.0.0.1:8080",
     google_api_key: str = "",
     openai_api_key: str = "",
+    openrouter_api_key: str = "",
     usage_store: Any | None = None,
 ) -> ModelProvider:
     if kind == ProviderKind.CODEX:
@@ -498,4 +622,6 @@ def make_provider(
         return GoogleAiStudioProvider(model, google_api_key, usage_store)
     if kind == ProviderKind.OPENAI:
         return OpenAiApiProvider(model, openai_api_key)
+    if kind == ProviderKind.OPENROUTER:
+        return OpenRouterProvider(model, openrouter_api_key)
     return LlamaCppProvider(model, llama_endpoint)

@@ -51,6 +51,11 @@ def test_prepare_freezes_project_local_sources_and_never_overwrites_them(tmp_pat
         "hires": (controlled / "hires" / "look-001.jpg").read_bytes(),
     }
     assert "локальными копиями" in first
+    visible = project.project_dir / "_MAT"
+    assert (visible / "reference.pdf").read_bytes() == frozen["reference"]
+    assert (visible / "catalog.xlsx").read_bytes() == frozen["catalog"]
+    assert (visible / "TSUM_AUTOMATION.indd").read_bytes() == frozen["template"]
+    assert (visible / "hires" / "look-001.jpg").read_bytes() == frozen["hires"]
 
     (source / "reference.pdf").write_bytes(b"reference-v2")
     (source / "catalog.xlsx").write_bytes(b"catalog-v2")

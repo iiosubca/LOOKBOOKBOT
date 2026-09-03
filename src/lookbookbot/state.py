@@ -10,7 +10,7 @@ from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
 from .config import app_data_dir
-from .domain import ProjectRecord, ProviderKind, STAGES, StageStatus
+from .domain import BuildMode, ProjectRecord, ProviderKind, STAGES, StageStatus
 
 
 def utc_now() -> str:
@@ -48,6 +48,7 @@ class StateStore:
                     show_date TEXT NOT NULL,
                     provider TEXT NOT NULL,
                     model TEXT NOT NULL DEFAULT '',
+                    build_mode TEXT NOT NULL DEFAULT 'full',
                     active INTEGER NOT NULL DEFAULT 0,
                     approved INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
@@ -129,6 +130,9 @@ class StateStore:
                 db.execute("ALTER TABLE credits ADD COLUMN needs_rematch INTEGER NOT NULL DEFAULT 0")
             if "rematch_requested_at" not in credit_columns:
                 db.execute("ALTER TABLE credits ADD COLUMN rematch_requested_at TEXT")
+            project_columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(projects)").fetchall()}
+            if "build_mode" not in project_columns:
+                db.execute("ALTER TABLE projects ADD COLUMN build_mode TEXT NOT NULL DEFAULT 'full'")
 
     def save_project(
         self,
@@ -140,11 +144,19 @@ class StateStore:
         show_date: date,
         provider: ProviderKind,
         model: str,
+        build_mode: BuildMode | str | None = None,
     ) -> ProjectRecord:
         now = utc_now()
         with self.connect() as db:
             existing = db.execute("SELECT id FROM projects WHERE project_dir = ?", (str(project_dir),)).fetchone()
             project_id = str(existing["id"]) if existing else str(uuid.uuid4())
+            existing_mode = "full"
+            if existing:
+                existing_row = db.execute("SELECT build_mode FROM projects WHERE id = ?", (project_id,)).fetchone()
+                existing_mode = str(existing_row["build_mode"]) if existing_row else "full"
+            requested_mode = build_mode.value if isinstance(build_mode, BuildMode) else str(build_mode or existing_mode)
+            if requested_mode not in {mode.value for mode in BuildMode}:
+                requested_mode = BuildMode.FULL.value
             # A deleted delivery folder is a new attempt, even when its date
             # happens to reproduce a previous database path. Never resurrect
             # stale cards, stages, or manual decisions into that new project.
@@ -154,16 +166,17 @@ class StateStore:
             db.execute("UPDATE projects SET active = 0")
             db.execute(
                 """
-                INSERT INTO projects(id,name,source_dir,output_root,project_dir,show_date,provider,model,active,created_at,updated_at)
-                VALUES(?,?,?,?,?,?,?,?,1,?,?)
+                INSERT INTO projects(id,name,source_dir,output_root,project_dir,show_date,provider,model,build_mode,active,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,1,?,?)
                 ON CONFLICT(id) DO UPDATE SET
                     name=excluded.name, source_dir=excluded.source_dir, output_root=excluded.output_root,
                     show_date=excluded.show_date, provider=excluded.provider, model=excluded.model,
+                    build_mode=excluded.build_mode,
                     active=1, updated_at=excluded.updated_at
                 """,
                 (
                     project_id, name, str(source_dir), str(output_root), str(project_dir), show_date.isoformat(),
-                    provider.value, model.strip(), now, now,
+                    provider.value, model.strip(), requested_mode, now, now,
                 ),
             )
             for stage in STAGES:
@@ -178,10 +191,15 @@ class StateStore:
             row = db.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
         if row is None:
             raise KeyError(project_id)
+        try:
+            build_mode = BuildMode(str(row["build_mode"]))
+        except (KeyError, ValueError):
+            build_mode = BuildMode.FULL
         return ProjectRecord(
             id=row["id"], name=row["name"], source_dir=Path(row["source_dir"]),
             output_root=Path(row["output_root"]), project_dir=Path(row["project_dir"]),
             show_date=date.fromisoformat(row["show_date"]), provider=ProviderKind(row["provider"]), model=row["model"],
+            build_mode=build_mode,
         )
 
     def active_project(self) -> ProjectRecord | None:
@@ -206,6 +224,16 @@ class StateStore:
         with self.connect() as db:
             row = db.execute("SELECT approved FROM projects WHERE id = ?", (project_id,)).fetchone()
         return bool(row and row["approved"])
+
+    def set_build_mode(self, project_id: str, build_mode: BuildMode | str) -> None:
+        value = build_mode.value if isinstance(build_mode, BuildMode) else str(build_mode)
+        if value not in {mode.value for mode in BuildMode}:
+            raise ValueError(f"Неизвестный режим сборки: {value}")
+        with self.connect() as db:
+            db.execute(
+                "UPDATE projects SET build_mode = ?, updated_at = ? WHERE id = ?",
+                (value, utc_now(), project_id),
+            )
 
     def stage_rows(self, project_id: str) -> dict[str, dict[str, Any]]:
         with self.connect() as db:

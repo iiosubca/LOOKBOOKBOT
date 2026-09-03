@@ -1,6 +1,38 @@
 # LOOKBOOKBOT for Windows
 
-## Version 0.2.59
+## Version 0.2.68
+
+Добавлен провайдер **OpenRouter** с моделью `google/gemini-3.8-flash`. Ключ хранится в Windows Credential Manager, а запросы используют официальный OpenRouter Chat Completions API с поддержкой текстовых и визуальных проверок.
+
+## Version 0.2.67
+
+Добавлен режим **«Только фотографии — INDD»**. Он фиксирует порядок PDF-референса и пары фотографий, выполняет структуру, дату, привязку фреймов и расстановку фотографий в локальном INDD, после чего останавливается. Excel-сопоставление, кредиты, визуальная проверка, PDF на проверку и финальные PDF в этом режиме не запускаются; пропущенные этапы отображаются в интерфейсе как намеренно пропущенные.
+
+## Version 0.2.66
+
+Excel credit-card matching now scores the complete PDF look pair: the representative Excel image is compared with both ordered PDF photos, while the combined pair appearance is used as a conservative tie-breaker in the global one-to-one assignment. Strong direct matches remain stable, and visual proof/confirmation is still required before credits are written.
+
+## Version 0.2.65
+
+Reference-photo matching now uses foreground appearance evidence and evaluates the left/right pair jointly. A close-up can anchor a visually similar full-length image without the quick build incorrectly blanking the entire look; one-to-one assignment and the PDF-authoritative order remain unchanged.
+
+## Version 0.2.64
+
+The first preparation stage now restores the familiar project-root `_MAT` folder containing the frozen PDF, Excel, hires and automation template. It is a synchronized browsing/handoff mirror of the protected `control/work/_mat` snapshot; the pipeline still reads only the frozen local copy and never the changing SOURCES folder.
+
+## Version 0.2.63
+
+Targeted credit rematching now uses the extracted PDF-reference photos when a quick build has a temporary `__lbb_missing_...` hire placeholder, so the model is never asked to identify a look from a blank board. The closed-board selector also accepts the compact label response used during schema repair, retries format-only failures with the same candidate set, and retains the existing one-to-one mapping for a quick-build look whose reference photo is genuinely unavailable.
+
+## Version 0.2.62
+
+The quick build now uses **autonomous credit matching**. Every initial Excel-card proposal is checked by the selected vision provider before credits are written; rejected matches are rematched from the complete unused-card pool while preserving the one-card-per-look rule. This internal proof does not start InDesign visual clearance or create a PDF, and it does not require manual confirmation. A temporary provider/response failure is retried and, only if necessary, falls back to the deterministic one-to-one map so the quick INDD build does not stop on a modal review error.
+
+## Version 0.2.61
+
+Added the explicit **Быстрая сборка — только INDD** mode. It runs the source, PDF-order, credit-map, structure, image and credits stages, then stops after the INDD pass. It does not run visual clearance or create any PDF. When a required retouched photo is absent or ambiguous, the complete look receives a documented blank placeholder in its fixed image frames; the PDF-reference pixels are used to map credits, and the selected vision provider internally rechecks that mapping before the INDD is saved. The selected mode is saved per project; intentionally skipped stages remain visible as skipped rather than failed. Switch back to **Полная сборка** when the project should continue through visual review and PDF export.
+
+## Version 0.2.60
 
 Added **OpenAI API** as a separate AI provider. Select it in the `ИИ` list, enter an `OPENAI_API_KEY` in the field that appears, choose a model (by default `gpt-5.6`) and press `Проверить модель`. The key is stored in Windows Credential Manager rather than the project database or lookbook folder. Text requests and image-proof checks use the direct OpenAI Responses API; Codex is not required for this mode.
 
@@ -168,6 +200,7 @@ LOOKBOOKBOT — настольная программа для управляе�
 - продолжение с первой незавершённой строки или запуск с выбранного этапа;
 - таблица PDF-порядка и пар изображений с предпросмотром и ручной заменой;
 - таблица соответствий `LOOK_### ↔ лист/номер карточки Excel` с отдельной ручной правкой;
+- автоматическое определение необязательной обложки PDF-референса: первая страница с двумя видимыми фото не пропускается;
 - все временные материалы только в `control/work`, корень выпуска остаётся чистым;
 - прямое управление InDesign через официальный COM-контроллер, без движения мыши;
 - пакетное продолжение этапов `images`, `captions` и composition;

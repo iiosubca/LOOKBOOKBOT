@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from lookbookbot.pipeline import _look_ids_in_text, _parse_codex_batch_decisions, _safe_confirmation_note
+from lookbookbot.pipeline import _look_ids_in_text, _parse_codex_batch_decisions, _run_readonly_vision, _safe_confirmation_note
 from lookbookbot.providers import ProviderError
 
 
@@ -43,3 +43,27 @@ def test_reads_only_the_controller_named_looks_from_a_note_failure() -> None:
     assert _look_ids_in_text("BLOCKED: LOOK_008 and LOOK_041 need another visual observation.") == [
         "LOOK_008", "LOOK_041",
     ]
+
+
+def test_rejected_autonomous_mapping_does_not_require_a_confirmation_note() -> None:
+    decisions = _parse_codex_batch_decisions(
+        '{"decisions":[{"look_id":"LOOK_001","accepted":false,"note":"другая куртка"}]}',
+        ["LOOK_001"],
+    )
+
+    assert decisions["LOOK_001"].accepted is False
+    assert decisions["LOOK_001"].note == "другая куртка"
+
+
+def test_readonly_vision_keeps_legacy_provider_doubles_compatible(tmp_path) -> None:
+    class LegacyProvider:
+        def run_readonly_agent(self, prompt, workspace, *, images, timeout):
+            assert prompt == "choose"
+            assert workspace == tmp_path
+            assert images == [tmp_path / "proof.jpg"]
+            assert timeout == 12
+            return "{}"
+
+    assert _run_readonly_vision(
+        LegacyProvider(), "choose", tmp_path, [tmp_path / "proof.jpg"], timeout=12,
+    ) == "{}"

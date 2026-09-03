@@ -16,7 +16,7 @@ WORK_FOLDERS = (
     "reference",
     "scratch",
 )
-ROOT_DIRECTORIES = {"control", "control-history", "Gender"}
+ROOT_DIRECTORIES = {"control", "control-history", "Gender", "_MAT"}
 ROOT_FILE_SUFFIXES = {".indd", ".pdf", ".idlk"}
 ROOT_FILE_NAMES = {"desktop.ini", "Thumbs.db", ".DS_Store"}
 
@@ -24,7 +24,7 @@ ROOT_FILE_NAMES = {"desktop.ini", "Thumbs.db", ".DS_Store"}
 def unexpected_root_items(project: Path) -> list[Path]:
     result: list[Path] = []
     for item in project.iterdir():
-        if item.is_dir() and item.name in ROOT_DIRECTORIES:
+        if item.is_dir() and item.name.casefold() in {name.casefold() for name in ROOT_DIRECTORIES}:
             continue
         if item.is_file() and (item.suffix.lower() in ROOT_FILE_SUFFIXES or item.name in ROOT_FILE_NAMES):
             continue
@@ -43,7 +43,7 @@ def main() -> None:
     if unexpected:
         names = ", ".join(item.name for item in sorted(unexpected, key=lambda item: item.name.lower()))
         raise SystemExit(
-            "Project root is not clean. Keep only INDD, deliverable PDFs, Gender, and control here; "
+            "Project root is not clean. Keep only INDD, deliverable PDFs, Gender, _MAT, and control here; "
             f"move these items before starting: {names}"
         )
     work = project / "control" / "work"

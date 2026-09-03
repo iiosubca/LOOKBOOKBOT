@@ -22,6 +22,8 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageOps
 from pypdf import PdfReader
 
+from pdf_page_geometry import draw_fully_covered_by_later, draw_intersects_page
+
 
 FIELDS = [
     "look_id",
@@ -33,6 +35,16 @@ FIELDS = [
     "indd_right_page",
 ]
 THUMBNAIL = (48, 72)
+PLACEHOLDER_PREFIX = "__lbb_missing_"
+MISSING_REFERENCE_DIR = Path("control/work/missing-photo-reference")
+# The original RGB/edge score is useful for near-identical exports, but it can
+# confuse two garments with a similar silhouette.  The foreground appearance
+# score supplies colour/texture evidence from the model and garment while the
+# pair score below makes the left/right decision jointly.
+BASE_MATCH_WEIGHT = 0.75
+APPEARANCE_MATCH_WEIGHT = 0.25
+PAIR_MARGIN = 0.004
+PAIR_SCORE_LIMIT = 0.32
 DRAW = re.compile(
     rb"q\s+([-+0-9.eE]+)\s+([-+0-9.eE]+)\s+([-+0-9.eE]+)\s+([-+0-9.eE]+)\s+([-+0-9.eE]+)\s+([-+0-9.eE]+)\s+cm\s+/([^\s/]+)\s+Do"
 )
@@ -66,35 +78,81 @@ def reduced_rgb(image: Image.Image, size: tuple[int, int], *, crop: bool) -> Ima
     return method(prepared, size, method=Image.Resampling.LANCZOS)
 
 
+def visible_pdf_draws(page) -> list[tuple[tuple[float, float, float, float, float, float], Image.Image]]:
+    """Return the actually visible photo placements, ordered left to right.
+
+    This is deliberately separate from ``visible_pdf_pair`` so the builder can
+    inspect the first page before deciding whether it is a cover.  A cover may
+    contain a logo or a decorative image, while a look page has exactly two
+    visible photo placements.
+    """
+    names = {item.name.rsplit(".", 1)[0]: item.image for item in page.images}
+    content = page.get_contents()
+    if content is None:
+        return []
+    placements: list[tuple[tuple[float, float, float, float, float, float], Image.Image]] = []
+    for match in DRAW.finditer(content.get_data()):
+        matrix = tuple(float(match.group(index)) for index in range(1, 7))
+        if not draw_intersects_page(page, matrix):
+            # Ignore image XObjects whose complete transformed bounds are
+            # outside the page.  InDesign/PDF exports may retain such stale
+            # placements alongside the two photographs that are actually
+            # visible on the reference page.
+            continue
+        name = match.group(7).decode("latin-1")
+        image = names.get(name)
+        if image is None:
+            continue
+        placements.append((matrix, image))
+    visible = [
+        (matrix, image)
+        for index, (matrix, image) in enumerate(placements)
+        if not draw_fully_covered_by_later(
+            page,
+            matrix,
+            [later_matrix for later_matrix, _later_image in placements[index + 1 :]],
+        )
+    ]
+    return sorted(visible, key=lambda item: item[0][4])
+
+
 def visible_pdf_pair(page, page_number: int) -> tuple[Image.Image, Image.Image]:
-    """Return the two visually topmost source images, ordered by horizontal page position.
+    """Return the two visible source images, ordered by horizontal page position.
 
     A PDF can retain an extra image XObject below the final right image.  Counting
     XObjects would treat that hidden source as a third look photo.  The page content
     stream instead identifies actual placements; at one rectangle only the final
     draw is visible.
     """
-    names = {item.name.rsplit(".", 1)[0]: item.image for item in page.images}
-    content = page.get_contents()
-    if content is None:
-        fail(f"PDF page {page_number} has no drawing content.")
-    visible: dict[tuple[float, float], tuple[float, Image.Image]] = {}
-    for match in DRAW.finditer(content.get_data()):
-        width, _b, _c, height, x, y = (float(match.group(index)) for index in range(1, 7))
-        name = match.group(7).decode("latin-1")
-        image = names.get(name)
-        if image is None:
-            continue
-        # PDF export can round two stacked draws to slightly different widths.
-        # Their shared placement coordinates, not dimensions, identify the same slot.
-        key = (round(x, 2), round(y, 2))
-        visible[key] = (x, image)
-    draws = sorted(visible.values(), key=lambda item: item[0])
+    draws = visible_pdf_draws(page)
     if len(draws) != 2:
         fail(
             f"PDF page {page_number} must visibly place exactly two look photographs; found {len(draws)}."
         )
     return draws[0][1], draws[1][1]
+
+
+def detect_cover_pages(reader) -> int:
+    """Detect the optional leading cover without assuming page one is a cover.
+
+    A controlled source may be either ``cover + N look pages`` or simply ``N look
+    pages``.  We only accept an automatic decision when the first page is clearly a
+    two-photo look page or the second page is clearly the first look after a
+    non-look cover.  Other layouts remain explicit errors instead of silently
+    shifting every look by one page.
+    """
+    if not reader.pages:
+        fail("Reference PDF has no pages.")
+    first_count = len(visible_pdf_draws(reader.pages[0]))
+    if first_count == 2:
+        return 0
+    if len(reader.pages) > 1 and len(visible_pdf_draws(reader.pages[1])) == 2:
+        return 1
+    fail(
+        "Cannot automatically determine the optional cover page: the first page "
+        "is not a two-photo look page and the next page is not a valid look page. "
+        "Use --cover-pages 0 or --cover-pages 1 after checking the reference PDF."
+    )
 
 
 def feature(image: Image.Image) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -116,6 +174,51 @@ def distance(left: tuple[np.ndarray, np.ndarray, np.ndarray], right: tuple[np.nd
     edges = float(np.mean(np.abs(left[1] - right[1])))
     silhouette = float(np.mean(np.abs(left[2] - right[2])))
     return colour * 0.42 + edges * 0.38 + silhouette * 0.20
+
+
+def appearance_signature(features: tuple[np.ndarray, np.ndarray, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    """Return foreground-weighted colour and spatial appearance evidence.
+
+    PDF reference images and hires can have different crops and JPEG quality.
+    A coarse foreground colour histogram plus low-resolution colour/mask
+    profiles is therefore more stable than comparing every pixel.  The
+    foreground mask is the same conservative mask used by ``feature`` and is
+    intentionally not a face/name/filename heuristic.
+    """
+    rgb, _edge, foreground = features
+    quantized = np.minimum((rgb * 8).astype(np.int32), 7)
+    bins = (quantized[..., 0] * 64 + quantized[..., 1] * 8 + quantized[..., 2]).ravel()
+    weights = foreground.ravel().astype(np.float64)
+    histogram = np.bincount(bins, weights=weights, minlength=512).astype(np.float64)
+    total = float(histogram.sum())
+    if total > 0:
+        histogram /= total
+    weighted_colour = (rgb * foreground[..., None]).sum(axis=(0, 1)) / max(float(foreground.sum()), 1e-8)
+    profile = np.concatenate((foreground.mean(axis=1), foreground.mean(axis=0)))
+    summary = np.concatenate((weighted_colour, np.asarray([foreground.mean()]), profile)).astype(np.float64)
+    return histogram, summary
+
+
+def appearance_distance(
+    left: tuple[np.ndarray, np.ndarray], right: tuple[np.ndarray, np.ndarray],
+) -> float:
+    """Compare the foreground appearance of two same-role photographs."""
+    histogram = float(np.abs(left[0] - right[0]).sum() / 2.0)
+    summary = float(np.mean(np.abs(left[1] - right[1])))
+    return histogram + 0.4 * summary
+
+
+def matching_distance(
+    left: tuple[np.ndarray, np.ndarray, np.ndarray],
+    right: tuple[np.ndarray, np.ndarray, np.ndarray],
+    left_appearance: tuple[np.ndarray, np.ndarray],
+    right_appearance: tuple[np.ndarray, np.ndarray],
+) -> float:
+    """Blend pixel structure with foreground appearance for registry matching."""
+    return (
+        BASE_MATCH_WEIGHT * distance(left, right)
+        + APPEARANCE_MATCH_WEIGHT * appearance_distance(left_appearance, right_appearance)
+    )
 
 
 def minimum_assignment(cost: np.ndarray) -> list[int]:
@@ -263,7 +366,185 @@ def write_registry(path: Path, rows: list[dict[str, str]]) -> None:
         writer.writerows(rows)
 
 
-def build(project: Path, reference: Path, hires: Path, registry: Path, cover_pages: int, dry_run: bool) -> None:
+def _is_placeholder(path: Path) -> bool:
+    return path.name.casefold().startswith(PLACEHOLDER_PREFIX)
+
+
+def _write_blank_placeholder(path: Path) -> Image.Image:
+    """Create a neutral image that can be placed in a fixed InDesign frame.
+
+    Quick mode intentionally leaves the frame usable but visually empty.  The
+    actual PDF-reference image is stored separately for credit mapping; it is
+    never placed into the INDD as a substitute for the missing retouch.
+    """
+    image = Image.new("RGB", (360, 540), "white")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(path, "JPEG", quality=95, optimize=True)
+    return image
+
+
+def _clear_previous_quick_artifacts(project: Path, hires: Path) -> None:
+    """Remove only placeholders owned by an earlier quick registry pass."""
+    manifest_path = project / "control" / "work" / "quick-missing-photos.json"
+    if manifest_path.is_file():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            manifest = {}
+        placeholders = manifest.get("placeholders", {}) if isinstance(manifest, dict) else {}
+        if isinstance(placeholders, dict):
+            for value in placeholders.values():
+                if not isinstance(value, dict):
+                    continue
+                for filename in value.values():
+                    if isinstance(filename, str) and filename.startswith(PLACEHOLDER_PREFIX):
+                        (hires / filename).unlink(missing_ok=True)
+        manifest_path.unlink(missing_ok=True)
+    reference_dir = project / MISSING_REFERENCE_DIR
+    if reference_dir.is_dir():
+        for path in reference_dir.glob("LOOK_*.jpg"):
+            path.unlink(missing_ok=True)
+
+
+def _diagnose_assignment(
+    target_indices: list[int],
+    assignment: list[int],
+    cost: np.ndarray,
+    files: list[Path],
+) -> tuple[list[dict[str, object]], list[int]]:
+    diagnostics: list[dict[str, object]] = []
+    problems: list[int] = []
+    for position, target_index in enumerate(target_indices):
+        source_index = assignment[position]
+        ranking = np.argsort(cost[target_index])
+        rank = int(np.where(ranking == source_index)[0][0]) + 1
+        selected = float(cost[target_index, source_index])
+        best = float(cost[target_index, ranking[0]])
+        alternative = float(cost[target_index, ranking[1]]) if len(ranking) > 1 else math.inf
+        margin = alternative - best
+        diagnostics.append({
+            "target": target_index,
+            "selected": files[source_index].name,
+            "selected_score": round(selected, 7),
+            "best_score": round(best, 7),
+            "second_score": round(alternative, 7),
+            "rank": rank,
+            "margin": round(margin, 7),
+        })
+        if rank != 1 or selected > 0.145 or margin < 0.004:
+            problems.append(target_index)
+    return diagnostics, problems
+
+
+def _pair_decisive_looks(
+    target_indices: list[int], assignment: list[int], cost: np.ndarray,
+) -> set[int]:
+    """Return looks whose assigned left/right pair is jointly decisive.
+
+    A single full-length image can be visually close to several other looks,
+    while its close-up is an exact anchor (or the other way around).  Treating
+    the two images as independent therefore creates false ``missing`` looks.
+    The pair check keeps the one-to-one assignment, but compares the selected
+    ordered pair with every other distinct hire pair before declaring it
+    unresolved.
+    """
+    by_target = {target: assignment[position] for position, target in enumerate(target_indices)}
+    decisive: set[int] = set()
+    for look in sorted({target // 2 + 1 for target in target_indices}):
+        left_target = (look - 1) * 2
+        right_target = left_target + 1
+        if left_target not in by_target or right_target not in by_target:
+            continue
+        left_source = by_target[left_target]
+        right_source = by_target[right_target]
+        if left_source == right_source:
+            continue
+        pair_scores = cost[left_target, :, None] + cost[right_target, None, :]
+        pair_scores = np.asarray(pair_scores, dtype=np.float64)
+        pair_scores[np.diag_indices_from(pair_scores)] = np.inf
+        flattened = pair_scores.ravel()
+        order = np.argsort(flattened)
+        selected_index = left_source * pair_scores.shape[1] + right_source
+        selected_rank = int(np.where(order == selected_index)[0][0]) + 1
+        best = float(flattened[order[0]])
+        second = float(flattened[order[1]]) if len(order) > 1 else math.inf
+        selected = float(pair_scores[left_source, right_source])
+        if (
+            selected_rank == 1
+            and selected <= PAIR_SCORE_LIMIT
+            and second - best >= PAIR_MARGIN
+        ):
+            decisive.add(look)
+    return decisive
+
+
+def _quick_missing_looks(
+    cost: np.ndarray,
+    files: list[Path],
+    target_count: int,
+) -> tuple[dict[int, int], set[int], list[dict[str, object]], list[str]]:
+    """Resolve reliable photos and quarantine whole uncertain looks.
+
+    The initial Hungarian pass can let a wrong file consume the best candidate
+    for another look.  In quick mode, an uncertain pair is therefore removed as
+    a complete two-photo look and the remaining hires are assigned again.  This
+    preserves correct one-to-one matches for all available looks while leaving
+    every unresolved look explicitly blank instead of silently placing a wrong
+    photograph.
+    """
+    all_targets = list(range(target_count))
+    missing_looks: set[int] = set()
+    final_diagnostics: list[dict[str, object]] = []
+    final_assignment: dict[int, int] = {}
+    while True:
+        active = [target for target in all_targets if target // 2 + 1 not in missing_looks]
+        while len(active) > len(files):
+            # There are not enough source files for the remaining targets. Put
+            # the least visually supported complete look into the explicit
+            # missing set until the rectangular assignment is possible.
+            candidate_looks = sorted({target // 2 + 1 for target in active})
+            look = max(
+                candidate_looks,
+                key=lambda value: max(float(np.min(cost[target])) for target in active if target // 2 + 1 == value),
+            )
+            missing_looks.add(look)
+            active = [target for target in active if target // 2 + 1 != look]
+        if not active:
+            final_diagnostics = []
+            break
+        assignment = minimum_assignment(cost[active, :])
+        diagnostics, problems = _diagnose_assignment(active, assignment, cost, files)
+        pair_decisive = _pair_decisive_looks(active, assignment, cost)
+        new_looks = {
+            target // 2 + 1 for target in problems
+            if target // 2 + 1 not in pair_decisive
+        }
+        if not new_looks - missing_looks:
+            final_diagnostics = diagnostics
+            final_assignment = {target: assignment[position] for position, target in enumerate(active)}
+            break
+        missing_looks.update(new_looks)
+    descriptions: list[str] = []
+    by_target = {int(item["target"]): item for item in final_diagnostics}
+    for target in all_targets:
+        look = target // 2 + 1
+        if look in missing_looks:
+            descriptions.append(f"LOOK_{look:03}: PDF image {target + 1} has no decisive hire match; the selected non-review mode leaves this photo blank.")
+        elif target in by_target and int(by_target[target]["rank"]) != 1:
+            descriptions.append(f"PDF image {target + 1}: {by_target[target]['selected']} remains non-decisive.")
+    return final_assignment, missing_looks, final_diagnostics, descriptions
+
+
+def build(
+    project: Path,
+    reference: Path,
+    hires: Path,
+    registry: Path,
+    cover_pages: int | None,
+    dry_run: bool,
+    allow_missing: bool = False,
+    photo_only: bool = False,
+) -> None:
     project = project.resolve()
     require_in_work(project, reference, "Reference PDF")
     require_in_work(project, hires, "Hires folder")
@@ -272,15 +553,24 @@ def build(project: Path, reference: Path, hires: Path, registry: Path, cover_pag
         fail(f"Reference PDF does not exist: {reference}")
     if not hires.is_dir():
         fail(f"Hires folder does not exist: {hires}")
-    if cover_pages < 0:
+    if cover_pages is not None and cover_pages < 0:
         fail("--cover-pages cannot be negative.")
+    if allow_missing:
+        _clear_previous_quick_artifacts(project, hires)
     files = sorted(
-        (item for item in hires.iterdir() if item.is_file() and item.suffix.lower() in {".jpg", ".jpeg"}),
+        (
+            item for item in hires.iterdir()
+            if item.is_file()
+            and item.suffix.lower() in {".jpg", ".jpeg"}
+            and not _is_placeholder(item)
+        ),
         key=lambda item: item.name.lower(),
     )
     if not files:
         fail("The hires folder does not contain JPG files.")
     reader = PdfReader(str(reference))
+    if cover_pages is None:
+        cover_pages = detect_cover_pages(reader)
     if len(reader.pages) <= cover_pages:
         fail("Reference PDF has no look pages after the cover.")
 
@@ -295,7 +585,7 @@ def build(project: Path, reference: Path, hires: Path, registry: Path, cover_pag
         del pair
         if page_number % 8 == 0:
             gc.collect()
-    if len(files) < len(pdf_features):
+    if len(files) < len(pdf_features) and not allow_missing:
         fail(f"Reference requires {len(pdf_features)} photographs, but only {len(files)} hires are available.")
     prior_rows: list[dict[str, str]] | None = None
     if registry.exists() and not registry_is_blank_bootstrap(registry):
@@ -313,33 +603,66 @@ def build(project: Path, reference: Path, hires: Path, registry: Path, cover_pag
             preview = fit_preview(image, (360, 540))
             hire_previews.append(preview)
             hire_features.append(feature(preview))
+    pdf_appearance = [appearance_signature(item) for item in pdf_features]
+    hire_appearance = [appearance_signature(item) for item in hire_features]
     cost = np.asarray(
-        [[distance(pdf_item, hire_item) for hire_item in hire_features] for pdf_item in pdf_features],
+        [
+            [
+                matching_distance(pdf_item, hire_item, pdf_appearance[target], hire_appearance[source])
+                for source, hire_item in enumerate(hire_features)
+            ]
+            for target, pdf_item in enumerate(pdf_features)
+        ],
         dtype=np.float64,
     )
-    assignment = minimum_assignment(cost)
-    diagnostics: list[dict[str, object]] = []
-    problems: list[str] = []
-    for target_index, source_index in enumerate(assignment):
-        ranking = np.argsort(cost[target_index])
-        rank = int(np.where(ranking == source_index)[0][0]) + 1
-        selected = float(cost[target_index, source_index])
-        best = float(cost[target_index, ranking[0]])
-        alternative = float(cost[target_index, ranking[1]]) if len(ranking) > 1 else math.inf
-        margin = alternative - best
-        diagnostics.append({
-            "target": target_index,
-            "selected": files[source_index].name,
-            "selected_score": round(selected, 7),
-            "best_score": round(best, 7),
-            "second_score": round(alternative, 7),
-            "rank": rank,
-            "margin": round(margin, 7),
-        })
-        if rank != 1 or selected > 0.145 or margin < 0.004:
-            problems.append(
-                f"PDF image {target_index + 1}: {files[source_index].name} (rank {rank}, score {selected:.4f}, margin {margin:.4f})"
-            )
+    if allow_missing:
+        assignment_by_target, missing_looks, diagnostics, problems = _quick_missing_looks(
+            cost, files, len(pdf_features),
+        )
+    else:
+        assignment = minimum_assignment(cost)
+        diagnostics, problem_targets = _diagnose_assignment(
+            list(range(len(pdf_features))), assignment, cost, files,
+        )
+        assignment_by_target = {target: source for target, source in enumerate(assignment)}
+        missing_looks = set()
+        problems = [
+            f"PDF image {target + 1}: {files[assignment_by_target[target]].name} "
+            f"(rank {diagnostics[target]['rank']}, score {float(diagnostics[target]['selected_score']):.4f}, "
+            f"margin {float(diagnostics[target]['margin']):.4f})"
+            for target in problem_targets
+        ]
+
+    placeholder_previews: dict[tuple[int, str], Image.Image] = {}
+    missing_reference_dir = project / MISSING_REFERENCE_DIR
+    missing_reference_dir.mkdir(parents=True, exist_ok=True)
+    placeholder_paths: dict[tuple[int, str], Path] = {}
+    for look_number in sorted(missing_looks):
+        look_id = f"LOOK_{look_number:03}"
+        for side, side_index in (("left", 0), ("right", 1)):
+            placeholder = hires / f"{PLACEHOLDER_PREFIX}{look_id}_{side.upper()}.jpg"
+            placeholder_preview = _write_blank_placeholder(placeholder)
+            placeholder_paths[(look_number, side)] = placeholder
+            placeholder_previews[(look_number, side)] = placeholder_preview
+            reference_target = page_images[look_number - 1][side_index]
+            reference_target.save(missing_reference_dir / f"{look_id}_{side.upper()}.jpg", "JPEG", quality=95, optimize=True)
+    if missing_looks:
+        missing_manifest = {
+            "schema": 1,
+            "mode": "photos" if photo_only else "quick",
+            "looks": [f"LOOK_{look:03}" for look in sorted(missing_looks)],
+            "reference_dir": str(MISSING_REFERENCE_DIR).replace("\\", "/"),
+            "placeholders": {
+                f"LOOK_{look:03}": {
+                    "left": placeholder_paths[(look, "left")].name,
+                    "right": placeholder_paths[(look, "right")].name,
+                }
+                for look in sorted(missing_looks)
+            },
+        }
+        (project / "control" / "work" / "quick-missing-photos.json").write_text(
+            json.dumps(missing_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+        )
 
     evidence = project / "control" / "work" / "registry-build" / timestamp()
     cards_dir = evidence / "cards"
@@ -361,13 +684,16 @@ def build(project: Path, reference: Path, hires: Path, registry: Path, cover_pag
     rows: list[dict[str, str]] = []
     contact_previews: list[Image.Image] = []
     for index, (left_target, right_target) in enumerate(page_images, start=1):
-        left_file = files[assignment[(index - 1) * 2]]
-        right_file = files[assignment[(index - 1) * 2 + 1]]
+        look_missing = index in missing_looks
+        left_file = placeholder_paths[(index, "left")] if look_missing else files[assignment_by_target[(index - 1) * 2]]
+        right_file = placeholder_paths[(index, "right")] if look_missing else files[assignment_by_target[(index - 1) * 2 + 1]]
+        left_preview = placeholder_previews[(index, "left")] if look_missing else hire_previews[assignment_by_target[(index - 1) * 2]]
+        right_preview = placeholder_previews[(index, "right")] if look_missing else hire_previews[assignment_by_target[(index - 1) * 2 + 1]]
         card = draw_card(
             left_target,
             right_target,
-            hire_previews[assignment[(index - 1) * 2]],
-            hire_previews[assignment[(index - 1) * 2 + 1]],
+            left_preview,
+            right_preview,
             f"LOOK_{index:03}",
             (left_file.name, right_file.name),
         )
@@ -384,7 +710,7 @@ def build(project: Path, reference: Path, hires: Path, registry: Path, cover_pag
             "indd_right_page": str(index * 2 + 1),
         })
     contacts = write_contact_sheets(contact_previews, evidence)
-    used = {files[index].name for index in assignment}
+    used = {files[index].name for index in assignment_by_target.values()}
     payload = {
         "schema": "lookbook-reference-registry/v1",
         "reference": str(reference),
@@ -397,9 +723,13 @@ def build(project: Path, reference: Path, hires: Path, registry: Path, cover_pag
         "registry": str(registry),
         "contacts": contacts,
         "problems": problems,
+        "quick_mode": bool(allow_missing and not photo_only),
+        "photo_only": bool(photo_only),
+        "missing_looks": [f"LOOK_{look:03}" for look in sorted(missing_looks)],
+        "missing_photo_reference_dir": str(MISSING_REFERENCE_DIR).replace("\\", "/") if missing_looks else "",
     }
     (evidence / "manifest.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    if problems:
+    if problems and not allow_missing:
         fail("Automatic visual matching is not decisive; inspect registry-build proof cards and correct source inputs. " + "; ".join(problems[:4]))
     if prior_rows is not None and prior_rows != rows:
         fail(
@@ -409,7 +739,12 @@ def build(project: Path, reference: Path, hires: Path, registry: Path, cover_pag
     if not dry_run and prior_rows is None:
         write_registry(registry, rows)
     state = "existing registry re-verified" if prior_rows is not None else "registry written"
-    print(f"PASS registry: {len(rows)} PDF-ordered looks, {len(used)} hires selected, {len(files) - len(used)} unused hires; {state}.")
+    suffix = ""
+    if missing_looks:
+        mode_label = "Режим только фотографий" if photo_only else "Быстрая сборка"
+        suffix_tail = "кредиты не сопоставляются." if photo_only else "кредиты будут сопоставлены по PDF-референсу."
+        suffix = f" {mode_label}: пустые фото оставлены для " + ", ".join(f"LOOK_{look:03}" for look in sorted(missing_looks)) + f"; {suffix_tail}"
+    print(f"PASS registry: {len(rows)} PDF-ordered looks, {len(used)} hires selected, {len(files) - len(used)} unused hires; {state}.{suffix}")
     print(f"Visual proof pack: {evidence}")
     print(f"Registry: {registry}{' (dry run only)' if dry_run else ''}")
 
@@ -425,7 +760,13 @@ def self_test() -> None:
         images.append(image)
     targets = [feature(image.resize((120, 180))) for image in images]
     hires = [feature(image) for image in reversed(images)] + [feature(Image.new("RGB", (240, 360), "white"))]
-    assignment = minimum_assignment(np.asarray([[distance(target, hire) for hire in hires] for target in targets]))
+    target_appearance = [appearance_signature(item) for item in targets]
+    hire_appearance = [appearance_signature(item) for item in hires]
+    assignment = minimum_assignment(np.asarray([
+        [matching_distance(target, hire, target_appearance[target_index], hire_appearance[hire_index])
+         for hire_index, hire in enumerate(hires)]
+        for target_index, target in enumerate(targets)
+    ]))
     expected = list(reversed(range(len(images))))
     if assignment != expected:
         raise SystemExit(f"Self-test failed: {assignment} != {expected}")
@@ -438,8 +779,22 @@ def main() -> None:
     parser.add_argument("--reference", default="control/work/_mat/reference.pdf")
     parser.add_argument("--hires", default="control/work/_mat/hires")
     parser.add_argument("--registry", default="control/work/look-register.tsv")
-    parser.add_argument("--cover-pages", type=int, default=1)
+    parser.add_argument(
+        "--cover-pages", type=lambda value: None if value.strip().lower() == "auto" else int(value),
+        default=None,
+        help="Optional leading cover pages. Default: auto-detect 0 or 1 from visible photo placements.",
+    )
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--allow-missing",
+        action="store_true",
+        help="Non-review build modes: leave explicitly unresolved whole looks as blank fixed-frame placeholders.",
+    )
+    parser.add_argument(
+        "--photo-only",
+        action="store_true",
+        help="Use photo-only wording and evidence for unresolved looks; credits are not part of this build.",
+    )
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if args.self_test:
@@ -448,7 +803,10 @@ def main() -> None:
     if args.project is None:
         parser.error("project is required unless --self-test is used")
     project = args.project.resolve()
-    build(project, path_from(project, args.reference), path_from(project, args.hires), path_from(project, args.registry), args.cover_pages, args.dry_run)
+    build(
+        project, path_from(project, args.reference), path_from(project, args.hires),
+        path_from(project, args.registry), args.cover_pages, args.dry_run, args.allow_missing, args.photo_only,
+    )
 
 
 if __name__ == "__main__":

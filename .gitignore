@@ -2,6 +2,7 @@
 build/
 dist/
 *.spec
+!LOOKBOOKBOT.spec
 __pycache__/
 *.py[cod]
 .pytest_cache/

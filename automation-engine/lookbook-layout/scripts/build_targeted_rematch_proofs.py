@@ -25,6 +25,7 @@ MAP_FIELDS = [
 INDEX_FIELDS = ["excel_sheet", "excel_look_number", "excel_image"]
 PANEL = (430, 610)
 PAIR_PANEL = (500, 650)
+PLACEHOLDER_PREFIX = "__lbb_missing_"
 
 
 def fail(message: str) -> None:
@@ -86,9 +87,31 @@ def make_panel(source: Path, title: str, size: tuple[int, int]) -> Image.Image:
         raise
 
 
-def render_pair(root: Path, row: dict[str, str], hires: Path, target: Path) -> None:
-    left = hires / row["left_filename"]
-    right = hires / row["right_filename"]
+def _reference_photo(
+    row: dict[str, str],
+    side: str,
+    hires: Path,
+    missing_reference_dir: Path | None,
+) -> Path:
+    """Use extracted PDF-reference photos for quick-build placeholders."""
+    filename = str(row[f"{side}_filename"]).strip()
+    source = hires / filename
+    if filename.casefold().startswith(PLACEHOLDER_PREFIX) and missing_reference_dir is not None:
+        fallback = missing_reference_dir / f"{row['look_id']}_{side.upper()}.jpg"
+        if fallback.is_file():
+            return fallback
+    return source
+
+
+def render_pair(
+    root: Path,
+    row: dict[str, str],
+    hires: Path,
+    target: Path,
+    missing_reference_dir: Path | None = None,
+) -> None:
+    left = _reference_photo(row, "left", hires, missing_reference_dir)
+    right = _reference_photo(row, "right", hires, missing_reference_dir)
     canvas = Image.new("RGB", (PAIR_PANEL[0] * 2, PAIR_PANEL[1]), "#dddddd")
     try:
         for index, (source, label) in enumerate(((left, "PDF LEFT"), (right, "PDF RIGHT"))):
@@ -193,6 +216,11 @@ def main() -> None:
     parser.add_argument("--map", dest="caption_map", default="control/work/caption-map.tsv")
     parser.add_argument("--index", default="control/work/_mat/excel-images/index.tsv")
     parser.add_argument("--hires", default="control/work/_mat/hires")
+    parser.add_argument(
+        "--missing-reference-dir",
+        default="",
+        help="Quick-build fallback directory containing extracted PDF-reference photos.",
+    )
     parser.add_argument("--output", default="control/work/rematch-evidence")
     parser.add_argument(
         "--exclude-json",
@@ -228,6 +256,9 @@ def main() -> None:
 
     output = child(root, args.output)
     hires = child(root, args.hires)
+    missing_reference_dir = child(root, args.missing_reference_dir) if args.missing_reference_dir else None
+    if missing_reference_dir is not None and not missing_reference_dir.is_dir():
+        fail(f"Missing reference-photo directory: {missing_reference_dir}")
     if not hires.is_dir():
         fail(f"Hires folder is missing: {hires}")
     for look_id in looks:
@@ -241,7 +272,7 @@ def main() -> None:
             fail(f"{look_id}: no untried, unreserved Excel candidate remains.")
         folder = output / look_id
         pair_target = folder / "pdf-pair.jpg"
-        render_pair(root, row, hires, pair_target)
+        render_pair(root, row, hires, pair_target, missing_reference_dir)
         pages: list[dict[str, object]] = []
         for page, offset in enumerate(range(0, len(candidates), 16), start=1):
             target = folder / f"candidates-{page:02}.jpg"
@@ -257,6 +288,10 @@ def main() -> None:
             "look_id": look_id,
             "pdf_pair": str(pair_target.relative_to(root)).replace("\\", "/"),
             "pdf_pair_sha256": digest(pair_target),
+            "pdf_reference_sources": {
+                "left": str(_reference_photo(row, "left", hires, missing_reference_dir).relative_to(root)).replace("\\", "/"),
+                "right": str(_reference_photo(row, "right", hires, missing_reference_dir).relative_to(root)).replace("\\", "/"),
+            },
             "candidate_pool": [f"{card['excel_sheet']}:{card['excel_look_number']}" for card in candidates],
             "candidate_pages": pages,
         }

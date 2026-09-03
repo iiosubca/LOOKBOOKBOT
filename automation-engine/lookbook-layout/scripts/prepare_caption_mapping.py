@@ -109,10 +109,11 @@ def main() -> None:
     book = load_workbook(copied, data_only=True, read_only=False)
     records: list[dict[str, str]] = []
     try:
+        sheets = {str(sheet.title).strip().upper(): sheet for sheet in book.worksheets}
         for sheet_name in ("W", "M"):
-            if sheet_name not in book.sheetnames:
+            sheet = sheets.get(sheet_name)
+            if sheet is None:
                 raise ValueError(f"Workbook is missing worksheet {sheet_name}.")
-            sheet = book[sheet_name]
             counters: dict[str, int] = {}
             for image in list(sheet._images):
                 look_number = image_look_number(sheet, image)

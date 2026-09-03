@@ -33,6 +33,7 @@ from typing import Any
 SCHEMA = 1
 GATES = ("map", "structure", "dates", "frames", "images", "captions", "visual", "release", "pdf")
 INDESIGN_GATES = {"structure", "dates", "frames", "images", "captions", "release"}
+PHOTO_ONLY_BUILD_MODE = "photos"
 # Exporting the current 102-page master can legitimately take several minutes
 # in InDesign.  Recovery is for an idle/stalled worker, not a busy exporter.
 VISUAL_PROOF_TIMEOUT_SECONDS = 720
@@ -87,7 +88,7 @@ MAX_PAGE_ORDER_DHASH_DISTANCE = 512
 MAX_PAGE_ORDER_TONE_DISTANCE = 30.0
 PAGE_ORDER_NEAREST_MARGIN = 96
 WORK_RELATIVE = Path("control") / "work"
-ROOT_DIRECTORIES = {"control", "control-history", "Gender"}
+ROOT_DIRECTORIES = {"control", "control-history", "Gender", "_MAT"}
 ROOT_FILE_SUFFIXES = {".indd", ".pdf", ".idlk"}
 ROOT_FILE_NAMES = {"desktop.ini", "Thumbs.db", ".DS_Store"}
 
@@ -151,7 +152,7 @@ def assert_project_root_clean(project: Path) -> None:
     """Fail a gate when temporary material escaped the controlled work area."""
     unexpected: list[str] = []
     for item in project.iterdir():
-        if item.is_dir() and item.name in ROOT_DIRECTORIES:
+        if item.is_dir() and item.name.casefold() in {name.casefold() for name in ROOT_DIRECTORIES}:
             continue
         if item.is_file() and (item.suffix.lower() in ROOT_FILE_SUFFIXES or item.name in ROOT_FILE_NAMES):
             continue
@@ -217,6 +218,24 @@ def state_artifact(project: Path, state: dict[str, Any], key: str) -> Path:
     return child_of(project, state[key])
 
 
+def reference_cover_pages(state: dict[str, Any]) -> int:
+    """Return the frozen number of leading non-look pages in the reference PDF.
+
+    Older sessions did not persist this value and were created under the former
+    one-cover assumption, so they retain a compatibility default of one.  New
+    sessions record either zero or one after comparing the PDF page count with the
+    PDF-authoritative registry.
+    """
+    raw = state.get("reference_cover_pages", 1)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        fail("Controller state has an invalid reference_cover_pages value.")
+    if value not in (0, 1):
+        fail("Controller state supports only zero or one leading reference cover page.")
+    return value
+
+
 def identity(path: Path) -> dict[str, Any]:
     if not path.exists() or not path.is_file():
         fail(f"Missing file: {path}")
@@ -274,6 +293,25 @@ def load_evidence(project: Path, state: dict[str, Any], gate: str) -> dict[str, 
     if evidence.get("gate") != gate or evidence.get("passed") is not True:
         return None
     if gate == "map":
+        if state.get("build_mode") == PHOTO_ONLY_BUILD_MODE:
+            if "reference_pdf" not in state:
+                return None
+            try:
+                manifest = validate_reference_order(project, state)
+                expected_confirmation_fingerprint = reference_order_confirmation_fingerprint(project, state)
+            except (GateError, OSError):
+                return None
+            if evidence.get("photos_only") is not True:
+                return None
+            if evidence.get("reference_order_manifest_sha256") != digest(reference_order_manifest_path(project)):
+                return None
+            if evidence.get("reference_order_confirmation_fingerprint") != expected_confirmation_fingerprint:
+                return None
+            if evidence.get("registry_sha256") != digest(state_artifact(project, state, "registry")):
+                return None
+            if evidence.get("reference_pdf_sha256") != digest(state_artifact(project, state, "reference_pdf")):
+                return None
+            return evidence if manifest.get("registry_sha256") == digest(state_artifact(project, state, "registry")) else None
         if any(key not in state for key in ("caption_map", "caption_workbook", "caption_provenance", "reference_pdf")):
             return None
         required = {
@@ -716,13 +754,15 @@ def validate_reference_order_manifest(project: Path, state: dict[str, Any]) -> d
     manifest = read_json(manifest_path)
     registry = state_artifact(project, state, "registry")
     rows = validate_registry(registry, int(state["look_count"]), state_artifact(project, state, "hires"))
+    cover_pages = reference_cover_pages(state)
     if (
         manifest.get("schema") != REFERENCE_ORDER_SCHEMA
         or manifest.get("generator") != "lookbook_gate.py:prepare-reference-order"
         or manifest.get("session_id") != state["session_id"]
         or manifest.get("reference_pdf_sha256") != digest(reference)
         or manifest.get("registry_sha256") != digest(registry)
-        or manifest.get("reference_page_count") != len(rows) + 1
+        or manifest.get("reference_page_count") != len(rows) + cover_pages
+        or manifest.get("reference_cover_pages", cover_pages) != cover_pages
     ):
         fail("PDF-reference order manifest is missing, stale, or bound to another registry/reference PDF.")
     looks = manifest.get("looks")
@@ -735,7 +775,7 @@ def validate_reference_order_manifest(project: Path, state: dict[str, Any]) -> d
         item = looks.get(look_id)
         if not isinstance(item, dict):
             fail(f"{look_id}: reference-order manifest entry is invalid.")
-        reference_page = int(row["pdf_spread"]) + 1
+        reference_page = int(row["pdf_spread"]) + cover_pages
         expected = {
             "look_id": look_id,
             "reference_page": reference_page,
@@ -755,7 +795,7 @@ def validate_reference_order_manifest(project: Path, state: dict[str, Any]) -> d
             if not artifact.is_file() or artifact.stat().st_size < 1024 or item.get(hash_key) != digest(artifact):
                 fail(f"{look_id}: PDF-reference evidence is absent or has changed.")
         reference_order_item_fingerprint(item)
-    if seen_pages != set(range(2, len(rows) + 2)):
+    if seen_pages != set(range(cover_pages + 1, len(rows) + cover_pages + 1)):
         fail("PDF-reference manifest does not cover every required source look page in order.")
     return manifest
 
@@ -864,11 +904,13 @@ def workbook_caption_rows(workbook: Path, caption_map: list[dict[str, str]]) -> 
         fail(f"Cannot read caption workbook {workbook.name}: {error}")
     grouped: dict[tuple[str, str], list[tuple[str, str, str, str]]] = {}
     try:
+        sheets = {str(sheet.title).strip().upper(): sheet for sheet in book.worksheets}
         for sheet in ("W", "M"):
-            if sheet not in book.sheetnames:
+            worksheet = sheets.get(sheet)
+            if worksheet is None:
                 fail(f"Caption workbook is missing required sheet: {sheet}")
             current: str | None = None
-            for values in book[sheet].iter_rows(min_row=2, values_only=True):
+            for values in worksheet.iter_rows(min_row=2, values_only=True):
                 number, kind, brand, price, article = (list(values) + [None] * 6)[1:6]
                 if number not in (None, "") and str(number).strip().isdigit():
                     current = str(int(float(number)))
@@ -2170,21 +2212,31 @@ def clear_for_new_arm(project: Path, gate: str) -> None:
 
 def command_init(args: argparse.Namespace) -> None:
     project = project_path(args.project)
+    build_mode = str(getattr(args, "build_mode", "full") or "full")
+    if build_mode not in {"full", "quick", PHOTO_ONLY_BUILD_MODE}:
+        fail("--build-mode must be full, quick, or photos.")
     master = child_of(project, args.master)
     if master.suffix.lower() != ".indd" or master.parent != project:
         fail("Master must be a saved .indd file directly in the project root; this anchors InDesign audits.")
     registry = child_of(project, args.registry)
-    captions = child_of(project, args.captions)
-    caption_map = child_of(project, args.caption_map)
-    caption_workbook = child_of(project, args.caption_workbook)
-    caption_provenance = child_of(project, args.caption_provenance)
     hires = child_of(project, args.hires)
     reference = child_of(project, args.reference)
-    for label, artifact in (
-        ("Registry", registry), ("Caption data", captions), ("Caption map", caption_map),
-        ("Caption workbook", caption_workbook), ("Caption provenance", caption_provenance),
-        ("Hires folder", hires), ("PDF reference", reference),
-    ):
+    required_artifacts = [("Registry", registry), ("Hires folder", hires), ("PDF reference", reference)]
+    caption_paths: dict[str, Path] = {}
+    if build_mode != PHOTO_ONLY_BUILD_MODE:
+        caption_paths = {
+            "captions": child_of(project, args.captions),
+            "caption_map": child_of(project, args.caption_map),
+            "caption_workbook": child_of(project, args.caption_workbook),
+            "caption_provenance": child_of(project, args.caption_provenance),
+        }
+        required_artifacts.extend([
+            ("Caption data", caption_paths["captions"]),
+            ("Caption map", caption_paths["caption_map"]),
+            ("Caption workbook", caption_paths["caption_workbook"]),
+            ("Caption provenance", caption_paths["caption_provenance"]),
+        ])
+    for label, artifact in required_artifacts:
         require_work_path(project, artifact, label)
     assert_project_root_clean(project)
     if not hires.exists() or not hires.is_dir():
@@ -2197,6 +2249,17 @@ def command_init(args: argparse.Namespace) -> None:
         fail("--show-date must use DD.MM.YYYY.")
     if args.looks < 1:
         fail("--looks must be at least 1.")
+    try:
+        from pypdf import PdfReader
+        reference_page_count = len(PdfReader(str(reference), strict=True).pages)
+    except Exception as error:
+        fail(f"PDF reference cannot be parsed: {error}")
+    reference_cover_page_count = reference_page_count - args.looks
+    if reference_cover_page_count not in (0, 1):
+        fail(
+            f"PDF reference has {reference_page_count} pages, but the registry contains {args.looks} looks. "
+            "Only zero or one leading non-look cover page is supported."
+        )
     existing = state_file(project)
     if existing.exists() and not args.restart:
         fail("A controller session already exists. Use status, or start intentionally with init --restart.")
@@ -2215,22 +2278,25 @@ def command_init(args: argparse.Namespace) -> None:
         "gates": list(GATES),
         "master": str(master.relative_to(project)),
         "registry": str(registry.relative_to(project)),
-        "captions": str(captions.relative_to(project)),
-        "caption_map": str(caption_map.relative_to(project)),
-        "caption_workbook": str(caption_workbook.relative_to(project)),
-        "caption_provenance": str(caption_provenance.relative_to(project)),
         "hires": str(hires.relative_to(project)),
         "reference_pdf": str(reference.relative_to(project)),
         "look_count": args.looks,
+        "reference_cover_pages": reference_cover_page_count,
         "expected_pages": args.looks * 2 + 2,
         "show_date": args.show_date,
         "show_text": args.show_text,
         "legal_date": (show_date + timedelta(days=args.legal_offset_days)).strftime("%d.%m.%Y"),
+        "build_mode": build_mode,
     }
+    if build_mode != PHOTO_ONLY_BUILD_MODE:
+        state.update({key: str(path.relative_to(project)) for key, path in caption_paths.items()})
     write_json(state_file(project), state)
     launcher = install_in_design_audit_launcher()
     print(f"INITIALIZED session {state['session_id']}")
-    print("Next required action: prepare-reference-order, confirm every PDF-reference pair, then validate-map")
+    if build_mode == PHOTO_ONLY_BUILD_MODE:
+        print("Next required action: prepare-reference-order, then validate-map; credit mapping is disabled")
+    else:
+        print("Next required action: prepare-reference-order, confirm every PDF-reference pair, then validate-map")
     print("IN DESIGN: native COM automation is the normal route; do not open the master while an apply or export command is running.")
     if launcher:
         print(f"MANUAL FALLBACK ONLY: {launcher}")
@@ -2277,6 +2343,41 @@ def _reference_order_card(reference_page: Path, left_source: Path, right_source:
         fail(f"Generated PDF-reference proof is unexpectedly empty: {destination}")
 
 
+def _auto_confirm_quick_reference_order(project: Path, state: dict[str, Any], rows: list[dict[str, str]]) -> None:
+    """Close the order gate in non-review modes without claiming a photo review.
+
+    Quick and photo-only modes still freeze the PDF order and left/right slots,
+    but they must not ask an AI or operator to certify a draft photo as a full
+    visual release review.
+    """
+    if state.get("build_mode") not in {"quick", PHOTO_ONLY_BUILD_MODE}:
+        return
+    manifest_path = reference_order_manifest_path(project)
+    manifest = read_json(manifest_path)
+    confirmations = reference_order_confirmation_dir(project)
+    for row in rows:
+        look_id = row["look_id"]
+        item = manifest.get("looks", {}).get(look_id)
+        if not isinstance(item, dict):
+            fail(f"{look_id}: quick PDF-reference manifest item is missing.")
+        destination = reference_order_confirmation_path(project, look_id)
+        if destination.exists():
+            continue
+        write_json(destination, {
+            "schema": REFERENCE_ORDER_SCHEMA,
+            "session_id": state["session_id"],
+            "created_at": utc_now(),
+            "look_id": look_id,
+            "reference_order_manifest_sha256": digest(manifest_path),
+            "item_fingerprint": reference_order_item_fingerprint(item),
+            "note": (
+                "Режим без полного визуального контроля: PDF-порядок и фиксированные левый/правый слоты "
+                "приняты автоматически; визуальная проверка исходных фотографий намеренно не выполнялась."
+            ),
+        })
+    print(f"NON-REVIEW PDF-REFERENCE ORDER LOCKED: {len(rows)} looks; photo identity review skipped by build mode.")
+
+
 def command_prepare_reference_order(args: argparse.Namespace) -> None:
     """Create a non-editable evidence pack for the authoritative PDF order."""
     project = project_path(args.project)
@@ -2302,7 +2403,11 @@ def command_prepare_reference_order(args: argparse.Namespace) -> None:
     existing_manifest = reference_order_manifest_path(project)
     if existing_manifest.is_file():
         validate_reference_order_manifest(project, state)
-        print(f"PDF-REFERENCE ORDER READY: {len(rows)} existing proof cards retained. Inspect and confirm every LOOK_### before validate-map.")
+        _auto_confirm_quick_reference_order(project, state, rows)
+        if state.get("build_mode") in {"quick", PHOTO_ONLY_BUILD_MODE}:
+            print(f"PDF-REFERENCE ORDER READY: {len(rows)} existing proof cards retained for non-review build mode.")
+        else:
+            print(f"PDF-REFERENCE ORDER READY: {len(rows)} existing proof cards retained. Inspect and confirm every LOOK_### before validate-map.")
         return
     confirmations = reference_order_confirmation_dir(project)
     if confirmations.exists() and any(confirmations.glob("LOOK_*.json")):
@@ -2320,10 +2425,11 @@ def command_prepare_reference_order(args: argparse.Namespace) -> None:
         reference_pages = len(PdfReader(str(reference), strict=True).pages)
     except Exception as error:
         fail(f"PDF reference cannot be parsed: {error}")
-    expected_reference_pages = len(rows) + 1
+    cover_pages = reference_cover_pages(state)
+    expected_reference_pages = len(rows) + cover_pages
     if reference_pages != expected_reference_pages:
         fail(
-            f"PDF reference has {reference_pages} pages; expected front cover plus {len(rows)} look spreads "
+            f"PDF reference has {reference_pages} pages; expected {cover_pages} leading cover page(s) plus {len(rows)} look spreads "
             f"({expected_reference_pages} pages total)."
         )
     stamp = utc_now().replace(":", "-")
@@ -2333,7 +2439,7 @@ def command_prepare_reference_order(args: argparse.Namespace) -> None:
     looks: dict[str, dict[str, Any]] = {}
     for row in rows:
         look_id = row["look_id"]
-        reference_page = int(row["pdf_spread"]) + 1
+        reference_page = int(row["pdf_spread"]) + cover_pages
         page_image = rendered.get(reference_page)
         if page_image is None:
             fail(f"{look_id}: source PDF did not render its required reference page {reference_page}.")
@@ -2351,11 +2457,16 @@ def command_prepare_reference_order(args: argparse.Namespace) -> None:
         "schema": REFERENCE_ORDER_SCHEMA, "generator": "lookbook_gate.py:prepare-reference-order",
         "session_id": state["session_id"], "created_at": utc_now(), "reference_pdf": identity(reference),
         "reference_pdf_sha256": digest(reference), "reference_page_count": reference_pages,
+        "reference_cover_pages": cover_pages,
         "registry_sha256": digest(registry), "looks": looks,
     }
     write_json(reference_order_manifest_path(project), manifest)
     validate_reference_order_manifest(project, state)
-    print(f"PDF-REFERENCE ORDER READY: {len(rows)} proof cards. Inspect and confirm every LOOK_### before validate-map.")
+    _auto_confirm_quick_reference_order(project, state, rows)
+    if state.get("build_mode") in {"quick", PHOTO_ONLY_BUILD_MODE}:
+        print(f"PDF-REFERENCE ORDER READY: {len(rows)} proof cards retained for non-review build mode.")
+    else:
+        print(f"PDF-REFERENCE ORDER READY: {len(rows)} proof cards. Inspect and confirm every LOOK_### before validate-map.")
 
 
 def command_confirm_reference_look(args: argparse.Namespace) -> None:
@@ -2391,6 +2502,19 @@ def command_validate_map(args: argparse.Namespace) -> None:
     registry = state_artifact(project, state, "registry")
     rows = validate_registry(registry, int(state["look_count"]), state_artifact(project, state, "hires"))
     validate_reference_order(project, state)
+    if state.get("build_mode") == PHOTO_ONLY_BUILD_MODE:
+        evidence = {
+            "schema": SCHEMA, "session_id": state["session_id"], "gate": "map", "passed": True,
+            "photos_only": True, "created_at": utc_now(), "registry": identity(registry),
+            "registry_sha256": digest(registry),
+            "reference_pdf_sha256": digest(state_artifact(project, state, "reference_pdf")),
+            "reference_order_manifest_sha256": digest(reference_order_manifest_path(project)),
+            "reference_order_confirmation_fingerprint": reference_order_confirmation_fingerprint(project, state),
+            "look_count": len(rows), "expected_pages": state["expected_pages"],
+        }
+        write_json(evidence_file(project, "map"), evidence)
+        print(f"PASS map: {len(rows)} PDF-reference-bound photo pairs are frozen; credit mapping is disabled by build mode.")
+        return
     caption_rows = validate_verified_caption_inputs(project, state, rows)
     mapping = state_artifact(project, state, "caption_map")
     workbook = state_artifact(project, state, "caption_workbook")
@@ -4443,7 +4567,7 @@ def verify_exported_pdf_order(project: Path, state: dict[str, Any], review_pdf: 
             "proof_mode": "caption-revision-native-scope-only",
             "items": [
                 {
-                    "look_id": row["look_id"], "reference_page": int(row["pdf_spread"]) + 1,
+                    "look_id": row["look_id"], "reference_page": int(row["pdf_spread"]) + reference_cover_pages(state),
                     "pages": [
                         {"side": "left", "page": int(row["indd_left_page"])},
                         {"side": "right", "page": int(row["indd_right_page"])},
@@ -4483,7 +4607,7 @@ def verify_exported_pdf_order(project: Path, state: dict[str, Any], review_pdf: 
     items: list[dict[str, Any]] = []
     for row in registry:
         look_id = row["look_id"]
-        comparison: dict[str, Any] = {"look_id": look_id, "reference_page": int(row["pdf_spread"]) + 1, "pages": []}
+        comparison: dict[str, Any] = {"look_id": look_id, "reference_page": int(row["pdf_spread"]) + reference_cover_pages(state), "pages": []}
         for side, page in (("left", int(row["indd_left_page"])), ("right", int(row["indd_right_page"]))):
             expected = expected_signatures[page]
             actual = actual_signatures[page]
@@ -5677,12 +5801,16 @@ def command_publish_final(args: argparse.Namespace) -> None:
 def command_status(args: argparse.Namespace) -> None:
     project = project_path(args.project)
     state = load_state(project)
+    mode = str(state.get("build_mode", "full"))
     passed = set(passed_gates(project, state))
     for gate in GATES:
         print(f"{'PASS' if gate in passed else 'LOCK'}  {gate}")
     next_gate = current_gate(project, state)
+    if mode == PHOTO_ONLY_BUILD_MODE and all(gate in passed for gate in ("map", "structure", "dates", "frames", "images")):
+        next_gate = None
+        print("MODE PHOTOS_ONLY: credit mapping, captions, visual review and PDF export are intentionally skipped.")
     print(f"SESSION {state['session_id']}")
-    print(f"NEXT {next_gate or 'COMPLETE'}")
+    print(f"NEXT {next_gate or ('PHOTOS_ONLY_COMPLETE' if mode == PHOTO_ONLY_BUILD_MODE else 'COMPLETE')}")
     final = final_deliverables_file(project)
     if final.exists():
         try:
@@ -6181,16 +6309,20 @@ def parser() -> argparse.ArgumentParser:
     init.add_argument("project")
     init.add_argument("--master", required=True)
     init.add_argument("--registry", default="look-register.tsv")
-    init.add_argument("--captions", default="caption-data.tsv")
-    init.add_argument("--caption-map", required=True, help="visually confirmed caption-map.tsv")
-    init.add_argument("--caption-workbook", required=True, help="copied source Excel workbook inside this project")
-    init.add_argument("--caption-provenance", required=True, help="hash manifest generated beside caption-data.tsv")
+    init.add_argument("--captions", default="control/work/caption-data.tsv")
+    init.add_argument("--caption-map", default="control/work/caption-map.tsv", help="visually confirmed caption-map.tsv")
+    init.add_argument("--caption-workbook", default="control/work/_mat/caption-source.xlsx", help="copied source Excel workbook inside this project")
+    init.add_argument("--caption-provenance", default="control/work/caption-provenance.json", help="hash manifest generated beside caption-data.tsv")
     init.add_argument("--hires", required=True, help="folder containing exactly the image filenames in the registry")
     init.add_argument("--reference", required=True, help="copied authoritative PDF reference inside control/work")
     init.add_argument("--looks", type=int, required=True)
     init.add_argument("--show-date", required=True, help="DD.MM.YYYY")
     init.add_argument("--show-text", required=True, help="exact visible show-date text")
     init.add_argument("--legal-offset-days", type=int, default=14)
+    init.add_argument(
+        "--build-mode", choices=("full", "quick", "photos"), default="full",
+        help="quick marks visual/review/final skips; photos skips credit mapping, captions, visual/review/final and writes only photo layout.",
+    )
     init.add_argument("--restart", action="store_true")
     init.set_defaults(func=command_init)
     valid = commands.add_parser("validate-map", help="accept only photo pairs with visually confirmed Excel credit mapping")

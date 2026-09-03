@@ -17,15 +17,15 @@ Do not begin, export, or call a later stage complete while `status` reports an e
 
 ### Project hygiene — mandatory before source analysis
 
-The project root is the delivery folder. It may contain only saved master `.indd` files, review/final `.pdf` files, `Gender`, `control`, and `control-history`. Every source copy, registry, map, proof card, contact sheet, temporary render, helper script, and scratch file belongs under `control\work`; never create a work file in the project root.
+The project root is the delivery folder. It may contain saved master `.indd` files, review/final `.pdf` files, `Gender`, `control`, `control-history`, and the visible `_MAT` mirror. Every controlled source copy, registry, map, proof card, contact sheet, temporary render, helper script, and scratch file belongs under `control\work`; `_MAT` is refreshed from the frozen snapshot for browsing and handoff, never read as a live source.
 
-After copying the prepared master directly into the dated project folder, run `scripts\create_lookbook_work_area.py <project>`. It creates the required `control\work` structure. Put hires in `control\work\_mat\hires`; use `control\work\scratch` for one-off utilities. The controller rejects initialization unless all controlled inputs are in that work area, and rejects map acceptance, review export, completion, or final publishing while a temporary root item exists.
+After copying the prepared master directly into the dated project folder, run `scripts\create_lookbook_work_area.py <project>`. It creates the required `control\work` structure. Put hires in `control\work\_mat\hires`; use `control\work\scratch` for one-off utilities. The application also maintains `_MAT\hires` and the visible frozen source files at the root. The controller rejects initialization unless all controlled inputs are in `control\work`, and rejects map acceptance, review export, completion, or final publishing while any other temporary root item exists.
 
 For a legacy project that has already passed every gate, use `scripts\migrate_legacy_lookbook_work.py <project> --apply` only after InDesign is closed. It moves the legacy work area, preserves a state backup and migration manifest in `control\history`, rebinds the frozen paths, and verifies that the passed gate state remains intact.
 
 ### Reference authority — apply before counting anything
 
-The PDF reference is the source of truth for the deliverable: it determines the required number of looks, their exact order, and each left/right photo pair. Build `look-register.tsv` from the PDF reference and the hires photos first. Covers and non-look source images are not looks.
+The PDF reference is the source of truth for the deliverable: it determines the required number of looks, their exact order, and each left/right photo pair. Build `look-register.tsv` from the PDF reference and the hires photos first. Covers and non-look source images are not looks. The registry builder detects an optional leading cover from visible page content; it does not assume that PDF page 1 is a cover. A page with exactly two visible photo placements is treated as the first look, including when it is PDF page 1.
 
 The workbook is a credit catalogue only. It may contain extra cards, rejected looks, or looks absent from the PDF. Its image count must never be compared to the PDF/registry count as a precondition. For example, 50 PDF looks and 54 Excel cards is normal: map the 50 required PDF looks, leave 4 Excel cards unused, and continue.
 

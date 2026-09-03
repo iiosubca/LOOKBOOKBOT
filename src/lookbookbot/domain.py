@@ -18,9 +18,18 @@ class StageStatus(StrEnum):
 class ProviderKind(StrEnum):
     CODEX = "codex"
     OPENAI = "openai"
+    OPENROUTER = "openrouter"
     GOOGLE = "google"
     OLLAMA = "ollama"
     LLAMACPP = "llamacpp"
+
+
+class BuildMode(StrEnum):
+    """The amount of automated work requested for a lookbook build."""
+
+    FULL = "full"
+    QUICK = "quick"
+    PHOTOS = "photos"
 
 
 @dataclass(frozen=True)
@@ -103,3 +112,4 @@ class ProjectRecord:
     show_date: date
     provider: ProviderKind
     model: str
+    build_mode: BuildMode = BuildMode.FULL

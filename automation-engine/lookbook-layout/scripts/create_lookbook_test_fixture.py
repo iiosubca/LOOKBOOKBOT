@@ -22,6 +22,8 @@ from pypdf import PdfReader, PdfWriter
 SCRIPT_DIR = Path(__file__).resolve().parent
 WORK_AREA = SCRIPT_DIR / "create_lookbook_work_area.py"
 REGISTRY_BUILDER = SCRIPT_DIR / "build_reference_registry.py"
+sys.path.insert(0, str(SCRIPT_DIR))
+from build_reference_registry import detect_cover_pages
 FIELDS = ("look_id", "spread_order", "pdf_spread", "left_filename", "right_filename", "indd_left_page", "indd_right_page")
 
 
@@ -48,16 +50,17 @@ def read_registry(path: Path, look_count: int) -> list[dict[str, str]]:
     return rows
 
 
-def write_short_reference(source: Path, destination: Path, looks: int) -> None:
+def write_short_reference(source: Path, destination: Path, looks: int) -> int:
     reader = PdfReader(str(source))
-    if len(reader.pages) < looks + 1:
-        fail(f"Reference PDF has {len(reader.pages)} pages; need cover plus {looks} look pages.")
+    cover_pages = detect_cover_pages(reader)
+    if len(reader.pages) < looks + cover_pages:
+        fail(f"Reference PDF has {len(reader.pages)} pages; need {cover_pages} cover page(s) plus {looks} look pages.")
     writer = PdfWriter()
-    writer.add_page(reader.pages[0])
-    for page_number in range(1, looks + 1):
+    for page_number in range(cover_pages + looks):
         writer.add_page(reader.pages[page_number])
     with destination.open("wb") as target:
         writer.write(target)
+    return cover_pages
 
 
 def main() -> None:

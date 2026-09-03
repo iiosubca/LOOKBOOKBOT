@@ -15,6 +15,7 @@ from .config import ToolPaths
 from .controller import CommandError, CommandRunner, LookbookController, evidence_passed, final_outputs_passed, read_json
 from .discovery import discover_sources
 from .domain import (
+    BuildMode,
     ProjectRecord,
     ProviderKind,
     STAGES,
@@ -24,7 +25,7 @@ from .domain import (
     visible_date_text,
 )
 from .providers import CodexProvider, ModelProvider, ProviderError, VisionDecision, make_provider
-from .secrets import get_google_api_key, get_openai_api_key
+from .secrets import get_google_api_key, get_openai_api_key, get_openrouter_api_key
 from .state import StateStore
 from .visual_audit import visual_audit_blocker_message
 
@@ -35,15 +36,30 @@ class PipelineError(RuntimeError):
 
 SOURCE_SNAPSHOT_SCHEMA = 1
 SOURCE_SNAPSHOT_RELATIVE = Path("control/work/source-snapshot.json")
+VISIBLE_MATERIALS_DIR = Path("_MAT")
 SOURCE_SNAPSHOT_REQUIRED = {
     "control/work/_mat/reference.pdf",
     "control/work/_mat/caption-source.xlsx",
     "control/work/_mat/automation-template.indd",
 }
 
+QUICK_BUILD_STOP_GATE = "captions"
+QUICK_BUILD_SKIPPED_STAGES = ("visual", "review", "final")
+PHOTO_ONLY_STOP_GATE = "images"
+PHOTO_ONLY_SKIPPED_STAGES = ("credits_map", "captions", "visual", "review", "final")
+MISSING_REFERENCE_PREFIX = "__lbb_missing_"
+
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _has_missing_reference(row: dict[str, str]) -> bool:
+    """Return whether a look has a deliberate quick-build photo placeholder."""
+    return any(
+        Path(str(row.get(field, ""))).name.casefold().startswith(MISSING_REFERENCE_PREFIX)
+        for field in ("left_filename", "right_filename")
+    )
 
 
 def _snapshot_entry(root: Path, path: Path, *, original: Path | None = None) -> dict[str, str | int]:
@@ -133,7 +149,45 @@ def _freeze_source_snapshot(root: Path, bundle) -> dict:
     snapshot = root / SOURCE_SNAPSHOT_RELATIVE
     snapshot.parent.mkdir(parents=True, exist_ok=True)
     snapshot.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _sync_visible_materials(root, payload)
     return payload
+
+
+def _sync_visible_materials(root: Path, payload: dict | None = None) -> None:
+    """Expose the frozen inputs in the familiar project-root ``_MAT`` folder.
+
+    ``control/work/_mat`` remains the sole operational source of truth.  The
+    root folder is a user-facing mirror for browsing and handoff, refreshed
+    from that frozen snapshot on every prepare/resume.  It therefore cannot
+    reintroduce a changed file from the living SOURCES directory.
+    """
+    controlled = root / "control" / "work" / "_mat"
+    visible = root / VISIBLE_MATERIALS_DIR
+    visible.mkdir(parents=True, exist_ok=True)
+    payload = payload or {}
+    source_names = {
+        str(entry.get("path", "")).replace("\\", "/"): str(entry.get("source_name", "")).strip()
+        for entry in payload.get("files", [])
+        if isinstance(entry, dict)
+    }
+    files = (
+        (controlled / "reference.pdf", visible / (source_names.get("control/work/_mat/reference.pdf") or "reference.pdf")),
+        (controlled / "caption-source.xlsx", visible / (source_names.get("control/work/_mat/caption-source.xlsx") or "caption-source.xlsx")),
+        (controlled / "automation-template.indd", visible / (source_names.get("control/work/_mat/automation-template.indd") or "automation-template.indd")),
+    )
+    for source, target in files:
+        if not source.is_file():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.is_file() or target.stat().st_size != source.stat().st_size or _sha256(target) != _sha256(source):
+            shutil.copy2(source, target)
+    visible_hires = visible / "hires"
+    visible_hires.mkdir(parents=True, exist_ok=True)
+    controlled_hires = controlled / "hires"
+    for source in sorted((*controlled_hires.glob("*.jpg"), *controlled_hires.glob("*.jpeg")), key=lambda p: p.name.casefold()):
+        target = visible_hires / source.name
+        if not target.is_file() or target.stat().st_size != source.stat().st_size or _sha256(target) != _sha256(source):
+            shutil.copy2(source, target)
 
 
 @dataclass(frozen=True)
@@ -166,15 +220,36 @@ class PipelineEngine:
         *,
         continue_after: bool = True,
         stop_after: str | None = None,
+        build_mode: BuildMode | str | None = None,
     ) -> PipelineResult:
         keys = [stage.key for stage in STAGES]
         start_key = start_key or self.store.first_incomplete_stage(project.id)
         if start_key not in keys:
             raise PipelineError(f"Неизвестный этап: {start_key}")
+        mode = self._coerce_build_mode(build_mode or getattr(project, "build_mode", BuildMode.FULL))
+        if mode == BuildMode.QUICK and keys.index(start_key) > keys.index(QUICK_BUILD_STOP_GATE):
+            self._mark_mode_skipped(project, mode)
+            return PipelineResult(
+                (),
+                None,
+                "Быстрая сборка уже дошла до INDD. Визуальная проверка и PDF не запускались; "
+                "для полного выпуска переключите режим на «Полная сборка»."
+            )
+        if mode == BuildMode.PHOTOS and keys.index(start_key) > keys.index(PHOTO_ONLY_STOP_GATE):
+            self._mark_mode_skipped(project, mode)
+            return PipelineResult(
+                (),
+                None,
+                "Сборка «только фотографии» уже дошла до INDD. Кредиты, визуальная проверка и PDF не запускались; "
+                "для полного выпуска создайте проект в режиме «Полная сборка».",
+            )
         self._bind_copied_revision_structure(project, start_key)
         provider = self._provider(project)
         completed: list[str] = []
         for stage in STAGES[keys.index(start_key) :]:
+            if mode == BuildMode.PHOTOS and stage.key in PHOTO_ONLY_SKIPPED_STAGES:
+                self._mark_mode_skipped(project, mode, (stage.key,))
+                continue
             current = self.store.stage_rows(project.id).get(stage.key, {})
             if current.get("status") == StageStatus.PASSED.value:
                 completed.append(stage.key)
@@ -197,11 +272,59 @@ class PipelineEngine:
             self.store.finish_run(run_id, StageStatus.PASSED, message)
             self.progress(stage.key, StageStatus.PASSED, message)
             completed.append(stage.key)
+            if mode == BuildMode.QUICK and stage.key == QUICK_BUILD_STOP_GATE:
+                self._mark_mode_skipped(project, mode)
+                return PipelineResult(
+                    tuple(completed),
+                    None,
+                    "БЫСТРАЯ СБОРКА ЗАВЕРШЕНА: INDD сохранён после разметки кредитов. "
+                    "Визуальная проверка, перемещение фото/кредитов и PDF не выполнялись. "
+                    "Теперь можно открыть INDD и внести ручные правки."
+                )
+            if mode == BuildMode.PHOTOS and stage.key == PHOTO_ONLY_STOP_GATE:
+                self._mark_mode_skipped(project, mode)
+                return PipelineResult(
+                    tuple(completed),
+                    None,
+                    "СБОРКА «ТОЛЬКО ФОТОГРАФИИ» ЗАВЕРШЕНА: INDD сохранён после расстановки фото. "
+                    "Сопоставление и запись кредитов, визуальная проверка и PDF не выполнялись.",
+                )
             if stage.key == stop_after:
                 return PipelineResult(tuple(completed), None, message)
             if not continue_after:
                 break
         return PipelineResult(tuple(completed), None, "Все доступные этапы завершены.")
+
+    @staticmethod
+    def _coerce_build_mode(value: BuildMode | str | None) -> BuildMode:
+        try:
+            return value if isinstance(value, BuildMode) else BuildMode(str(value or BuildMode.FULL.value))
+        except ValueError as error:
+            raise PipelineError(f"Неизвестный режим сборки: {value}") from error
+
+    def _mark_mode_skipped(
+        self,
+        project: ProjectRecord,
+        mode: BuildMode,
+        keys: tuple[str, ...] | None = None,
+    ) -> None:
+        """Persist intentional mode skips without presenting them as failures."""
+        if mode == BuildMode.PHOTOS:
+            skipped = keys or PHOTO_ONLY_SKIPPED_STAGES
+            message = "Пропущено в режиме «Только фотографии — INDD»."
+            marker = "photos_only"
+        else:
+            skipped = keys or QUICK_BUILD_SKIPPED_STAGES
+            message = "Пропущено в режиме «Быстрая сборка — только INDD»."
+            marker = "quick_build"
+        for key in skipped:
+            self.store.set_stage(
+                project.id,
+                key,
+                StageStatus.PENDING,
+                details={"skipped": marker, "message": message},
+            )
+            self.progress(key, StageStatus.PENDING, message)
 
     def _bind_copied_revision_structure(self, project: ProjectRecord, start_key: str) -> None:
         """Refresh copied-INDD object IDs before the first captions pass.
@@ -483,6 +606,7 @@ class PipelineEngine:
             llama_endpoint=self.store.get_setting("llama_endpoint", "http://127.0.0.1:8080"),
             google_api_key=get_google_api_key(),
             openai_api_key=get_openai_api_key(),
+            openrouter_api_key=get_openrouter_api_key(),
             usage_store=self.store,
         )
 
@@ -512,14 +636,15 @@ class PipelineEngine:
         self.controller.script("create_lookbook_work_area.py", root, timeout=120)
         snapshot = root / SOURCE_SNAPSHOT_RELATIVE
         if snapshot.is_file():
-            _validate_source_snapshot(root)
+            frozen = _validate_source_snapshot(root)
+            _sync_visible_materials(root, frozen)
             template = root / "control" / "work" / "_mat" / "automation-template.indd"
             master = root / master_filename(project.show_date)
             if not master.exists():
                 shutil.copy2(template, master)
             return (
                 f"Проект подготовлен: {root.name}. Используется сохранённый снимок PDF, Excel, hires и шаблона "
-                "из control/work/_mat; текущая папка SOURCES не читается."
+                "из control/work/_mat; видимая копия также доступна в _MAT; текущая папка SOURCES не читается."
             )
         report = discover_sources(project.source_dir, self.tools)
         if report.bundle is None:
@@ -529,7 +654,7 @@ class PipelineEngine:
         if not master.exists():
             shutil.copy2(root / "control" / "work" / "_mat" / "automation-template.indd", master)
         return (
-            f"Проект подготовлен: {root.name}. PDF, Excel, hires и шаблон скопированы в control/work/_mat; "
+            f"Проект подготовлен: {root.name}. PDF, Excel, hires и шаблон скопированы в control/work/_mat и видимую _MAT; "
             "InDesign будет работать только с локальными копиями проекта."
         )
 
@@ -538,7 +663,12 @@ class PipelineEngine:
         registry = project.project_dir / "control" / "work" / "look-register.tsv"
         manual = {row["look_id"]: row for row in self.store.looks(project.id) if row.get("status") == "manual"}
         if not registry.is_file() or not manual:
-            self.controller.script("build_reference_registry.py", project.project_dir, timeout=1800)
+            registry_args: list[str | Path] = []
+            if project.build_mode in {BuildMode.QUICK, BuildMode.PHOTOS}:
+                registry_args.append("--allow-missing")
+            if project.build_mode == BuildMode.PHOTOS:
+                registry_args.append("--photo-only")
+            self.controller.script("build_reference_registry.py", project.project_dir, *registry_args, timeout=1800)
         rows = _read_tsv(registry)
         applied: list[dict[str, str]] = []
         for row in rows:
@@ -572,21 +702,65 @@ class PipelineEngine:
         caption_map = root / "control" / "work" / "caption-map.tsv"
         if not caption_map.is_file():
             self.controller.script("prepare_caption_mapping.py", root, "--workbook", workbook, timeout=1800)
-        self.controller.script("auto_caption_map.py", root, "--mode", "seed", timeout=1800)
+        if project.build_mode == BuildMode.QUICK:
+            self.controller.script(
+                "auto_caption_map.py", root,
+                "--mode", "quick-autonomous",
+                "--missing-reference-dir", "control/work/missing-photo-reference",
+                timeout=1800,
+            )
+        else:
+            self.controller.script("auto_caption_map.py", root, "--mode", "seed", timeout=1800)
         manual_assignments = self._apply_credit_overrides(project)
         self.controller.script("render_caption_mapping_evidence.py", root, "--map", "control/work/caption-map.tsv", "--hires", "control/work/_mat/hires", timeout=1800)
 
         if isinstance(provider, CodexProvider):
-            rejected = self._confirm_codex_credit_proofs_parallel(project, provider)
-            if rejected:
-                # A proposed mapping is never silently accepted after a visual
-                # rejection.  Freeze the proven rows and let the existing
-                # one-to-one rematch workflow handle only the disputed cards.
+            try:
+                if project.build_mode == BuildMode.QUICK:
+                    self.log(
+                        "Быстрая сборка: запускаю автоматическую сверку всех credit proof-карточек "
+                        "без остановки интерфейса; визуальная проверка верстки и PDF по-прежнему пропускаются."
+                    )
+                rejected = self._confirm_autonomous_credit_proofs(project, provider)
+                if rejected:
+                    self.log(
+                        "AI отклонил первичное сопоставление; автоматически пересобираю только спорные карточки: "
+                        + ", ".join(rejected)
+                    )
+                    self._targeted_credit_rematch(project, provider, rejected)
+            except (ProviderError, ReviewRequired, CommandError, OSError, PipelineError) as error:
+                if project.build_mode != BuildMode.QUICK:
+                    raise
                 self.log(
-                    "Кредитные карточки требуют точечной пересверки: "
-                    + ", ".join(rejected)
+                    "Автосверка кредитов временно недоступна; применяю резервное "
+                    f"один-к-одному сопоставление и продолжаю сборку: {error}"
                 )
-                self._targeted_credit_rematch(project, provider, rejected)
+                self._quick_caption_map_fallback(root)
+        elif project.build_mode == BuildMode.QUICK:
+            # All built-in HTTP/local vision providers use the same read-only
+            # proof contract.  In quick mode this check is autonomous: a
+            # rejected card is rematched from the closed Excel pool instead of
+            # becoming a user-facing ReviewRequired stop.
+            try:
+                rejected = self._confirm_local_credit_proofs(
+                    project, provider, return_rejected=True,
+                )
+                if rejected:
+                    self.log(
+                        "AI отклонил первичное сопоставление; автоматически пересобираю только спорные карточки: "
+                        + ", ".join(rejected)
+                    )
+                    self._targeted_credit_rematch(project, provider, rejected)
+            except (ProviderError, ReviewRequired, CommandError, OSError) as error:
+                # Quick mode is explicitly a no-interaction draft route.  A
+                # temporary provider failure must not turn into a modal error
+                # or leave half-confirmed map rows.  The deterministic
+                # one-to-one result is regenerated and recorded as fallback.
+                self.log(
+                    "Автосверка кредитов временно недоступна; применяю резервное "
+                    f"один-к-одному сопоставление и продолжаю сборку: {error}"
+                )
+                self._quick_caption_map_fallback(root)
         else:
             self._select_local_credit_overrides(project, provider, manual_assignments)
             if manual_assignments:
@@ -607,6 +781,20 @@ class PipelineEngine:
         provenance = root / "control" / "work" / "caption-provenance.json"
         self.controller.script("build_verified_caption_data.py", caption_map, workbook, captions, "--provenance", provenance, timeout=600)
         return f"Все {len(rows)} кредитных карточек подтверждены и привязаны один-к-одному."
+
+    def _quick_caption_map_fallback(self, root: Path) -> None:
+        """Restore a complete deterministic map after a transient vision failure."""
+        self.controller.script(
+            "auto_caption_map.py", root,
+            "--mode", "quick-fallback",
+            "--missing-reference-dir", "control/work/missing-photo-reference",
+            timeout=1800,
+        )
+        self.controller.script(
+            "render_caption_mapping_evidence.py", root,
+            "--map", "control/work/caption-map.tsv",
+            "--hires", "control/work/_mat/hires", timeout=1800,
+        )
 
     def _repair_duplicate_caption_map(
         self,
@@ -679,12 +867,34 @@ class PipelineEngine:
         workbook = root / "control" / "work" / "_mat" / "caption-source.xlsx"
         if not caption_map.is_file():
             raise PipelineError("Не найдена существующая карта кредитов для точечной перепроверки.")
-        targets = sorted(set(requested_looks))
+        requested_targets = sorted(set(requested_looks))
+        targets = requested_targets.copy()
         before = _read_tsv(caption_map)
         before_by_look = {row["look_id"]: row.copy() for row in before}
         unknown = [look_id for look_id in targets if look_id not in before_by_look]
         if unknown:
             raise PipelineError("В карте кредитов отсутствуют отмеченные луки: " + ", ".join(unknown))
+
+        # A quick build may intentionally use a blank INDD placeholder until
+        # retouched photography arrives.  Do not ask a vision model to rematch
+        # a blank pair: the extracted PDF-reference image is the only valid
+        # evidence and, when absent from this legacy project, the safest quick
+        # result is to retain the existing one-to-one credit assignment.
+        skipped_missing = [
+            look_id for look_id in targets
+            if _has_missing_reference(before_by_look[look_id])
+        ] if project.build_mode == BuildMode.QUICK else []
+        if skipped_missing:
+            for row in before:
+                if row["look_id"] in skipped_missing:
+                    row["visual_status"] = "CONFIRMED"
+            _write_tsv(caption_map, before)
+            targets = [look_id for look_id in targets if look_id not in set(skipped_missing)]
+            self.log(
+                "Быстрая сборка: пропущено автоматическое пересопоставление для "
+                + ", ".join(skipped_missing)
+                + " — в проекте нет ретушированных фото, сохранено текущее one-to-one назначение."
+            )
 
         for row in before:
             if row["look_id"] in targets:
@@ -726,7 +936,7 @@ class PipelineEngine:
         for look_id in targets:
             (observations / f"{look_id}.json").unlink(missing_ok=True)
 
-        if isinstance(provider, CodexProvider):
+        if isinstance(provider, CodexProvider) or project.build_mode == BuildMode.QUICK:
             self._resolve_codex_targeted_credit_rematch(project, provider, targets, manifest)
         else:
             # Other model providers retain the existing conservative path.
@@ -759,16 +969,20 @@ class PipelineEngine:
                 "Точечная перепроверка не подтвердила: " + ", ".join(pending) + ". Остальные луки не изменялись."
             )
         self.store.replace_credits(project.id, after)
-        self.store.clear_credit_rematches(project.id, targets)
+        self.store.clear_credit_rematches(project.id, requested_targets)
         captions = root / "control" / "work" / "caption-data.tsv"
         provenance = root / "control" / "work" / "caption-provenance.json"
         self.controller.script("build_verified_caption_data.py", caption_map, workbook, captions, "--provenance", provenance, timeout=600)
-        return f"Точечно перепроверены только отмеченные луки: {', '.join(targets)}. Остальные строки карты сохранены без изменений."
+        suffix = (
+            "; без фото сохранены текущие назначения: " + ", ".join(skipped_missing)
+            if skipped_missing else ""
+        )
+        return f"Точечно перепроверены только отмеченные луки: {', '.join(targets) or 'новых кандидатов нет'}. Остальные строки карты сохранены без изменений{suffix}."
 
     def _resolve_codex_targeted_credit_rematch(
         self,
         project: ProjectRecord,
-        provider: CodexProvider,
+        provider: ModelProvider,
         targets: list[str],
         manifest: Path,
     ) -> None:
@@ -776,9 +990,10 @@ class PipelineEngine:
 
         The previous implementation delegated this mutation to a broad Codex
         task. A read-only worker could reject a bad proof but had no durable
-        way to choose, prove, select and re-confirm a replacement. Here Codex
-        only sees pixels and returns a single candidate; the controller owns
-        every file mutation and validates every transition.
+        way to choose, prove, select and re-confirm a replacement. Every
+        supported vision provider now only sees pixels and returns a single
+        candidate; the controller owns every file mutation and validates every
+        transition.
         """
         root = project.project_dir
         unresolved = list(targets)
@@ -800,7 +1015,7 @@ class PipelineEngine:
                 "render_caption_mapping_evidence.py", root,
                 "--map", "control/work/caption-map.tsv", "--hires", "control/work/_mat/hires", timeout=1800,
             )
-            rejected = self._confirm_codex_credit_proofs_parallel(project, provider)
+            rejected = self._confirm_autonomous_credit_proofs(project, provider)
             unresolved = [look_id for look_id in unresolved if look_id in set(rejected)]
             if unresolved:
                 self.log(
@@ -812,7 +1027,7 @@ class PipelineEngine:
 
     def _choose_and_verify_codex_rematch_candidates(
         self,
-        provider: CodexProvider,
+        provider: ModelProvider,
         root: Path,
         targets: list[str],
         manifest: Path,
@@ -835,10 +1050,16 @@ class PipelineEngine:
             # is allowed to transfer a card to the LOOK that actually matches
             # it, after which the former owner is re-evaluated.
             self._write_rematch_reserved(manifest, [])
-            self.controller.script(
-                "build_targeted_rematch_proofs.py", root,
+            rematch_args: list[str | Path] = [
                 "--looks", ",".join(remaining),
                 "--exclude-json", "control/work/ui-overrides/targeted-credit-rematch.json",
+            ]
+            missing_reference_dir = root / "control" / "work" / "missing-photo-reference"
+            if missing_reference_dir.is_dir():
+                rematch_args.extend(("--missing-reference-dir", "control/work/missing-photo-reference"))
+            self.controller.script(
+                "build_targeted_rematch_proofs.py", root,
+                *rematch_args,
                 timeout=1800,
             )
             choices = self._choose_codex_rematch_candidates(provider, root, remaining)
@@ -901,9 +1122,19 @@ class PipelineEngine:
         self._write_rematch_reserved(manifest, [])
         return accepted
 
+    def _confirm_autonomous_credit_proofs(
+        self,
+        project: ProjectRecord,
+        provider: ModelProvider,
+    ) -> list[str]:
+        """Confirm the current map without exposing a manual review queue."""
+        if isinstance(provider, CodexProvider):
+            return self._confirm_codex_credit_proofs_parallel(project, provider)
+        return self._confirm_local_credit_proofs(project, provider, return_rejected=True)
+
     def _choose_codex_rematch_candidates(
         self,
-        provider: CodexProvider,
+        provider: ModelProvider,
         root: Path,
         targets: list[str],
     ) -> dict[str, tuple[str, str]]:
@@ -927,7 +1158,7 @@ class PipelineEngine:
 
     def _inspect_codex_rematch_candidate(
         self,
-        provider: CodexProvider,
+        provider: ModelProvider,
         root: Path,
         look_id: str,
     ) -> tuple[str, str]:
@@ -949,35 +1180,47 @@ class PipelineEngine:
         )
         if not candidates or len(attachments) < 2 or len(attachments) > 5 or any(not path.is_file() for path in attachments):
             raise ValueError(f"{look_id}: incomplete controlled candidate evidence.")
-        allowed_labels = ", ".join(f"{sheet}:{number}" for sheet, number in sorted(candidates, key=lambda pair: (pair[0], int(pair[1]))))
+        ordered_candidates = sorted(candidates, key=lambda pair: (pair[0], int(pair[1])))
+        allowed_labels = ", ".join(f"{sheet}:{number}" for sheet, number in ordered_candidates)
+        allowed_lines = "\n".join(f"- {sheet}:{number}" for sheet, number in ordered_candidates)
         prompt = f"""Choose the single Excel card for one PDF look by visible identity.
 
 LOOK: {look_id}
 The first image contains the two PDF-look photographs. The other images are all allowed, currently unclaimed Excel cards, each labelled `EXCEL W:12` or `EXCEL M:9`.
 This is a closed candidate board. The only valid labels are: {allowed_labels}.
+Print the selected label exactly as one of these board labels (one per line):
+{allowed_lines}
 
-Compare the model, garments, colours, bag, shoes, accessories, pose and crop. Model presentation is a valid visible cue; do not use card numbers, ordering, filenames or background as evidence. Select only the label that visibly matches both PDF images.
+Use a deliberate two-pass comparison. First identify the model and the complete outfit in both PDF photos; then compare every plausible Excel card by at least two distinctive cues: garment type and colour, silhouette, bag, shoes, accessories, pose or crop. Recheck the leading candidates against both PDF photos before choosing. Model presentation is a valid visible cue. Do not use card numbers, ordering, filenames or background as evidence. Select the one label whose card visibly matches the same look, not merely a similar studio image.
 
 Reply with exactly one JSON object and no Markdown:
-{{"look_id":"{look_id}","excel_sheet":"W or M","excel_look_number":"number","note":"at least two concrete visible identity cues"}}"""
-        raw = provider.run_readonly_agent(prompt, root, timeout=3600, images=attachments)
-        try:
-            return _parse_codex_rematch_candidate(raw, look_id, candidates)
-        except ProviderError as first_error:
-            # This is a schema repair, not another visual guess: the same
-            # pixels and the same closed board are supplied again, now with an
-            # explicit instruction to return one printed board label.
-            repair_prompt = prompt + (
-                "\n\nYour previous response could not be applied because it named a label outside this closed board. "
-                f"Return one of these exact labels only: {allowed_labels}. Do not invent or reuse another card."
-            )
-            repaired = provider.run_readonly_agent(repair_prompt, root, timeout=3600, images=attachments)
+{{"look_id":"{look_id}","choice":"W:12","note":"at least two concrete visible identity cues"}}"""
+        prompts = [
+            prompt,
+            prompt + (
+                "\n\nThe previous response was not usable. This is a schema repair with the same images, "
+                "not a new visual task. Return exactly one JSON object with a `choice` field. "
+                f"Return one of these exact labels only: {allowed_labels}. "
+                f"The `choice` must be one of these exact labels and nothing else:\n{allowed_lines}"
+            ),
+            prompt + (
+                "\n\nFinal closed-board response repair. Do not explain your reasoning and do not use "
+                "excel_sheet/excel_look_number. Return only this shape, replacing CHOICE with one exact "
+                f"board label:\n{{\"look_id\":\"{look_id}\",\"choice\":\"CHOICE\",\"note\":\"garment=...; bag/shoes=...\"}}\n"
+                f"Allowed CHOICE values:\n{allowed_lines}"
+            ),
+        ]
+        failures: list[str] = []
+        for attempt, selection_prompt in enumerate(prompts, start=1):
             try:
-                return _parse_codex_rematch_candidate(repaired, look_id, candidates)
-            except ProviderError as repair_error:
-                raise ProviderError(
-                    f"{look_id}: the provider did not return a valid closed-board choice after schema repair ({repair_error})."
-                ) from first_error
+                raw = _run_readonly_vision(provider, selection_prompt, root, attachments, timeout=3600)
+                return _parse_codex_rematch_candidate(raw, look_id, candidates)
+            except (ProviderError, ValueError, OSError) as error:
+                failures.append(f"attempt {attempt}: {error}")
+        raise ProviderError(
+            f"{look_id}: automatic selection returned no valid label from the closed candidate board after "
+            f"{len(prompts)} format repairs ({failures[-1]})."
+        )
 
     def _alternative_evidence_rows(
         self,
@@ -999,7 +1242,7 @@ Reply with exactly one JSON object and no Markdown:
 
     def _inspect_codex_credit_evidence_parallel(
         self,
-        provider: CodexProvider,
+        provider: ModelProvider,
         root: Path,
         rows: list[dict[str, str]],
     ) -> dict[str, VisionDecision]:
@@ -1061,23 +1304,45 @@ Reply with exactly one JSON object and no Markdown:
         rows = self.store.looks(project.id)
         if not rows:
             raise PipelineError("Реестр луков пуст.")
+        if state.is_file():
+            saved_state = read_json(state)
+            saved_mode = str(saved_state.get("build_mode", BuildMode.FULL.value))
+            if saved_mode != project.build_mode.value:
+                raise PipelineError(
+                    "Режим сборки уже зафиксирован в контроллере этого проекта. "
+                    "Для смены режима создайте новый проект с теми же исходниками."
+                )
         if not state.is_file():
-            self.controller.gate(
-                "init", root,
+            init_args: list[str | Path] = [
                 "--master", master_filename(project.show_date),
                 "--registry", "control/work/look-register.tsv",
-                "--captions", "control/work/caption-data.tsv",
-                "--caption-map", "control/work/caption-map.tsv",
-                "--caption-workbook", "control/work/_mat/caption-source.xlsx",
-                "--caption-provenance", "control/work/caption-provenance.json",
                 "--hires", "control/work/_mat/hires",
                 "--reference", "control/work/_mat/reference.pdf",
                 "--looks", str(len(rows)),
                 "--show-date", project.show_date.strftime("%d.%m.%Y"),
                 "--show-text", visible_date_text(project.show_date),
+                "--build-mode", project.build_mode.value,
+            ]
+            if project.build_mode != BuildMode.PHOTOS:
+                init_args.extend([
+                    "--captions", "control/work/caption-data.tsv",
+                    "--caption-map", "control/work/caption-map.tsv",
+                    "--caption-workbook", "control/work/_mat/caption-source.xlsx",
+                    "--caption-provenance", "control/work/caption-provenance.json",
+                ])
+            self.controller.gate(
+                "init", root,
+                *init_args,
                 timeout=300,
             )
         self.controller.gate("prepare-reference-order", root, timeout=1800)
+        if project.build_mode == BuildMode.PHOTOS:
+            if evidence_passed(root, "map"):
+                return "PDF-порядок и пары фотографий зафиксированы для режима «Только фотографии — INDD»."
+            self.controller.gate("validate-map", root, timeout=600)
+            if not evidence_passed(root, "map"):
+                raise PipelineError("Контроллер не записал PASS map для режима «Только фотографии — INDD».")
+            return "PDF-порядок и пары фотографий зафиксированы для режима «Только фотографии — INDD»."
         if isinstance(provider, CodexProvider):
             self._confirm_codex_reference_proofs_parallel(project, provider)
         else:
@@ -1333,11 +1598,17 @@ Reply with exactly one JSON object and no Markdown:
             self.log("Codex: " + result[-4000:])
 
     def _confirm_local_credit_proofs(
-        self, project: ProjectRecord, provider: ModelProvider, only_looks: set[str] | None = None,
-    ) -> None:
+        self,
+        project: ProjectRecord,
+        provider: ModelProvider,
+        only_looks: set[str] | None = None,
+        *,
+        return_rejected: bool = False,
+    ) -> list[str]:
         root = project.project_dir
         mapping = _read_tsv(root / "control" / "work" / "caption-map.tsv")
         accepted: list[tuple[str, str]] = []
+        rejected: list[str] = []
         for row in mapping:
             if only_looks is not None and row["look_id"] not in only_looks:
                 continue
@@ -1352,11 +1623,14 @@ Reply with exactly one JSON object and no Markdown:
             )
             if decision.accepted:
                 accepted.append((row["look_id"], decision.note))
+            else:
+                rejected.append(row["look_id"])
             if len(accepted) == 5:
                 self._confirm_credit_batch(root, accepted)
                 accepted.clear()
         if accepted:
             self._confirm_credit_batch(root, accepted)
+        return rejected if return_rejected else []
 
     def _confirm_credit_batch(self, root: Path, accepted: list[tuple[str, str]]) -> None:
         looks = ",".join(look for look, _note in accepted)
@@ -1446,7 +1720,7 @@ Reply with exactly one JSON object and no Markdown:
         return rejected
 
     def _inspect_codex_credit_batch(
-        self, provider: CodexProvider, root: Path, rows: list[dict[str, str]], *, strict_notes: bool = False,
+        self, provider: ModelProvider, root: Path, rows: list[dict[str, str]], *, strict_notes: bool = False,
     ) -> dict[str, VisionDecision]:
         expected = [str(row["look_id"]) for row in rows]
         cards = []
@@ -1463,7 +1737,7 @@ Reply with exactly one JSON object and no Markdown:
 Тебе разрешено смотреть только эти proof-карточки:
 {chr(10).join(cards)}
 
-Каждая карточка состоит из Excel-лука и двух фотографий PDF-лука. Для каждого LOOK проверь реальное совпадение по модели, одежде, цвету, аксессуарам, обуви, сумке, позе и силуэту. Нельзя использовать порядок, номера строк, гендер, названия файлов или фон как доказательство.
+Каждая карточка состоит из Excel-лука и двух фотографий PDF-лука. Для каждого LOOK сначала определи модель и полный образ на обеих фотографиях PDF, затем сравни минимум два отличительных признака с Excel-фото: тип и цвет одежды, сумку, обувь, аксессуары, силуэт или позу. Перед решением сделай второй проход сравнения; отклоняй карточку, если совпадают только общий фон, типовая поза или один изолированный цвет. Нельзя использовать порядок, номера строк, гендер, названия файлов или фон как доказательство.
 
 Ничего не записывай, не запускай команды, не меняй TSV и не открывай InDesign. Верни только JSON без Markdown:
 {{"decisions":[{{"look_id":"LOOK_001","accepted":true,"note":"не менее двух конкретных видимых признаков"}}]}}
@@ -1480,8 +1754,26 @@ Reply with exactly one JSON object and no Markdown:
                 " This is a recovery pass after a note-format rejection: comply with the label format exactly "
                 "for every accepted LOOK."
             )
-        raw = provider.run_readonly_agent(prompt + note_contract, root, timeout=3600, images=attachments)
-        return _parse_codex_batch_decisions(raw, expected)
+        try:
+            raw = _run_readonly_vision(provider, prompt + note_contract, root, attachments, timeout=3600)
+            return _parse_codex_batch_decisions(raw, expected)
+        except ProviderError as first_error:
+            # Repair only the response format with the same pixels and the
+            # same closed proof batch. This avoids a user-facing stop when a
+            # provider returns prose around otherwise valid JSON.
+            repair_prompt = prompt + note_contract + (
+                "\n\nПредыдущий ответ нельзя применить. Верни ровно один JSON-объект, "
+                "включи каждый запрошенный LOOK ровно один раз, используй accepted=true/false "
+                "и конкретное поле note."
+            )
+            try:
+                repaired = _run_readonly_vision(provider, repair_prompt, root, attachments, timeout=3600)
+                return _parse_codex_batch_decisions(repaired, expected)
+            except ProviderError as repair_error:
+                raise ProviderError(
+                    "Не удалось получить корректный ответ автоматической сверки кредитов "
+                    f"после повторной попытки: {repair_error}"
+                ) from first_error
 
     def _confirm_codex_reference_proofs_parallel(self, project: ProjectRecord, provider: CodexProvider) -> None:
         """Confirm PDF-reference evidence in parallel without concurrent controller writes."""
@@ -2176,6 +2468,27 @@ def _look_ids_in_text(value: str) -> list[str]:
     return list(dict.fromkeys(re.findall(r"\bLOOK_\d{3,}\b", str(value).upper())))
 
 
+def _run_readonly_vision(
+    provider: ModelProvider,
+    prompt: str,
+    workspace: Path,
+    images: list[Path],
+    *,
+    timeout: int,
+) -> str:
+    """Call the provider's closed-board vision API with test/backward support."""
+    method = getattr(provider, "run_readonly_vision", None)
+    if callable(method):
+        return str(method(prompt, workspace, images=images, timeout=timeout))
+    # Older lightweight provider doubles used by the embedded engine exposed
+    # only Codex's original method. Keep that contract valid while production
+    # providers use the common raw-vision method above.
+    legacy = getattr(provider, "run_readonly_agent", None)
+    if callable(legacy):
+        return str(legacy(prompt, workspace, timeout=timeout, images=images))
+    raise ProviderError(f"{getattr(provider, 'kind', 'AI')} не поддерживает автоматический выбор Excel-карточки.")
+
+
 def _parse_codex_batch_decisions(raw: str, expected_looks: list[str]) -> dict[str, VisionDecision]:
     """Validate a no-write Codex batch response before any controller mutation."""
     text = str(raw).strip()
@@ -2200,7 +2513,13 @@ def _parse_codex_batch_decisions(raw: str, expected_looks: list[str]) -> dict[st
         accepted = item.get("accepted", item.get("match"))
         if not isinstance(accepted, bool):
             raise ProviderError(f"{look_id}: поле accepted должно быть true или false.")
-        note = _safe_confirmation_note(str(item.get("note", "")))
+        raw_note = str(item.get("note", "")).strip()
+        # A rejected proposal is an internal rematch signal in autonomous
+        # mode; it does not need to satisfy the human-facing confirmation-note
+        # contract. Accepted decisions still require grounded evidence.
+        note = _safe_confirmation_note(raw_note) if accepted else (
+            raw_note or "Совпадение не подтверждено; требуется автоматический подбор другой карточки."
+        )
         parsed[look_id] = VisionDecision(accepted=accepted, note=note, raw=text)
     if set(parsed) != expected:
         missing = ", ".join(sorted(expected - set(parsed)))
@@ -2229,8 +2548,6 @@ def _parse_codex_rematch_candidate(
         raise ProviderError("Codex returned invalid JSON for the rematch candidate.") from error
     if not isinstance(payload, dict) or str(payload.get("look_id", "")).strip() != expected_look:
         raise ProviderError(f"{expected_look}: Codex returned a candidate for another LOOK.")
-    sheet = str(payload.get("excel_sheet", "")).strip().upper()
-    number = str(payload.get("excel_look_number", "")).strip()
     board: dict[tuple[str, str], tuple[str, str]] = {}
     for candidate_sheet, candidate_number in candidates:
         canonical_sheet = str(candidate_sheet).strip().upper()
@@ -2241,9 +2558,26 @@ def _parse_codex_rematch_candidate(
         if canonical in board and board[canonical] != (candidate_sheet, candidate_number):
             raise ProviderError(f"{expected_look}: the controlled candidate board contains duplicate logical labels.")
         board[canonical] = (candidate_sheet, candidate_number)
-    if sheet not in {"W", "M"} or not number.isdigit():
-        raise ProviderError(f"{expected_look}: Codex selected a card outside the supplied candidate board.")
-    selected = board.get((sheet, str(int(number))))
+
+    def from_label(value: object) -> tuple[str, str] | None:
+        text_value = str(value or "").strip().upper()
+        match = re.fullmatch(r"(?:EXCEL\s*)?([WM])\s*[:/_-]\s*0*(\d+)", text_value)
+        if not match:
+            return None
+        return board.get((match.group(1), str(int(match.group(2)))))
+
+    # Accept both the original two-field schema and the compact `choice`
+    # schema used by response repair. A valid closed-board choice wins even
+    # when stale auxiliary fields are present in the same response.
+    explicit_values: list[object] = []
+    for key in ("choice", "candidate", "label", "excel_card", "excel"):
+        if key in payload:
+            explicit_values.append(payload[key])
+    sheet = str(payload.get("excel_sheet", "")).strip().upper()
+    number = str(payload.get("excel_look_number", "")).strip()
+    if sheet in {"W", "M"} and number.isdigit():
+        explicit_values.append(f"{sheet}:{number}")
+    selected = next((choice for value in explicit_values if (choice := from_label(value)) is not None), None)
     if selected is None:
         raise ProviderError(f"{expected_look}: Codex selected a card outside the supplied candidate board.")
     _safe_confirmation_note(str(payload.get("note", "")))

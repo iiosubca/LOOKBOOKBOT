@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import hashlib
+import json
 import re
 from datetime import date
 from pathlib import Path
@@ -52,11 +53,18 @@ from .caption_editor import (
 )
 from .controller import read_json
 from .discovery import discover_sources, infer_output_root
-from .domain import ProviderKind, STAGES, StageStatus, project_code
+from .domain import BuildMode, ProviderKind, STAGES, StageStatus, project_code
 from .pipeline import PipelineEngine, PipelineError, PipelineResult
 from .project_import import ExistingProjectError, open_existing_project
 from .providers import ProviderError, make_provider
-from .secrets import get_google_api_key, get_openai_api_key, save_google_api_key, save_openai_api_key
+from .secrets import (
+    get_google_api_key,
+    get_openai_api_key,
+    get_openrouter_api_key,
+    save_google_api_key,
+    save_openai_api_key,
+    save_openrouter_api_key,
+)
 from .state import StateStore
 from .visual_audit import load_visual_audit
 
@@ -71,17 +79,22 @@ STATUS_COLOR = {
 }
 
 
-def _stage_status_square(status: str) -> QIcon:
+def _stage_status_square(status: str, *, skipped: bool = False) -> QIcon:
     """Render the release-stage state with the same square language as checks."""
-    fill = {
-        StageStatus.PASSED.value: "#111111",
-        StageStatus.FAILED.value: "#e84b16",
-        StageStatus.BLOCKED.value: "#e84b16",
-    }.get(status, "#ffffff")
+    if skipped:
+        fill = "#e3e3de"
+        outline = "#8b8b84"
+    else:
+        fill = {
+            StageStatus.PASSED.value: "#111111",
+            StageStatus.FAILED.value: "#e84b16",
+            StageStatus.BLOCKED.value: "#e84b16",
+        }.get(status, "#ffffff")
+        outline = "#111111"
     pixmap = QPixmap(14, 14)
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
-    painter.setPen(QPen(QColor("#111111"), 1))
+    painter.setPen(QPen(QColor(outline), 1))
     painter.setBrush(QColor(fill))
     painter.drawRect(1, 1, 11, 11)
     painter.end()
@@ -292,6 +305,7 @@ class MainWindow(QMainWindow):
         self.provider_combo = QComboBox()
         self.provider_combo.addItem("Codex", ProviderKind.CODEX.value)
         self.provider_combo.addItem("OpenAI API", ProviderKind.OPENAI.value)
+        self.provider_combo.addItem("OpenRouter", ProviderKind.OPENROUTER.value)
         self.provider_combo.addItem("Google AI Studio", ProviderKind.GOOGLE.value)
         self.provider_combo.addItem("Ollama", ProviderKind.OLLAMA.value)
         self.provider_combo.addItem("llama.cpp", ProviderKind.LLAMACPP.value)
@@ -382,6 +396,24 @@ class MainWindow(QMainWindow):
         self.run_button.setObjectName("Run")
         self.run_button.clicked.connect(self._run_pipeline)
         side_layout.addWidget(self.run_button)
+        build_mode_title = QLabel("РЕЖИМ СБОРКИ")
+        build_mode_title.setObjectName("ModeTitle")
+        self.build_mode_combo = QComboBox()
+        self.build_mode_combo.addItem("Полная сборка", BuildMode.FULL.value)
+        self.build_mode_combo.addItem("Быстрая сборка — только INDD", BuildMode.QUICK.value)
+        self.build_mode_combo.addItem("Только фотографии — INDD", BuildMode.PHOTOS.value)
+        self.build_mode_combo.setToolTip(
+            "Быстрая сборка автоматически размечает кредиты и сохраняет INDD без визуальной проверки и PDF. "
+            "Режим «Только фотографии» расставляет только фото и сохраняет INDD без Excel-сопоставления, "
+            "кредитов, визуальной проверки и PDF."
+        )
+        self.build_mode_combo.currentIndexChanged.connect(self._build_mode_changed)
+        self.build_mode_hint = QLabel()
+        self.build_mode_hint.setObjectName("Muted")
+        self.build_mode_hint.setWordWrap(True)
+        side_layout.insertWidget(side_layout.indexOf(self.continue_button), build_mode_title)
+        side_layout.insertWidget(side_layout.indexOf(self.continue_button), self.build_mode_combo)
+        side_layout.insertWidget(side_layout.indexOf(self.continue_button), self.build_mode_hint)
         self.visual_progress_label = QLabel()
         self.visual_progress_label.setObjectName("Muted")
         self.visual_progress_label.setWordWrap(True)
@@ -695,7 +727,15 @@ class MainWindow(QMainWindow):
         if index >= 0:
             self.provider_combo.setCurrentIndex(index)
         self.model_combo.setCurrentText(self.store.get_setting(f"model_{provider}", ""))
+        build_mode = self.store.get_setting("build_mode", BuildMode.FULL.value)
+        mode_index = self.build_mode_combo.findData(build_mode)
+        if mode_index < 0:
+            mode_index = self.build_mode_combo.findData(BuildMode.FULL.value)
+        self.build_mode_combo.blockSignals(True)
+        self.build_mode_combo.setCurrentIndex(mode_index)
+        self.build_mode_combo.blockSignals(False)
         self._provider_changed()
+        self._refresh_build_mode_hint()
 
     def _load_project(self) -> None:
         self.project = self.store.active_project()
@@ -710,6 +750,11 @@ class MainWindow(QMainWindow):
         if index >= 0:
             self.provider_combo.setCurrentIndex(index)
         self.model_combo.setCurrentText(self.project.model)
+        mode_index = self.build_mode_combo.findData(self.project.build_mode.value)
+        self.build_mode_combo.blockSignals(True)
+        if mode_index >= 0:
+            self.build_mode_combo.setCurrentIndex(mode_index)
+        self.build_mode_combo.blockSignals(False)
         # Version 0.2.57 adds the shared front/back covers to Gender PDFs.
         # Older completed projects are safely returned to the final-only stage
         # so the controller can archive and replace just those two outputs.
@@ -726,6 +771,7 @@ class MainWindow(QMainWindow):
         self._load_caption_revision_visual_mode()
         self._load_runs()
         self._refresh_google_quota()
+        self._refresh_build_mode_hint()
 
     def _browse_sources(self) -> None:
         selected = QFileDialog.getExistingDirectory(self, "Выберите папку исходников", self.source_edit.text() or str(Path.home()))
@@ -754,10 +800,12 @@ class MainWindow(QMainWindow):
         self.project = self.store.save_project(
             name=project_code(show_date), source_dir=source.resolve(), output_root=output_root,
             project_dir=project_dir, show_date=show_date, provider=provider, model=model,
+            build_mode=BuildMode(str(self.build_mode_combo.currentData() or BuildMode.FULL.value)),
         )
         self.store.set_setting("last_source", str(source.resolve()))
         self.store.set_setting("provider", provider.value)
         self.store.set_setting(f"model_{provider.value}", model)
+        self.store.set_setting("build_mode", self.project.build_mode.value)
         self._append_log(f"Проект открыт: {project_dir}")
         self._load_project()
 
@@ -784,6 +832,7 @@ class MainWindow(QMainWindow):
         defaults = {
             ProviderKind.CODEX: ["", "gpt-5.6-sol", "gpt-5.5"],
             ProviderKind.OPENAI: ["gpt-5.6"],
+            ProviderKind.OPENROUTER: ["google/gemini-3.8-flash"],
             ProviderKind.GOOGLE: ["gemini-3.5-flash-lite"],
             ProviderKind.OLLAMA: [saved] if saved else [],
             ProviderKind.LLAMACPP: [saved or "local"],
@@ -792,7 +841,8 @@ class MainWindow(QMainWindow):
         self.model_combo.setCurrentText(saved or defaults[kind][0])
         is_google = kind == ProviderKind.GOOGLE
         is_openai = kind == ProviderKind.OPENAI
-        needs_key = is_google or is_openai
+        is_openrouter = kind == ProviderKind.OPENROUTER
+        needs_key = is_google or is_openai or is_openrouter
         self.provider_key_label.setVisible(needs_key)
         self.provider_key_edit.setVisible(needs_key)
         self.google_quota.setVisible(is_google)
@@ -805,6 +855,44 @@ class MainWindow(QMainWindow):
             self.provider_key_label.setText("OpenAI API key")
             self.provider_key_edit.setPlaceholderText("sk-...")
             self.provider_key_edit.setText(get_openai_api_key())
+        elif is_openrouter:
+            self.provider_key_label.setText("OpenRouter API key")
+            self.provider_key_edit.setPlaceholderText("sk-or-...")
+            self.provider_key_edit.setText(get_openrouter_api_key())
+
+    def _build_mode_changed(self) -> None:
+        value = str(self.build_mode_combo.currentData() or BuildMode.FULL.value)
+        try:
+            mode = BuildMode(value)
+        except ValueError:
+            mode = BuildMode.FULL
+        self.store.set_setting("build_mode", mode.value)
+        if self.project:
+            self.store.set_build_mode(self.project.id, mode)
+            self.project = self.store.get_project(self.project.id)
+            self._refresh_stages()
+        self._refresh_build_mode_hint()
+
+    def _refresh_build_mode_hint(self) -> None:
+        if not hasattr(self, "build_mode_combo"):
+            return
+        mode = str(self.build_mode_combo.currentData() or BuildMode.FULL.value)
+        if mode == BuildMode.QUICK.value:
+            self.build_mode_hint.setText(
+                "Только INDD: кредиты автоматически сверяются по фотографиям и Excel, "
+                "а визуальная проверка верстки и PDF не запускаются. "
+                "Отсутствующие фото остаются пустыми в фиксированных фреймах."
+            )
+        elif mode == BuildMode.PHOTOS.value:
+            self.build_mode_hint.setText(
+                "Только фотографии: создаётся INDD с фото по PDF-порядку. "
+                "Excel, кредиты, визуальная проверка и PDF не запускаются. "
+                "Если фото ещё нет, его фрейм останется пустым."
+            )
+        else:
+            self.build_mode_hint.setText(
+                "Полный выпуск: после кредитов выполняются визуальная проверка и PDF на проверку."
+            )
 
     def _save_provider_key_if_supplied(self, provider: ProviderKind) -> None:
         value = self.provider_key_edit.text()
@@ -812,6 +900,8 @@ class MainWindow(QMainWindow):
             save_google_api_key(value)
         elif provider == ProviderKind.OPENAI and value.strip():
             save_openai_api_key(value)
+        elif provider == ProviderKind.OPENROUTER and value.strip():
+            save_openrouter_api_key(value)
 
     def _refresh_google_quota(self) -> None:
         usage = self.store.google_usage_status()
@@ -831,6 +921,7 @@ class MainWindow(QMainWindow):
             llama_endpoint=self.store.get_setting("llama_endpoint", "http://127.0.0.1:8080"),
             google_api_key=get_google_api_key(),
             openai_api_key=get_openai_api_key(),
+            openrouter_api_key=get_openrouter_api_key(),
             usage_store=self.store,
         )
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
@@ -858,6 +949,23 @@ class MainWindow(QMainWindow):
         self._save_provider_key_if_supplied(ProviderKind(str(self.provider_combo.currentData())))
         selected = self.stage_list.selectedItems()
         start_key = str(selected[0].data(Qt.ItemDataRole.UserRole)) if selected else None
+        build_mode = BuildMode(str(self.build_mode_combo.currentData() or BuildMode.FULL.value))
+        if build_mode == BuildMode.QUICK and start_key in {"visual", "review", "final"}:
+            QMessageBox.information(
+                self,
+                "Быстрая сборка завершена",
+                "В режиме «Быстрая сборка — только INDD» эти этапы намеренно не запускаются. "
+                "Откройте сохранённый INDD или переключите режим на «Полная сборка»."
+            )
+            return
+        if build_mode == BuildMode.PHOTOS and start_key in {"captions", "visual", "review", "final"}:
+            QMessageBox.information(
+                self,
+                "Сборка только фотографий завершена",
+                "В режиме «Только фотографии — INDD» кредиты, визуальная проверка и PDF намеренно не запускаются. "
+                "Откройте сохранённый INDD или создайте новый проект в режиме «Полная сборка».",
+            )
+            return
         # A deliberately selected stage is an explicit request to rebuild it
         # (for example, after a human correction or to export the review PDF
         # again). Continuing with no selection keeps completed stages intact
@@ -1112,13 +1220,33 @@ class MainWindow(QMainWindow):
     def _refresh_stages(self) -> None:
         rows = self.store.stage_rows(self.project.id) if self.project else {}
         for stage in STAGES:
-            status = rows.get(stage.key, {}).get("status", StageStatus.PENDING.value)
+            row = rows.get(stage.key, {})
+            status = row.get("status", StageStatus.PENDING.value)
+            try:
+                details = json.loads(str(row.get("details_json", "{}")))
+            except (TypeError, ValueError):
+                details = {}
+            skipped = (
+                bool(self.project)
+                and (
+                    self.project.build_mode == BuildMode.QUICK and details.get("skipped") == "quick_build"
+                    or self.project.build_mode == BuildMode.PHOTOS and details.get("skipped") == "photos_only"
+                )
+            )
             item = self.stage_items[stage.key]
-            item.setText(stage.title)
-            item.setIcon(_stage_status_square(status))
-            item.setForeground(QColor(STATUS_COLOR.get(status, "#e8edf5")))
-            error = rows.get(stage.key, {}).get("error", "")
-            item.setToolTip(error or stage.description)
+            item.setText(f"{stage.title} — ПРОПУЩЕНО" if skipped else stage.title)
+            item.setIcon(_stage_status_square(status, skipped=skipped))
+            item.setForeground(QColor("#8b8b84" if skipped else STATUS_COLOR.get(status, "#e8edf5")))
+            error = row.get("error", "")
+            skip_message = (
+                "Пропущено в режиме «Только фотографии — INDD»."
+                if details.get("skipped") == "photos_only"
+                else "Пропущено в режиме «Быстрая сборка — только INDD»."
+            )
+            item.setToolTip(
+                skip_message
+                if skipped else (error or stage.description)
+            )
 
     def _stage_selected(self) -> None:
         selected = self.stage_list.selectedItems()

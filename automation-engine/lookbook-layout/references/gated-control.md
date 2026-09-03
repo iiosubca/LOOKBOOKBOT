@@ -12,7 +12,7 @@ $gate = 'C:\Users\vdiza\.codex\skills\lookbook-layout\scripts\lookbook_gate.py'
 $project = 'C:\Users\vdiza\Desktop\TSUM\2026\Lookbook\TSUM_FS-0260726'
 ```
 
-The saved master `.indd` must sit directly in `$project`. The PDF reference determines every required look and its order; build the photo registry from that reference before opening Excel. The registry binds only photo pairs to pages; credits are not allowed in it. Excel is a catalogue and may legitimately have unused extra looks — its number of cards must not be compared to the PDF count. Before map validation, create the reviewed Excel-to-photo map and its proof cards:
+The saved master `.indd` must sit directly in `$project`. The PDF reference determines every required look and its order; build the photo registry from that reference before opening Excel. The registry builder detects whether the PDF has zero or one leading non-look cover page from visible photo placements; it does not blindly skip page 1. The registry binds only photo pairs to pages; credits are not allowed in it. Excel is a catalogue and may legitimately have unused extra looks — its number of cards must not be compared to the PDF count. Before map validation, create the reviewed Excel-to-photo map and its proof cards:
 
 For this TSUM workspace, create the project master as a copy of:
 
@@ -73,7 +73,7 @@ Before Excel credit mapping can be accepted, bind the exact reference pages to t
 # Repeat the one-look command after inspecting every LOOK_###. Confirmations are immutable and hash-bound to the source PDF and registry.
 ```
 
-`validate-map` blocks unless all reference-page comparisons are present and current. The register requires `pdf_spread` 1..N and fixed InDesign pairs 2/3, 4/5, ...; Excel cannot silently replace the reference sequence.
+`validate-map` blocks unless all reference-page comparisons are present and current. The register requires `pdf_spread` 1..N and fixed InDesign pairs 2/3, 4/5, ...; Excel cannot silently replace the reference sequence. The source PDF may contain either N look pages or one leading cover followed by N look pages; the frozen controller session stores that offset.
 
 Check the only durable status with:
 

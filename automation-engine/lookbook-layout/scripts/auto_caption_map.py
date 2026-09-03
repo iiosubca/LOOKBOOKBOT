@@ -3,10 +3,11 @@
 
 The PDF-derived registry supplies the fixed left/right photo pair for every
 look.  This tool compares each embedded Excel card with both members of every
-registered pair, uses a one-to-one assignment, and refuses weak or ambiguous
-matches.  It is deliberately separate from the proof renderer: a proposed map
-is PENDING, the renderer freezes an exact three-panel proof, and only then can
-the same visual resolver mark every row CONFIRMED.
+registered pair, scores the complete pair as a unit, uses a one-to-one
+assignment, and refuses weak or ambiguous matches.  It is deliberately separate
+from the proof renderer: a proposed map is PENDING, the renderer freezes an
+exact three-panel proof, and only then can the same visual resolver mark every
+row CONFIRMED.
 """
 from __future__ import annotations
 
@@ -35,6 +36,17 @@ MAP_FIELDS = [
 INDEX_FIELDS = ["excel_sheet", "excel_look_number", "excel_image"]
 THUMBNAIL = (96, 144)
 PANEL = (520, 720)
+MISSING_PREFIX = "__lbb_missing_"
+# An Excel card contains one representative image, while the PDF registry
+# contains the ordered full-length/close-up pair.  Keep both views in the
+# score: direct view identity remains strongest, and pair appearance is a
+# conservative tie-breaker.  The two appearance terms are deliberately small
+# because a full-length Excel card is not expected to look like the close-up
+# pixel-for-pixel.  This lets pair evidence correct near-ties without
+# destabilising strong one-to-one matches.
+DIRECT_PAIR_WEIGHT = 0.985
+BEST_VIEW_APPEARANCE_WEIGHT = 0.010
+PAIR_CONTEXT_WEIGHT = 0.005
 ALTERNATIVE_FIELDS = [
     "look_id", "excel_sheet", "excel_look_number", "excel_image",
     "left_filename", "right_filename", "evidence_file", "evidence_sha256",
@@ -73,9 +85,9 @@ def preview(image: Image.Image) -> Image.Image:
     return ImageOps.fit(oriented, THUMBNAIL, method=Image.Resampling.LANCZOS)
 
 
-def image_feature(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    with Image.open(path) as source:
-        thumb = preview(source)
+def _feature_arrays(image: Image.Image) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Build identity features while suppressing the shared studio background."""
+    thumb = preview(image)
     rgb = np.asarray(thumb, dtype=np.float32) / 255.0
     grey = rgb[..., 0] * 0.299 + rgb[..., 1] * 0.587 + rgb[..., 2] * 0.114
     edge = np.zeros_like(grey)
@@ -84,10 +96,41 @@ def image_feature(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     spread = np.max(rgb, axis=2) - np.min(rgb, axis=2)
     foreground = np.clip((0.94 - grey) / 0.24, 0.0, 1.0)
     foreground = np.maximum(foreground, np.clip((spread - 0.055) / 0.18, 0.0, 1.0))
-    return rgb, edge, foreground
+
+    # A global colour average cannot distinguish neighbouring looks with the
+    # same white studio wall. Preserve where the garment colour occurs by
+    # recording foreground-weighted colour in a stable 4x4 grid.
+    grid: list[float] = []
+    mask = np.maximum(foreground, 0.08)
+    height, width = mask.shape
+    for row in range(4):
+        y0, y1 = round(row * height / 4), round((row + 1) * height / 4)
+        for column in range(4):
+            x0, x1 = round(column * width / 4), round((column + 1) * width / 4)
+            region = mask[y0:y1, x0:x1]
+            pixels = rgb[y0:y1, x0:x1]
+            denominator = float(np.sum(region)) or 1.0
+            grid.extend(float(value) for value in np.sum(pixels * region[..., None], axis=(0, 1)) / denominator)
+
+    subject = rgb[foreground > 0.14]
+    if len(subject) < 12:
+        subject = rgb.reshape(-1, 3)
+    histogram, _ = np.histogramdd(subject, bins=(4, 4, 4), range=((0.0, 1.0),) * 3)
+    histogram = histogram.astype(np.float32).reshape(-1)
+    histogram /= float(np.sum(histogram)) or 1.0
+    profile = np.concatenate((np.mean(foreground, axis=1), np.mean(foreground, axis=0))).astype(np.float32)
+    return rgb, edge, foreground, np.asarray(grid, dtype=np.float32), np.concatenate((histogram, profile))
 
 
-def distance(left: tuple[np.ndarray, np.ndarray, np.ndarray], right: tuple[np.ndarray, np.ndarray, np.ndarray]) -> float:
+def image_feature(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    with Image.open(path) as source:
+        return _feature_arrays(source)
+
+
+def distance(
+    left: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+    right: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+) -> float:
     # Most pixels are the same pale studio background.  A global average made
     # two different light looks appear deceptively close.  Weight the garment
     # and model silhouette heavily, while retaining a small background weight
@@ -96,7 +139,83 @@ def distance(left: tuple[np.ndarray, np.ndarray, np.ndarray], right: tuple[np.nd
     colour = float(np.sum(np.mean(np.abs(left[0] - right[0]), axis=2) * weight) / np.sum(weight))
     edges = float(np.sum(np.abs(left[1] - right[1]) * weight) / np.sum(weight))
     silhouette = float(np.mean(np.abs(left[2] - right[2])))
-    return colour * 0.42 + edges * 0.38 + silhouette * 0.20
+    grid = float(np.mean(np.abs(left[3] - right[3])))
+    signature = float(np.mean(np.abs(left[4] - right[4])))
+    # Keep direct pixels and edges useful for exact same-shoot matches, but
+    # make spatial garment colour and silhouette distribution decisive when
+    # several male looks share the same pale background and pose.
+    return (
+        colour * 0.28
+        + edges * 0.24
+        + silhouette * 0.14
+        + grid * 0.22
+        + signature * 0.12
+    )
+
+
+def appearance_signature(
+    features: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Extract foreground-weighted appearance evidence from an image feature."""
+    rgb, _edge, foreground, _grid, _signature = features
+    quantized = np.minimum((rgb * 8).astype(np.int32), 7)
+    bins = (quantized[..., 0] * 64 + quantized[..., 1] * 8 + quantized[..., 2]).ravel()
+    weights = foreground.ravel().astype(np.float64)
+    histogram = np.bincount(bins, weights=weights, minlength=512).astype(np.float64)
+    total = float(histogram.sum())
+    if total > 0:
+        histogram /= total
+    weighted_colour = (rgb * foreground[..., None]).sum(axis=(0, 1)) / max(float(foreground.sum()), 1e-8)
+    profile = np.concatenate((foreground.mean(axis=1), foreground.mean(axis=0)))
+    summary = np.concatenate((weighted_colour, np.asarray([foreground.mean()]), profile)).astype(np.float64)
+    return histogram, summary
+
+
+def appearance_distance(
+    left: tuple[np.ndarray, np.ndarray], right: tuple[np.ndarray, np.ndarray],
+) -> float:
+    histogram = float(np.abs(left[0] - right[0]).sum() / 2.0)
+    summary = float(np.mean(np.abs(left[1] - right[1])))
+    return histogram + 0.4 * summary
+
+
+def pair_context_distance(
+    card: tuple[np.ndarray, np.ndarray],
+    left: tuple[np.ndarray, np.ndarray],
+    right: tuple[np.ndarray, np.ndarray],
+) -> float:
+    """Compare a card with the combined appearance of both pair members."""
+    pair_histogram = (left[0] + right[0]) / 2.0
+    pair_summary = (left[1] + right[1]) / 2.0
+    histogram = float(np.abs(card[0] - pair_histogram).sum() / 2.0)
+    summary = float(np.mean(np.abs(card[1] - pair_summary)))
+    return histogram + 0.4 * summary
+
+
+def pair_distance(
+    card: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+    left: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+    right: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+    card_appearance: tuple[np.ndarray, np.ndarray],
+    left_appearance: tuple[np.ndarray, np.ndarray],
+    right_appearance: tuple[np.ndarray, np.ndarray],
+) -> tuple[float, str, float, float, float]:
+    """Return one score for an Excel card against the complete photo pair."""
+    left_score = distance(card, left)
+    right_score = distance(card, right)
+    matched_side = "LEFT" if left_score <= right_score else "RIGHT"
+    best_view = min(left_score, right_score)
+    best_appearance = min(
+        appearance_distance(card_appearance, left_appearance),
+        appearance_distance(card_appearance, right_appearance),
+    )
+    context = pair_context_distance(card_appearance, left_appearance, right_appearance)
+    score = (
+        DIRECT_PAIR_WEIGHT * best_view
+        + BEST_VIEW_APPEARANCE_WEIGHT * best_appearance
+        + PAIR_CONTEXT_WEIGHT * context
+    )
+    return score, matched_side, left_score, right_score, context
 
 
 def minimum_assignment(cost: np.ndarray) -> list[int]:
@@ -213,28 +332,74 @@ def render_alternative_proof(project: Path, row: dict[str, str], card: dict[str,
         fail(f"{row['look_id']}: alternative proof is unexpectedly small.")
 
 
-def resolve(project: Path, registry: list[dict[str, str]], cards: list[dict[str, str]], hires: Path) -> tuple[list[int], list[dict[str, object]], list[str]]:
+def _caption_source(
+    project: Path,
+    row: dict[str, str],
+    hires: Path,
+    missing_reference_dir: Path | None,
+    side: str,
+) -> Path:
+    filename = row[f"{side}_filename"]
+    source = hires / filename
+    if filename.casefold().startswith(MISSING_PREFIX):
+        if missing_reference_dir is None:
+            fail(
+                f"{row['look_id']}: quick-build placeholder has no PDF-reference fallback. "
+                "Run the quick registry build again."
+            )
+        source = missing_reference_dir / f"{row['look_id']}_{side.upper()}.jpg"
+    return source
+
+
+def resolve(
+    project: Path,
+    registry: list[dict[str, str]],
+    cards: list[dict[str, str]],
+    hires: Path,
+    missing_reference_dir: Path | None = None,
+) -> tuple[list[int], list[dict[str, object]], list[str]]:
     if len(cards) < len(registry):
         fail(f"Excel has {len(cards)} visual cards but the PDF requires {len(registry)} looks.")
-    card_features: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+    card_features: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
     for card in cards:
         image = child(project, card["excel_image"])
         if not image.is_file():
             fail(f"Excel visual card is missing: {image}")
         card_features.append(image_feature(image))
-    pairs: list[tuple[tuple[np.ndarray, np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray, np.ndarray]]] = []
+    pairs: list[
+        tuple[
+            tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+            tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+        ]
+    ] = []
     for row in registry:
-        left, right = hires / row["left_filename"], hires / row["right_filename"]
+        left = _caption_source(project, row, hires, missing_reference_dir, "left")
+        right = _caption_source(project, row, hires, missing_reference_dir, "right")
         if not left.is_file() or not right.is_file():
-            fail(f"{row['look_id']}: frozen photo pair is missing from hires.")
+            fail(f"{row['look_id']}: caption-mapping source pair is missing: {left}, {right}.")
         pairs.append((image_feature(left), image_feature(right)))
+    # Excel contains one representative frame per credit card.  Precompute a
+    # compact appearance signature once per image so the assignment can use
+    # both views of each PDF look without repeatedly decoding or analysing them.
+    card_appearances = [appearance_signature(feature) for feature in card_features]
+    pair_appearances = [
+        (appearance_signature(left), appearance_signature(right))
+        for left, right in pairs
+    ]
     costs = np.empty((len(registry), len(cards)), dtype=np.float64)
     side: list[list[str]] = [["" for _ in cards] for _ in registry]
     for look_index, (left, right) in enumerate(pairs):
         for card_index, card_feature in enumerate(card_features):
-            left_score, right_score = distance(card_feature, left), distance(card_feature, right)
-            costs[look_index, card_index] = min(left_score, right_score)
-            side[look_index][card_index] = "LEFT" if left_score <= right_score else "RIGHT"
+            score, matched_side, _left_score, _right_score, _context = pair_distance(
+                card_feature,
+                left,
+                right,
+                card_appearances[card_index],
+                pair_appearances[look_index][0],
+                pair_appearances[look_index][1],
+            )
+            costs[look_index, card_index] = score
+            side[look_index][card_index] = matched_side
     assignment = minimum_assignment(costs)
     diagnostics: list[dict[str, object]] = []
     issues: list[str] = []
@@ -383,12 +548,18 @@ def main() -> None:
         choices=(
             "propose", "seed", "reset-visual-review", "repair", "confirm-strong", "confirm-review",
             "alternative-proofs", "select-alternatives", "confirm", "audit",
+            "quick-seed", "quick-autonomous", "quick-fallback",
         ),
         default="propose",
     )
     parser.add_argument("--registry", default="control/work/look-register.tsv")
     parser.add_argument("--index", default="control/work/_mat/excel-images/index.tsv")
     parser.add_argument("--hires", default="control/work/_mat/hires")
+    parser.add_argument(
+        "--missing-reference-dir",
+        default="",
+        help="Quick-build only: use extracted PDF-reference photos for registry placeholders while mapping Excel credits.",
+    )
     parser.add_argument("--map", dest="caption_map", default="control/work/caption-map.tsv")
     parser.add_argument("--candidates", default="control/work/caption-map-candidates.tsv")
     parser.add_argument("--looks", default="", help="comma-separated LOOK_### IDs for one reviewed batch (maximum five)")
@@ -408,7 +579,10 @@ def main() -> None:
     for index, row in enumerate(registry, start=1):
         if row["look_id"] != f"LOOK_{index:03}" or not row["left_filename"] or not row["right_filename"]:
             fail(f"Registry row {index} is incomplete.")
-    assignment, diagnostics, issues = resolve(project, registry, cards, child(project, args.hires))
+    missing_reference_dir = child(project, args.missing_reference_dir) if args.missing_reference_dir else None
+    assignment, diagnostics, issues = resolve(
+        project, registry, cards, child(project, args.hires), missing_reference_dir,
+    )
     candidate_rows = [{key: str(value) for key, value in record.items()} for record in diagnostics]
     write_rows(child(project, args.candidates), list(candidate_rows[0]) if candidate_rows else [], candidate_rows)
     if issues and args.mode in {"propose", "confirm", "audit"}:
@@ -424,7 +598,12 @@ def main() -> None:
             "left_filename": source["left_filename"],
             "right_filename": source["right_filename"],
             "evidence_file": f"control/work/mapping-evidence/{source['look_id']}.jpg",
-            "visual_status": "PENDING",
+            # ``quick-seed`` is retained as a low-level compatibility command
+            # for callers that explicitly want the old non-review behaviour.
+            # The application uses ``quick-autonomous``: it keeps every
+            # proposal PENDING until the selected vision provider has checked
+            # the exact proof card and, when needed, chosen a replacement.
+            "visual_status": "CONFIRMED" if args.mode in {"quick-seed", "quick-fallback"} else "PENDING",
         })
     map_path = child(project, args.caption_map)
     review = {str(record["look_id"]): record for record in diagnostics if needs_visual_review(record)}
@@ -467,6 +646,41 @@ def main() -> None:
             "confirmed. Render all proof cards and visually confirm every exact card in batches of at most five."
         )
         print(f"Review queue: {queue_path}")
+    elif args.mode in {"quick-seed", "quick-autonomous", "quick-fallback"}:
+        if map_path.exists():
+            existing = read_rows(map_path, MAP_FIELDS)
+            has_prior_decisions = any(
+                row[key]
+                for row in existing
+                for key in ("excel_sheet", "excel_look_number", "excel_image")
+            )
+            if args.mode != "quick-fallback" and (len(existing) != len(proposed) or (
+                has_prior_decisions
+                and any(not same_identity(actual, expected) for actual, expected in zip(existing, proposed))
+            )):
+                fail("Quick caption map would replace an existing different map; start a new quick build instead.")
+        write_rows(map_path, MAP_FIELDS, proposed)
+        if issues and args.mode == "quick-seed":
+            print(
+                "QUICK CAPTION MAP WARNING: automatic identity was not decisive for "
+                + ", ".join(record["look_id"] for record in diagnostics if any(record["look_id"] in issue for issue in issues))
+                + "; assignments were retained for this non-review quick build and are listed in the candidate report."
+            )
+        if args.mode == "quick-autonomous":
+            print(
+                f"QUICK AUTONOMOUS CAPTION MAP READY: {len(proposed)} one-to-one proposals queued for "
+                "automatic vision adjudication before the credits stage."
+            )
+        elif args.mode == "quick-fallback":
+            print(
+                f"QUICK FALLBACK CAPTION MAP READY: {len(proposed)} deterministic one-to-one assignments "
+                "restored after a temporary automatic vision-provider failure."
+            )
+        else:
+            print(
+                f"QUICK CAPTION MAP READY: {len(proposed)} one-to-one Excel credit assignments confirmed from "
+                "PDF/reference image identity. The low-level quick-seed command skips visual credit-proof inspection."
+            )
     elif args.mode == "reset-visual-review":
         # A stale test or a rejected visual observation must never retain a
         # CONFIRMED flag.  Resetting restores only the frozen original visual

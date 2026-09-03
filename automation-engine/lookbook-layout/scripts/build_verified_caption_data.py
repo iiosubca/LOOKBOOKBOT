@@ -65,11 +65,13 @@ def extract_products(workbook_path: Path, mapping: list[dict[str, str]]) -> list
     workbook = openpyxl.load_workbook(workbook_path, data_only=True, read_only=False)
     grouped: dict[tuple[str, str], list[tuple[str, str, str, str]]] = {}
     try:
+        sheets = {str(sheet.title).strip().upper(): sheet for sheet in workbook.worksheets}
         for sheet_name in ("W", "M"):
-            if sheet_name not in workbook.sheetnames:
+            sheet = sheets.get(sheet_name)
+            if sheet is None:
                 raise ValueError(f"Workbook is missing worksheet {sheet_name}.")
             current = ""
-            for values in workbook[sheet_name].iter_rows(min_row=2, values_only=True):
+            for values in sheet.iter_rows(min_row=2, values_only=True):
                 number, kind, brand, amount, article = (list(values) + [None] * 6)[1:6]
                 number_text = clean(number)
                 if number_text.isdigit():

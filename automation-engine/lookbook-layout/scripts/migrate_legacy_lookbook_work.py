@@ -75,9 +75,13 @@ def main() -> None:
     if current_gate(project, state) is not None:
         raise SystemExit("Migrate only after every controlled gate has passed; an active build must keep its frozen paths.")
     work = work_path(project)
+    visible_mat = project / "_MAT"
+    preserve_visible_mat = visible_mat.is_dir() and (work / "_mat").is_dir()
     moves: list[tuple[Path, Path]] = []
     for name in ROOT_WORK_DIRECTORIES:
         source = project / name
+        if name == "_mat" and preserve_visible_mat:
+            continue
         if source.exists():
             moves.append((source, work / name))
     for key in STATE_WORK_KEYS:
@@ -87,7 +91,11 @@ def main() -> None:
             moves.append((source, target))
     protected = {source.resolve() for source, _ in moves}
     for item in project.iterdir():
-        if item.name in {"control", "control-history", "Gender"} or item.suffix.lower() in {".indd", ".pdf", ".idlk"}:
+        if (
+            item.name.casefold() in {"control", "control-history", "gender"}
+            or (preserve_visible_mat and item.name.casefold() == "_mat")
+            or item.suffix.lower() in {".indd", ".pdf", ".idlk"}
+        ):
             continue
         if item.resolve() not in protected:
             moves.append((item, work / "legacy-root" / item.name))

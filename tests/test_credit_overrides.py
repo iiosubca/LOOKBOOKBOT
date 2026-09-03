@@ -134,6 +134,15 @@ def test_rematch_candidate_accepts_a_zero_padded_rendering_of_a_board_label() ->
     ) == ("W", "007")
 
 
+def test_rematch_candidate_accepts_compact_choice_schema_and_stale_auxiliary_fields() -> None:
+    assert _parse_codex_rematch_candidate(
+        '{"look_id":"LOOK_007","choice":"EXCEL W:007","excel_sheet":"M",'
+        '"excel_look_number":"999","note":"garment=blue pleated blouse; bag=straw tote"}',
+        "LOOK_007",
+        {("W", "7"), ("M", "11")},
+    ) == ("W", "7")
+
+
 def test_rematch_selection_repairs_an_out_of_board_provider_answer(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state.db")
     engine = PipelineEngine(store)
