@@ -5,6 +5,8 @@ import sys
 import hashlib
 import json
 import re
+import threading
+from dataclasses import asdict
 from datetime import date
 from pathlib import Path
 
@@ -40,6 +42,7 @@ from PySide6.QtWidgets import (
 )
 
 from .config import ToolPaths
+from .codex_catalog import CodexModel, list_codex_models
 from .caption_editor import (
     CaptionEditorError,
     apply_caption_draft,
@@ -56,7 +59,7 @@ from .discovery import discover_sources, infer_output_root
 from .domain import BuildMode, ProviderKind, STAGES, StageStatus, project_code
 from .pipeline import PipelineEngine, PipelineError, PipelineResult
 from .project_import import ExistingProjectError, open_existing_project
-from .providers import ProviderError, make_provider
+from .providers import CODEX_STANDARD_MODEL, ProviderError, make_provider
 from .secrets import (
     get_google_api_key,
     get_openai_api_key,
@@ -193,6 +196,11 @@ class PipelineWorker(QObject):
             self.finished.emit(result)
 
 
+class CatalogSignals(QObject):
+    loaded = Signal(object)
+    failed = Signal(str)
+
+
 class ImagePreview(QLabel):
     def __init__(self, placeholder: str) -> None:
         super().__init__(placeholder)
@@ -229,6 +237,13 @@ class MainWindow(QMainWindow):
         self.project = self.store.active_project()
         self.worker_thread: QThread | None = None
         self.worker: PipelineWorker | None = None
+        self.codex_models: list[CodexModel] = self._cached_codex_models()
+        self.codex_catalog_verified = False
+        self._catalog_pending = False
+        self._updating_model_controls = False
+        self.catalog_signals = CatalogSignals(self)
+        self.catalog_signals.loaded.connect(self._catalog_loaded)
+        self.catalog_signals.failed.connect(self._catalog_failed)
         self._busy_controls: list[tuple[QPushButton, str, bool]] = []
         self.stage_items: dict[str, QListWidgetItem] = {}
         self._loading_credits = False
@@ -249,6 +264,7 @@ class MainWindow(QMainWindow):
         self._apply_style()
         self._load_settings()
         self._load_project()
+        QTimer.singleShot(0, self._refresh_codex_models)
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -313,6 +329,14 @@ class MainWindow(QMainWindow):
         self.model_combo = QComboBox()
         self.model_combo.setEditable(True)
         self.model_combo.setMinimumWidth(180)
+        self.model_combo.currentTextChanged.connect(self._model_changed)
+        self.reasoning_combo = QComboBox()
+        self.reasoning_combo.setMinimumWidth(160)
+        self.reasoning_label = QLabel("Размышления")
+        self.catalog_refresh_button = QPushButton("Обновить модели")
+        self.catalog_refresh_button.clicked.connect(self._refresh_codex_models)
+        self.catalog_status = QLabel("Список Codex ещё не проверен")
+        self.catalog_status.setObjectName("Muted")
         self.provider_key_label = QLabel("API key")
         self.provider_key_edit = QLineEdit()
         self.provider_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
@@ -356,6 +380,13 @@ class MainWindow(QMainWindow):
 
         setup_layout.addLayout(source_row)
         setup_layout.addLayout(model_row)
+        catalog_row = QHBoxLayout()
+        catalog_row.setSpacing(10)
+        catalog_row.addWidget(self.reasoning_label)
+        catalog_row.addWidget(self.reasoning_combo)
+        catalog_row.addWidget(self.catalog_refresh_button)
+        catalog_row.addWidget(self.catalog_status, 1)
+        setup_layout.addLayout(catalog_row)
         outer.addWidget(setup)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -514,7 +545,7 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         toolbar = QHBoxLayout()
-        hint = QLabel("Отметьте галочкой только спорные луки: повторно сопоставляться будут лишь они, остальные CONFIRMED останутся замороженными.")
+        hint = QLabel("Отметьте спорные луки: бот перепроверит их и связанные конфликты назначений. Остальные луки и ручные назначения сохраняются.")
         hint.setObjectName("Muted")
         self.rematch_credits_button = QPushButton("↻ Повторно сопоставить отмеченные")
         self.rematch_credits_button.clicked.connect(self._run_targeted_credit_rematch)
@@ -726,7 +757,10 @@ class MainWindow(QMainWindow):
         index = self.provider_combo.findData(provider)
         if index >= 0:
             self.provider_combo.setCurrentIndex(index)
-        self.model_combo.setCurrentText(self.store.get_setting(f"model_{provider}", ""))
+        saved_model = self.store.get_setting(f"model_{provider}", "")
+        if provider == ProviderKind.CODEX.value and not saved_model:
+            saved_model = CODEX_STANDARD_MODEL
+        self._select_model(saved_model)
         build_mode = self.store.get_setting("build_mode", BuildMode.FULL.value)
         mode_index = self.build_mode_combo.findData(build_mode)
         if mode_index < 0:
@@ -735,6 +769,7 @@ class MainWindow(QMainWindow):
         self.build_mode_combo.setCurrentIndex(mode_index)
         self.build_mode_combo.blockSignals(False)
         self._provider_changed()
+        self._select_model(saved_model)
         self._refresh_build_mode_hint()
 
     def _load_project(self) -> None:
@@ -749,7 +784,12 @@ class MainWindow(QMainWindow):
         index = self.provider_combo.findData(self.project.provider.value)
         if index >= 0:
             self.provider_combo.setCurrentIndex(index)
-        self.model_combo.setCurrentText(self.project.model)
+        display_model = self.project.model
+        if self.project.provider == ProviderKind.CODEX and not display_model:
+            display_model = CODEX_STANDARD_MODEL
+        self._select_model(display_model)
+        if self.project.provider == ProviderKind.CODEX:
+            self._fill_reasoning(display_model, self.project.reasoning_effort)
         mode_index = self.build_mode_combo.findData(self.project.build_mode.value)
         self.build_mode_combo.blockSignals(True)
         if mode_index >= 0:
@@ -796,15 +836,21 @@ class MainWindow(QMainWindow):
         project_dir = output_root / project_code(show_date)
         provider = ProviderKind(str(self.provider_combo.currentData()))
         model = self.model_combo.currentText().strip()
+        if provider == ProviderKind.CODEX and not self._codex_selection_valid(model, str(self.reasoning_combo.currentData() or "")):
+            return
+        reasoning_effort = str(self.reasoning_combo.currentData() or "") if provider == ProviderKind.CODEX else ""
         self._save_provider_key_if_supplied(provider)
         self.project = self.store.save_project(
             name=project_code(show_date), source_dir=source.resolve(), output_root=output_root,
             project_dir=project_dir, show_date=show_date, provider=provider, model=model,
             build_mode=BuildMode(str(self.build_mode_combo.currentData() or BuildMode.FULL.value)),
+            reasoning_effort=reasoning_effort,
         )
         self.store.set_setting("last_source", str(source.resolve()))
         self.store.set_setting("provider", provider.value)
         self.store.set_setting(f"model_{provider.value}", model)
+        if provider == ProviderKind.CODEX:
+            self.store.set_setting(f"reasoning_codex_{model}", reasoning_effort)
         self.store.set_setting("build_mode", self.project.build_mode.value)
         self._append_log(f"Проект открыт: {project_dir}")
         self._load_project()
@@ -815,9 +861,13 @@ class MainWindow(QMainWindow):
         if not selected:
             return
         provider = ProviderKind(str(self.provider_combo.currentData()))
+        model = self.model_combo.currentText().strip()
+        if provider == ProviderKind.CODEX and not self._codex_selection_valid(model, str(self.reasoning_combo.currentData() or "")):
+            return
         try:
             self.project = open_existing_project(
-                self.store, Path(selected), provider=provider, model=self.model_combo.currentText().strip()
+                self.store, Path(selected), provider=provider, model=model,
+                reasoning_effort=str(self.reasoning_combo.currentData() or "") if provider == ProviderKind.CODEX else "",
             )
         except ExistingProjectError as error:
             QMessageBox.warning(self, "Не удалось открыть проект", str(error))
@@ -828,17 +878,26 @@ class MainWindow(QMainWindow):
     def _provider_changed(self) -> None:
         kind = ProviderKind(str(self.provider_combo.currentData()))
         saved = self.store.get_setting(f"model_{kind.value}", "")
-        self.model_combo.clear()
+        if kind == ProviderKind.CODEX:
+            if not saved:
+                saved = CODEX_STANDARD_MODEL
+            self.model_combo.setEditable(False)
+            self._fill_codex_models(saved, self.store.get_setting(f"reasoning_codex_{saved}", ""))
+        else:
+            self.model_combo.setEditable(True)
+            self.model_combo.clear()
         defaults = {
-            ProviderKind.CODEX: ["", "gpt-5.6-sol", "gpt-5.5"],
             ProviderKind.OPENAI: ["gpt-5.6"],
             ProviderKind.OPENROUTER: ["google/gemini-3.8-flash"],
             ProviderKind.GOOGLE: ["gemini-3.5-flash-lite"],
             ProviderKind.OLLAMA: [saved] if saved else [],
             ProviderKind.LLAMACPP: [saved or "local"],
         }
-        self.model_combo.addItems([item for item in defaults[kind] if item or kind == ProviderKind.CODEX])
-        self.model_combo.setCurrentText(saved or defaults[kind][0])
+        if kind != ProviderKind.CODEX:
+            self.model_combo.addItems([item for item in defaults[kind] if item])
+            self.model_combo.setCurrentText(saved or defaults[kind][0])
+        for widget in (self.reasoning_label, self.reasoning_combo, self.catalog_refresh_button, self.catalog_status):
+            widget.setVisible(kind == ProviderKind.CODEX)
         is_google = kind == ProviderKind.GOOGLE
         is_openai = kind == ProviderKind.OPENAI
         is_openrouter = kind == ProviderKind.OPENROUTER
@@ -859,6 +918,114 @@ class MainWindow(QMainWindow):
             self.provider_key_label.setText("OpenRouter API key")
             self.provider_key_edit.setPlaceholderText("sk-or-...")
             self.provider_key_edit.setText(get_openrouter_api_key())
+
+    def _cached_codex_models(self) -> list[CodexModel]:
+        try:
+            cached = json.loads(self.store.get_setting("codex_model_catalog", "[]"))
+            if not isinstance(cached, list):
+                return []
+            return [CodexModel(
+                model=str(item["model"]), display_name=str(item["display_name"]),
+                reasoning_efforts=tuple(str(value) for value in item["reasoning_efforts"]),
+                default_reasoning_effort=str(item["default_reasoning_effort"]),
+            ) for item in cached if isinstance(item, dict)]
+        except (ValueError, KeyError, TypeError):
+            return []
+
+    def _select_model(self, model: str) -> None:
+        if not model:
+            return
+        if self.model_combo.findText(model) < 0:
+            self.model_combo.addItem(model)
+        self.model_combo.setCurrentText(model)
+
+    def _fill_codex_models(self, preferred_model: str, preferred_effort: str = "") -> None:
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        available = [item.model for item in self.codex_models]
+        self.model_combo.addItems(available or [CODEX_STANDARD_MODEL])
+        if preferred_model and preferred_model not in available:
+            self.model_combo.addItem(preferred_model)
+        self.model_combo.setCurrentText(preferred_model if preferred_model else (available[0] if available else CODEX_STANDARD_MODEL))
+        self.model_combo.blockSignals(False)
+        for index, item in enumerate(self.codex_models):
+            self.model_combo.setItemData(index, item.display_name, Qt.ItemDataRole.ToolTipRole)
+        self._fill_reasoning(self.model_combo.currentText(), preferred_effort)
+
+    def _model_changed(self, model: str) -> None:
+        if not hasattr(self, "provider_combo") or not hasattr(self, "reasoning_combo"):
+            return
+        if str(self.provider_combo.currentData()) == ProviderKind.CODEX.value:
+            self._fill_reasoning(model, self.store.get_setting(f"reasoning_codex_{model}", ""))
+
+    def _fill_reasoning(self, model: str, preferred: str = "") -> None:
+        info = next((item for item in self.codex_models if item.model == model), None)
+        self.reasoning_combo.blockSignals(True)
+        self.reasoning_combo.clear()
+        default = f"Как в Codex (рекомендовано: {info.default_reasoning_effort})" if info and info.default_reasoning_effort else "Как в Codex"
+        self.reasoning_combo.addItem(default, "")
+        for effort in info.reasoning_efforts if info else ():
+            self.reasoning_combo.addItem(effort, effort)
+        index = self.reasoning_combo.findData(preferred)
+        self.reasoning_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.reasoning_combo.setEnabled(info is not None)
+        self.reasoning_combo.blockSignals(False)
+
+    def _codex_selection_valid(self, model: str, effort: str) -> bool:
+        if self._catalog_pending:
+            QMessageBox.information(self, "Проверка моделей", "Дождитесь обновления списка моделей Codex перед запуском.")
+            return False
+        if not self.codex_catalog_verified:
+            return True  # Keep a saved build usable while Codex is offline.
+        info = next((item for item in self.codex_models if item.model == model), None)
+        if info is None:
+            QMessageBox.warning(self, "Модель недоступна", "Этой модели нет в текущем списке Codex. Выберите доступную модель.")
+            return False
+        if effort and effort not in info.reasoning_efforts:
+            QMessageBox.warning(self, "Уровень недоступен", "Выбранный уровень размышления не поддерживается этой моделью.")
+            return False
+        return True
+
+    def _refresh_codex_models(self) -> None:
+        if self._catalog_pending:
+            return
+        self._catalog_pending = True
+        self.catalog_refresh_button.setEnabled(False)
+        self.catalog_status.setText("Проверяю модели, доступные в Codex…")
+
+        def fetch() -> None:
+            try:
+                self.catalog_signals.loaded.emit(list_codex_models())
+            except Exception as error:
+                # A discovery worker must always release the pending UI state,
+                # even if a future Codex response changes unexpectedly.
+                self.catalog_signals.failed.emit(str(error))
+
+        threading.Thread(target=fetch, name="lookbookbot-codex-catalog", daemon=True).start()
+
+    def _catalog_loaded(self, models: object) -> None:
+        self._catalog_pending = False
+        self.catalog_refresh_button.setEnabled(True)
+        current = self.model_combo.currentText().strip()
+        effort = str(self.reasoning_combo.currentData() or "")
+        self.codex_models = list(models)
+        self.codex_catalog_verified = True
+        self.store.set_setting("codex_model_catalog", json.dumps([asdict(item) for item in self.codex_models]))
+        if str(self.provider_combo.currentData()) == ProviderKind.CODEX.value:
+            self._fill_codex_models(current, effort)
+        if current and current not in {item.model for item in self.codex_models}:
+            self.catalog_status.setText("Codex: выбранная ранее модель недоступна; выберите модель из нового списка")
+        else:
+            self.catalog_status.setText(f"Codex: актуальный список получен, моделей: {len(self.codex_models)}")
+        self.catalog_status.setToolTip("")
+
+    def _catalog_failed(self, message: str) -> None:
+        self._catalog_pending = False
+        self.catalog_refresh_button.setEnabled(True)
+        self.codex_catalog_verified = False
+        source = "последний сохранённый список" if self.codex_models else "список недоступен"
+        self.catalog_status.setText(f"Codex: {source}; нажмите «Обновить модели»")
+        self.catalog_status.setToolTip(message)
 
     def _build_mode_changed(self) -> None:
         value = str(self.build_mode_combo.currentData() or BuildMode.FULL.value)
@@ -914,6 +1081,9 @@ class MainWindow(QMainWindow):
 
     def _test_provider(self) -> None:
         kind = ProviderKind(str(self.provider_combo.currentData()))
+        if kind == ProviderKind.CODEX:
+            self._refresh_codex_models()
+            return
         self._save_provider_key_if_supplied(kind)
         provider = make_provider(
             kind, self.model_combo.currentText().strip(),
@@ -945,6 +1115,10 @@ class MainWindow(QMainWindow):
     def _run_pipeline(self) -> None:
         if self.project is None:
             QMessageBox.information(self, "Сначала создайте проект", "Выберите исходники, дату и нажмите «Создать / открыть проект».")
+            return
+        if str(self.provider_combo.currentData()) == ProviderKind.CODEX.value and not self._codex_selection_valid(
+            self.model_combo.currentText().strip(), str(self.reasoning_combo.currentData() or ""),
+        ):
             return
         self._save_provider_key_if_supplied(ProviderKind(str(self.provider_combo.currentData())))
         selected = self.stage_list.selectedItems()
@@ -991,6 +1165,19 @@ class MainWindow(QMainWindow):
         if self.worker_thread is not None and self.worker_thread.isRunning():
             self._append_log("Операция уже выполняется; повторный запуск не создан.")
             return
+        # The selection in the header is the selection for this run, including
+        # an already open project. Save it before the worker reads ProjectRecord.
+        selected_provider = ProviderKind(str(self.provider_combo.currentData()))
+        selected_model = self.model_combo.currentText().strip()
+        selected_effort = str(self.reasoning_combo.currentData() or "") if selected_provider == ProviderKind.CODEX else ""
+        if selected_provider == ProviderKind.CODEX and not self._codex_selection_valid(selected_model, selected_effort):
+            return
+        self.store.set_project_provider(self.project.id, selected_provider, selected_model, selected_effort)
+        self.store.set_setting("provider", selected_provider.value)
+        self.store.set_setting(f"model_{selected_provider.value}", selected_model)
+        if selected_provider == ProviderKind.CODEX:
+            self.store.set_setting(f"reasoning_codex_{selected_model}", selected_effort)
+        self.project = self.store.get_project(self.project.id)
         self._begin_worker_ui(initiator or self.run_button, activity_text)
         self.worker_thread = QThread(self)
         self.worker = PipelineWorker(
@@ -1319,7 +1506,7 @@ class MainWindow(QMainWindow):
         if not self.project or self.looks_table.currentRow() < 0:
             return
         row = self.looks_table.currentRow()
-        hires = self.project.project_dir / "control" / "work" / "_mat" / "hires"
+        hires = self.project.project_dir / "_MAT" / "hires"
         self.left_preview.set_image(hires / self.looks_table.item(row, 3).text())
         self.right_preview.set_image(hires / self.looks_table.item(row, 4).text())
 
@@ -1633,7 +1820,7 @@ class MainWindow(QMainWindow):
         finally:
             self._loading_corrections = False
         self._correction_dirty = False
-        hires = self.project.project_dir / "control" / "work" / "_mat" / "hires"
+        hires = self.project.project_dir / "_MAT" / "hires"
         self.correction_left_preview.set_image(hires / str(look.get("left_filename", "")) if look else None)
         self.correction_right_preview.set_image(hires / str(look.get("right_filename", "")) if look else None)
 

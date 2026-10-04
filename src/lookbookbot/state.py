@@ -48,6 +48,7 @@ class StateStore:
                     show_date TEXT NOT NULL,
                     provider TEXT NOT NULL,
                     model TEXT NOT NULL DEFAULT '',
+                    reasoning_effort TEXT NOT NULL DEFAULT '',
                     build_mode TEXT NOT NULL DEFAULT 'full',
                     active INTEGER NOT NULL DEFAULT 0,
                     approved INTEGER NOT NULL DEFAULT 0,
@@ -133,6 +134,13 @@ class StateStore:
             project_columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(projects)").fetchall()}
             if "build_mode" not in project_columns:
                 db.execute("ALTER TABLE projects ADD COLUMN build_mode TEXT NOT NULL DEFAULT 'full'")
+            if "reasoning_effort" not in project_columns:
+                db.execute("ALTER TABLE projects ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT ''")
+                # Older builds routed their inherited Astra selection to Terra.
+                # Preserve that behavior once; new explicit choices stay exact.
+                db.execute(
+                    "UPDATE projects SET model='gpt-5.6-terra' WHERE provider='codex' AND model='gpt-6-astra'"
+                )
 
     def save_project(
         self,
@@ -145,6 +153,7 @@ class StateStore:
         provider: ProviderKind,
         model: str,
         build_mode: BuildMode | str | None = None,
+        reasoning_effort: str = "",
     ) -> ProjectRecord:
         now = utc_now()
         with self.connect() as db:
@@ -166,17 +175,18 @@ class StateStore:
             db.execute("UPDATE projects SET active = 0")
             db.execute(
                 """
-                INSERT INTO projects(id,name,source_dir,output_root,project_dir,show_date,provider,model,build_mode,active,created_at,updated_at)
-                VALUES(?,?,?,?,?,?,?,?,?,1,?,?)
+                INSERT INTO projects(id,name,source_dir,output_root,project_dir,show_date,provider,model,reasoning_effort,build_mode,active,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,1,?,?)
                 ON CONFLICT(id) DO UPDATE SET
                     name=excluded.name, source_dir=excluded.source_dir, output_root=excluded.output_root,
                     show_date=excluded.show_date, provider=excluded.provider, model=excluded.model,
+                    reasoning_effort=excluded.reasoning_effort,
                     build_mode=excluded.build_mode,
                     active=1, updated_at=excluded.updated_at
                 """,
                 (
                     project_id, name, str(source_dir), str(output_root), str(project_dir), show_date.isoformat(),
-                    provider.value, model.strip(), requested_mode, now, now,
+                    provider.value, model.strip(), reasoning_effort.strip(), requested_mode, now, now,
                 ),
             )
             for stage in STAGES:
@@ -200,6 +210,7 @@ class StateStore:
             output_root=Path(row["output_root"]), project_dir=Path(row["project_dir"]),
             show_date=date.fromisoformat(row["show_date"]), provider=ProviderKind(row["provider"]), model=row["model"],
             build_mode=build_mode,
+            reasoning_effort=str(row["reasoning_effort"]),
         )
 
     def active_project(self) -> ProjectRecord | None:
@@ -233,6 +244,15 @@ class StateStore:
             db.execute(
                 "UPDATE projects SET build_mode = ?, updated_at = ? WHERE id = ?",
                 (value, utc_now(), project_id),
+            )
+
+    def set_project_provider(
+        self, project_id: str, provider: ProviderKind, model: str, reasoning_effort: str = "",
+    ) -> None:
+        with self.connect() as db:
+            db.execute(
+                "UPDATE projects SET provider=?, model=?, reasoning_effort=?, updated_at=? WHERE id=?",
+                (provider.value, model.strip(), reasoning_effort.strip(), utc_now(), project_id),
             )
 
     def stage_rows(self, project_id: str) -> dict[str, dict[str, Any]]:

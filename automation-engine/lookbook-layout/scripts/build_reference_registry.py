@@ -1,7 +1,7 @@
 """Build the complete PDF-authoritative photo registry before controller init.
 
 The source PDF defines the order and the left/right position of every look.  This
-tool reads the two embedded photographs from each look page, matches them against
+tool renders the two visible photographs from each look page, matches them against
 the supplied hires by image content, writes the full registry, and leaves a visual
 proof pack in ``control/work``.  It deliberately never reads an Excel workbook.
 """
@@ -12,6 +12,7 @@ import argparse
 import csv
 import datetime as dt
 import gc
+import hashlib
 import io
 import json
 import math
@@ -23,6 +24,7 @@ from PIL import Image, ImageDraw, ImageOps
 from pypdf import PdfReader
 
 from pdf_page_geometry import draw_fully_covered_by_later, draw_intersects_page
+from project_materials import project_hires, is_project_hires
 
 
 FIELDS = [
@@ -60,6 +62,8 @@ def path_from(project: Path, value: str) -> Path:
 
 
 def require_in_work(project: Path, path: Path, label: str) -> None:
+    if label == "Hires folder" and is_project_hires(project, path):
+        return
     work = (project / "control" / "work").resolve()
     try:
         path.resolve().relative_to(work)
@@ -370,6 +374,48 @@ def _is_placeholder(path: Path) -> bool:
     return path.name.casefold().startswith(PLACEHOLDER_PREFIX)
 
 
+def _distinct_hires(
+    files: list[Path], preferred_names: set[str] | None = None,
+) -> tuple[list[Path], list[dict[str, object]]]:
+    """Collapse exact byte copies BEFORE assignment and confidence margins.
+
+    Filenames only choose a stable representative of an already proven byte
+    group; they never establish image identity. In particular, a retouched
+    ``copy`` with different bytes remains an independent candidate. No file
+    is removed, renamed, rewritten, or changed into a placeholder here.
+    Keep an existing registry's member when re-verifying a completed project.
+    """
+    preferred = {name.casefold() for name in (preferred_names or set())}
+    sizes: dict[int, list[Path]] = {}
+    for file in files:
+        sizes.setdefault(file.stat().st_size, []).append(file)
+    representatives: list[Path] = []
+    duplicates: list[dict[str, object]] = []
+    for size, same_size in sizes.items():
+        if len(same_size) == 1:
+            representatives.extend(same_size)
+            continue
+        groups: dict[str, list[Path]] = {}
+        for file in same_size:
+            with file.open("rb") as source:
+                digest = hashlib.file_digest(source, "sha256").hexdigest()
+            groups.setdefault(digest, []).append(file)
+        for digest, members in groups.items():
+            def preference(file: Path) -> tuple[bool, bool, str, str]:
+                copy_suffix = bool(re.search(r"(?:[ _-]copy(?:\s*\(\d+\)|\s+\d+)?|[ _-]копия(?:\s*\(\d+\)|\s+\d+)?)$", file.stem, re.IGNORECASE))
+                return file.name.casefold() not in preferred, copy_suffix, file.name.casefold(), file.name
+            selected = min(members, key=preference)
+            representatives.append(selected)
+            if len(members) > 1:
+                duplicates.append({
+                    "selected": selected.name, "sha256": digest, "bytes": size,
+                    "copies": sorted(file.name for file in members if file != selected),
+                })
+    representatives.sort(key=lambda file: (file.name.casefold(), file.name))
+    duplicates.sort(key=lambda group: str(group["selected"]).casefold())
+    return representatives, duplicates
+
+
 def _write_blank_placeholder(path: Path) -> Image.Image:
     """Create a neutral image that can be placed in a fixed InDesign frame.
 
@@ -568,6 +614,20 @@ def build(
     )
     if not files:
         fail("The hires folder does not contain JPG files.")
+    all_files = files
+    prior_rows: list[dict[str, str]] | None = None
+    if registry.exists() and not registry_is_blank_bootstrap(registry):
+        prior_rows = existing_registry(registry)
+    preferred_names = {
+        row[field] for row in (prior_rows or []) for field in ("left_filename", "right_filename")
+    }
+    files, duplicate_groups = _distinct_hires(all_files, preferred_names)
+    if duplicate_groups:
+        print(
+            f"HIRES DEDUPLICATED: {len(all_files)} files, {len(files)} distinct photographs, "
+            f"{len(all_files) - len(files)} exact copies excluded from candidate competition; "
+            "all source files preserved."
+        )
     reader = PdfReader(str(reference))
     if cover_pages is None:
         cover_pages = detect_cover_pages(reader)
@@ -576,8 +636,21 @@ def build(
 
     pdf_features: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
     page_images: list[tuple[Image.Image, Image.Image]] = []
+    # Embedded JPEG decoding can miss PDF Decode arrays, CMYK profiles and
+    # clipping, producing false colours or a doubled photo. Match the pixels
+    # actually displayed by a PDF viewer instead of those raw XObjects.
+    from lookbook_gate import render_pdf_pages
+    from reference_photo_render import rendered_photo_pair
+    rendered_pages = render_pdf_pages(
+        reference, project / "control" / "work" / "reference-rendered-photos",
+        list(range(cover_pages + 1, len(reader.pages) + 1)), 120, crop_box=True,
+    )
     for page_number in range(cover_pages, len(reader.pages)):
-        pair = visible_pdf_pair(reader.pages[page_number], page_number + 1)
+        page = reader.pages[page_number]
+        draws = visible_pdf_draws(page)
+        if len(draws) != 2:
+            fail(f"PDF page {page_number + 1} must visibly place exactly two look photographs; found {len(draws)}.")
+        pair = rendered_photo_pair(page, rendered_pages[page_number + 1], [matrix for matrix, _image in draws])
         # Keep only a proof-sized image. Retaining 100 decoded 25-MB source JPEGs
         # consumes several gigabytes and can abort preparation before a registry exists.
         page_images.append((fit_preview(pair[0], (360, 540)), fit_preview(pair[1], (360, 540))))
@@ -587,10 +660,6 @@ def build(
             gc.collect()
     if len(files) < len(pdf_features) and not allow_missing:
         fail(f"Reference requires {len(pdf_features)} photographs, but only {len(files)} hires are available.")
-    prior_rows: list[dict[str, str]] | None = None
-    if registry.exists() and not registry_is_blank_bootstrap(registry):
-        prior_rows = existing_registry(registry)
-
     # Decode each hire exactly once.  The old implementation decoded every
     # 25-MB source again while drawing the proof cards.  On a 100-photo job
     # that could exceed the Codex command limit even after the registry had
@@ -717,9 +786,12 @@ def build(
         "reference_pages": len(reader.pages),
         "cover_pages": cover_pages,
         "looks": len(rows),
-        "hires_available": len(files),
+        "hires_available": len(all_files),
+        "hires_unique": len(files),
+        "hires_duplicate_files": len(all_files) - len(files),
+        "duplicate_groups": duplicate_groups,
         "hires_used": len(used),
-        "unused_hires": [file.name for file in files if file.name not in used],
+        "unused_hires": [file.name for file in all_files if file.name not in used],
         "registry": str(registry),
         "contacts": contacts,
         "problems": problems,
@@ -777,7 +849,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Build a complete PDF-authoritative look-register.tsv from reference and hires.")
     parser.add_argument("project", nargs="?", type=Path)
     parser.add_argument("--reference", default="control/work/_mat/reference.pdf")
-    parser.add_argument("--hires", default="control/work/_mat/hires")
+    parser.add_argument("--hires", default="_MAT/hires")
     parser.add_argument("--registry", default="control/work/look-register.tsv")
     parser.add_argument(
         "--cover-pages", type=lambda value: None if value.strip().lower() == "auto" else int(value),
@@ -804,7 +876,7 @@ def main() -> None:
         parser.error("project is required unless --self-test is used")
     project = args.project.resolve()
     build(
-        project, path_from(project, args.reference), path_from(project, args.hires),
+        project, path_from(project, args.reference), project_hires(project, args.hires),
         path_from(project, args.registry), args.cover_pages, args.dry_run, args.allow_missing, args.photo_only,
     )
 

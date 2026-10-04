@@ -53,6 +53,16 @@ function Write-Json([string]$Path, $Value) {
     [System.IO.File]::WriteAllText($Path, $json + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
 }
 function Normalize-Path([string]$Path) { return [System.IO.Path]::GetFullPath($Path).ToLowerInvariant() }
+function Get-ProjectHiresPath([string]$Root, $State) {
+    $canonical = Join-Path $Root '_MAT\hires'
+    $requested = Join-Path $Root ([string]$State.hires)
+    $legacy = Join-Path $Root 'control\work\_mat\hires'
+    if ((Normalize-Path $requested) -in @((Normalize-Path $canonical), (Normalize-Path $legacy))) {
+        if (Test-Path -LiteralPath $canonical -PathType Container) { return $canonical }
+        return $legacy
+    }
+    return $requested
+}
 function Open-AutomationDocument($Application, [string]$Path) {
     $previousInteraction = $null
     try {
@@ -1044,8 +1054,8 @@ function Invoke-Composition([string]$ProjectPath, [int]$MaximumLooks, [bool]$For
             $left = $byLabel[$leftLabel]; $right = $byLabel[$rightLabel]
             $caption = $byLabel[$captionLabel]
             $leftFilename = [string]$row.left_image_filename; $rightFilename = [string]$row.right_image_filename
-            Set-FrameGraphic $left (Join-Path (Join-Path $projectFull ([string]$state.hires)) $leftFilename) $leftFilename "$id left frame" $true
-            Set-FrameGraphic $right (Join-Path (Join-Path $projectFull ([string]$state.hires)) $rightFilename) $rightFilename "$id right frame"
+            Set-FrameGraphic $left (Join-Path (Get-ProjectHiresPath $projectFull $state) $leftFilename) $leftFilename "$id left frame" $true
+            Set-FrameGraphic $right (Join-Path (Get-ProjectHiresPath $projectFull $state) $rightFilename) $rightFilename "$id right frame"
             $before = @(Get-GraphicBounds $left "$id left graphic before crop adjustment")
             $shift = 0.0
             if (-not [double]::TryParse([string]$row.photo_adjustment_points, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$shift)) { Fail "$id has an invalid planned horizontal shift." }
@@ -1210,8 +1220,8 @@ function Invoke-CompositionDelta([string]$ProjectPath, [int]$MaximumLooks) {
             $id = [string]$row.look_id; $expected = if ($deltaByLook.ContainsKey($id)) { $deltaByLook[$id] } else { $baseByLook[$id] }
             $left = $byLabel["LOOKBOOK_LEFT_IMAGE|$id"]; $right = $byLabel["LOOKBOOK_RIGHT_IMAGE|$id"]
             if ($null -eq $left -or $null -eq $right) { Fail "$id image containers are missing during targeted composition." }
-            $leftSource = Join-Path (Join-Path $projectFull ([string]$state.hires)) ([string]$row.left_image_filename)
-            $rightSource = Join-Path (Join-Path $projectFull ([string]$state.hires)) ([string]$row.right_image_filename)
+            $leftSource = Join-Path (Get-ProjectHiresPath $projectFull $state) ([string]$row.left_image_filename)
+            $rightSource = Join-Path (Get-ProjectHiresPath $projectFull $state) ([string]$row.right_image_filename)
             if (-not (Test-FrameImage $left ([string]$row.left_image_filename) $leftSource) -or -not (Test-FrameImage $right ([string]$row.right_image_filename) $rightSource)) { Fail "$id has a changed or missing image link before targeted composition." }
             $current = @(Get-GraphicBounds $left "$id left graphic before targeted composition")
             if (-not (Test-GeometryBounds -Actual $current -Expected @($expected.after_left_graphic_bounds))) { Fail "$id left graphic differs from its last verified composition state." }
@@ -1221,8 +1231,8 @@ function Invoke-CompositionDelta([string]$ProjectPath, [int]$MaximumLooks) {
             $id = [string]$row.look_id; $left = $byLabel["LOOKBOOK_LEFT_IMAGE|$id"]; $right = $byLabel["LOOKBOOK_RIGHT_IMAGE|$id"]; $caption = $byLabel["LOOKBOOK_CREDITS|$id"]
             if ($null -eq $left -or $null -eq $right -or $null -eq $caption) { Fail "$id image or credits containers are missing." }
             $leftFilename = [string]$row.left_image_filename; $rightFilename = [string]$row.right_image_filename
-            Set-FrameGraphic $left (Join-Path (Join-Path $projectFull ([string]$state.hires)) $leftFilename) $leftFilename "$id left frame" $true
-            Set-FrameGraphic $right (Join-Path (Join-Path $projectFull ([string]$state.hires)) $rightFilename) $rightFilename "$id right frame"
+            Set-FrameGraphic $left (Join-Path (Get-ProjectHiresPath $projectFull $state) $leftFilename) $leftFilename "$id left frame" $true
+            Set-FrameGraphic $right (Join-Path (Get-ProjectHiresPath $projectFull $state) $rightFilename) $rightFilename "$id right frame"
             $before = @(Get-GraphicBounds $left "$id left graphic before crop adjustment")
             $shift = [double]$row.photo_adjustment_points
             if ([math]::Abs($shift) -gt 0.0001) { $left.AllGraphics.Item(1).Move([System.Type]::Missing, @($shift, 0)) }
@@ -1304,7 +1314,7 @@ function Invoke-LookCalibration([string]$ProjectPath, [string]$TargetLookId) {
         $leftLabel = "LOOKBOOK_LEFT_IMAGE|$TargetLookId"; $rightLabel = "LOOKBOOK_RIGHT_IMAGE|$TargetLookId"
         if (-not $byLabel.ContainsKey($leftLabel) -or -not $byLabel.ContainsKey($rightLabel) -or -not $byLabel.ContainsKey($captionLabel)) { Fail "$TargetLookId is missing an existing image or credits container." }
         $left = $byLabel[$leftLabel]; $right = $byLabel[$rightLabel]; $caption = $byLabel[$captionLabel]
-        $hires = Join-Path $projectFull ([string]$state.hires)
+        $hires = Get-ProjectHiresPath $projectFull $state
         $leftFilename = [string]$planRow[0].left_image_filename; $rightFilename = [string]$planRow[0].right_image_filename
         Set-FrameGraphic $left (Join-Path $hires $leftFilename) $leftFilename "$TargetLookId left frame" $true
         Set-FrameGraphic $right (Join-Path $hires $rightFilename) $rightFilename "$TargetLookId right frame"
@@ -1354,7 +1364,7 @@ function Invoke-CaptionRepair([string]$ProjectPath, [int]$MaximumLooks) {
     $masterPath = Join-Path $projectFull ([string]$state.master)
     $registry = @(Read-Tsv (Join-Path $projectFull ([string]$state.registry)) @('look_id','spread_order','pdf_spread','left_filename','right_filename','indd_left_page','indd_right_page'))
     $captions = @(Read-Tsv (Join-Path $projectFull ([string]$state.captions)) @('look_id','type','brand','price','article'))
-    $hires = Join-Path $projectFull ([string]$state.hires)
+    $hires = Get-ProjectHiresPath $projectFull $state
     $app = New-Object -ComObject InDesign.Application
     Close-SavedAutomationMaster $app $masterPath 'Caption repair'
     $doc = $null
@@ -1398,7 +1408,7 @@ function Export-CaptionClearanceLayout([string]$ProjectPath) {
     $masterPath = Join-Path $projectFull ([string]$state.master)
     $registryPath = Join-Path $projectFull ([string]$state.registry)
     $captionsPath = Join-Path $projectFull ([string]$state.captions)
-    $hiresPath = Join-Path $projectFull ([string]$state.hires)
+    $hiresPath = Get-ProjectHiresPath $projectFull $state
     $captionGeometryPath = Join-Path $control 'evidence\caption-geometry.json'
     if (-not (Test-Path -LiteralPath $captionGeometryPath -PathType Leaf)) { $captionGeometryPath = '' }
     $visualCaptionCorrectionPath = Join-Path $control 'visual\clearance-correction-plan.json'
@@ -1572,7 +1582,7 @@ function Audit-CaptionRevisionScope([string]$ProjectPath) {
     $masterPath = Join-Path $projectFull ([string]$state.master)
     if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf) -or -not (Test-Path -LiteralPath $masterPath -PathType Leaf)) { Fail 'Source or target INDD is missing for caption revision scope audit.' }
     $registry = @(Read-Tsv (Join-Path $projectFull ([string]$state.registry)) @('look_id','spread_order','pdf_spread','left_filename','right_filename','indd_left_page','indd_right_page'))
-    $hires = Join-Path $projectFull ([string]$state.hires)
+    $hires = Get-ProjectHiresPath $projectFull $state
     $app = New-Object -ComObject InDesign.Application
     Close-SavedAutomationMaster $app $sourcePath 'Caption revision scope source'
     Close-SavedAutomationMaster $app $masterPath 'Caption revision scope target'
@@ -1655,9 +1665,9 @@ function Invoke-Gate([string]$ProjectPath, [string]$GateName) {
         if ($GateName -eq 'frames') { Assert-Baseline $doc (Join-Path $control 'evidence\structure.json'); Apply-Frames $doc $registry; Assert-Structure $doc $state $registry; Assert-Frames $doc $registry }
         if ($GateName -eq 'images') {
             Assert-Baseline $doc (Join-Path $control 'evidence\structure.json'); Assert-Frames $doc $registry
-            $changedRows = @(Apply-ImagesBatch $doc $registry (Join-Path $projectFull ([string]$state.hires)) $BatchSize)
+            $changedRows = @(Apply-ImagesBatch $doc $registry (Get-ProjectHiresPath $projectFull $state) $BatchSize)
             $doc.Save() | Out-Null; $saved = $true
-            $hires = Join-Path $projectFull ([string]$state.hires)
+            $hires = Get-ProjectHiresPath $projectFull $state
             $progress = Write-ImageProgress $control $state $arm $masterPath $doc $registry $hires
             if ([int]$progress.completed_count -eq [int]$Registry.Count) {
                 Assert-Images $doc $registry $null $hires
@@ -1705,7 +1715,7 @@ function Invoke-Gate([string]$ProjectPath, [string]$GateName) {
             $visualCaptionCorrectionPath = Join-Path $control 'visual\clearance-correction-plan.json'
             $visualCaptionCorrections = Get-VisualCaptionCorrections $visualCaptionCorrectionPath $state
             Assert-Structure $doc $state $registry; Assert-Baseline $doc (Join-Path $control 'evidence\structure.json') $captionGeometryPath $false $visualCaptionCorrectionPath $state; Assert-Dates $doc $state; Assert-Frames $doc $registry
-            Assert-Images $doc $registry $compositionSources (Join-Path $projectFull ([string]$state.hires)); Assert-Captions $doc $registry $captions $visualCaptionCorrections; Assert-VisualCaptionCorrectionsApplied $doc $visualCaptionCorrections; Assert-Visual $control $state $masterPath
+            Assert-Images $doc $registry $compositionSources (Get-ProjectHiresPath $projectFull $state); Assert-Captions $doc $registry $captions $visualCaptionCorrections; Assert-VisualCaptionCorrectionsApplied $doc $visualCaptionCorrections; Assert-Visual $control $state $masterPath
         }
         if ($GateName -ne 'release') { $doc.Save() | Out-Null; $saved = $true } else { $saved = $true }
         if ($GateName -eq 'release') { Write-Evidence $control $state $arm $GateName $masterPath $doc }

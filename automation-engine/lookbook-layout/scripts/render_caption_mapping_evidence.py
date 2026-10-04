@@ -10,6 +10,8 @@ import os
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageOps
+from caption_photo_sources import caption_photo_source
+from project_materials import project_hires
 
 
 MAP_FIELDS = [
@@ -80,17 +82,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Render auditable visual proof for every proposed caption map row.")
     parser.add_argument("project", type=Path)
     parser.add_argument("--map", dest="caption_map", default="control/work/caption-map.tsv")
-    parser.add_argument("--hires", default="control/work/_mat/hires")
+    parser.add_argument("--hires", default="_MAT/hires")
     args = parser.parse_args()
     project = args.project.resolve()
     rows = read_map(child(project, args.caption_map))
-    hires = child(project, args.hires)
+    hires = project_hires(project, args.hires)
     manifest: dict[str, object] = {"schema": 1, "generator": "render_caption_mapping_evidence.py", "items": {}}
     evidence_roots: set[Path] = set()
     for row in rows:
         excel = child(project, row["excel_image"])
-        left = hires / row["left_filename"]
-        right = hires / row["right_filename"]
+        left = caption_photo_source(project, row, hires, "left")
+        right = caption_photo_source(project, row, hires, "right")
         proof = child(project, row["evidence_file"])
         evidence_roots.add(proof.parent)
         for path in (excel, left, right):
@@ -108,9 +110,13 @@ def main() -> None:
         if proof.stat().st_size < 1024:
             raise ValueError(f"{row['look_id']}: generated visual proof is unexpectedly small.")
         manifest["items"][row["look_id"]] = {
-            "left_sha256": digest(left), "right_sha256": digest(right),
+            "left_sha256": digest(hires / row["left_filename"]),
+            "right_sha256": digest(hires / row["right_filename"]),
             "excel_sha256": digest(excel), "evidence_sha256": digest(proof),
         }
+        for side, source in (("left", left), ("right", right)):
+            if source != hires / row[f"{side}_filename"]:
+                manifest["items"][row["look_id"]][f"{side}_reference_sha256"] = digest(source)
     if len(evidence_roots) != 1:
         raise ValueError("All caption-map evidence files must live in one controlled folder.")
     write_json(next(iter(evidence_roots)) / "manifest.json", manifest)

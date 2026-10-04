@@ -18,11 +18,13 @@ import json
 import math
 import os
 from pathlib import Path
+from project_materials import project_hires
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageOps
+from caption_photo_sources import caption_photo_source
 
-from credit_note_rules import visible_identity_cue_categories
+from credit_note_rules import visual_observation_is_specific
 
 
 REGISTRY_FIELDS = [
@@ -313,7 +315,8 @@ def paste_panel(canvas: Image.Image, source: Path, x: int, title: str) -> None:
 
 def render_alternative_proof(project: Path, row: dict[str, str], card: dict[str, str], hires: Path, proof: Path) -> None:
     excel = child(project, card["excel_image"])
-    left, right = hires / row["left_filename"], hires / row["right_filename"]
+    left = caption_photo_source(project, row, hires, "left")
+    right = caption_photo_source(project, row, hires, "right")
     for source in (excel, left, right):
         if not source.is_file():
             fail(f"{row['look_id']}: missing alternative-proof source {source}")
@@ -505,8 +508,7 @@ def parse_observations(value: str, requested: list[str]) -> dict[str, str]:
     if set(observations) != set(requested):
         fail("--notes must provide one visual observation for every requested LOOK_### and no others.")
     for look_id, note in observations.items():
-        cue_categories = visible_identity_cue_categories(note)
-        if len(note) < 28 or len(cue_categories) < 2:
+        if not visual_observation_is_specific(note):
             fail(
                 f"{look_id}: visual observation is not specific enough. Describe at least two visible identity cues "
                 "(model, garment, colour, bag, shoes, accessories). Use explicit labels such as "
@@ -554,11 +556,11 @@ def main() -> None:
     )
     parser.add_argument("--registry", default="control/work/look-register.tsv")
     parser.add_argument("--index", default="control/work/_mat/excel-images/index.tsv")
-    parser.add_argument("--hires", default="control/work/_mat/hires")
+    parser.add_argument("--hires", default="_MAT/hires")
     parser.add_argument(
         "--missing-reference-dir",
-        default="",
-        help="Quick-build only: use extracted PDF-reference photos for registry placeholders while mapping Excel credits.",
+        default="control/work/missing-photo-reference",
+        help="Use extracted PDF-reference photos for quick-build registry placeholders while mapping Excel credits.",
     )
     parser.add_argument("--map", dest="caption_map", default="control/work/caption-map.tsv")
     parser.add_argument("--candidates", default="control/work/caption-map-candidates.tsv")
@@ -581,7 +583,7 @@ def main() -> None:
             fail(f"Registry row {index} is incomplete.")
     missing_reference_dir = child(project, args.missing_reference_dir) if args.missing_reference_dir else None
     assignment, diagnostics, issues = resolve(
-        project, registry, cards, child(project, args.hires), missing_reference_dir,
+        project, registry, cards, project_hires(project, args.hires), missing_reference_dir,
     )
     candidate_rows = [{key: str(value) for key, value in record.items()} for record in diagnostics]
     write_rows(child(project, args.candidates), list(candidate_rows[0]) if candidate_rows else [], candidate_rows)
@@ -598,16 +600,13 @@ def main() -> None:
             "left_filename": source["left_filename"],
             "right_filename": source["right_filename"],
             "evidence_file": f"control/work/mapping-evidence/{source['look_id']}.jpg",
-            # ``quick-seed`` is retained as a low-level compatibility command
-            # for callers that explicitly want the old non-review behaviour.
-            # The application uses ``quick-autonomous``: it keeps every
-            # proposal PENDING until the selected vision provider has checked
-            # the exact proof card and, when needed, chosen a replacement.
-            "visual_status": "CONFIRMED" if args.mode in {"quick-seed", "quick-fallback"} else "PENDING",
+            # Similarity proposes a card; it never visually confirms one,
+            # including compatibility quick-seed/fallback commands.
+            "visual_status": "PENDING",
         })
     map_path = child(project, args.caption_map)
     review = {str(record["look_id"]): record for record in diagnostics if needs_visual_review(record)}
-    batch_limit = 50 if args.controller_batch else 5
+    batch_limit = max(1, len(registry)) if args.controller_batch else 5
     if args.mode == "propose":
         write_rows(map_path, MAP_FIELDS, proposed)
         print(f"PASS caption-map proposal: {len(proposed)} unique Excel cards resolved from image identity. Render proof cards before confirmation.")
@@ -654,11 +653,15 @@ def main() -> None:
                 for row in existing
                 for key in ("excel_sheet", "excel_look_number", "excel_image")
             )
-            if args.mode != "quick-fallback" and (len(existing) != len(proposed) or (
-                has_prior_decisions
-                and any(not same_identity(actual, expected) for actual, expected in zip(existing, proposed))
-            )):
-                fail("Quick caption map would replace an existing different map; start a new quick build instead.")
+            if args.mode == "quick-fallback" and has_prior_decisions:
+                fail("A fallback proposal cannot overwrite prior credit decisions. Resume their visual review instead.")
+            if args.mode != "quick-fallback" and has_prior_decisions:
+                # Resume is not a new proposal. Retain confirmed rows, notes,
+                # pending decisions and registered alternative selections.
+                assert_allowed_map(project, existing, proposed)
+                confirmed = sum(row["visual_status"] == "CONFIRMED" for row in existing)
+                print(f"QUICK CAPTION MAP RESUMED: {confirmed} confirmations retained; {len(existing) - confirmed} rows pending.")
+                return
         write_rows(map_path, MAP_FIELDS, proposed)
         if issues and args.mode == "quick-seed":
             print(
@@ -674,12 +677,12 @@ def main() -> None:
         elif args.mode == "quick-fallback":
             print(
                 f"QUICK FALLBACK CAPTION MAP READY: {len(proposed)} deterministic one-to-one assignments "
-                "restored after a temporary automatic vision-provider failure."
+                "queued as PENDING; a vision-provider failure cannot confirm an assignment."
             )
         else:
             print(
-                f"QUICK CAPTION MAP READY: {len(proposed)} one-to-one Excel credit assignments confirmed from "
-                "PDF/reference image identity. The low-level quick-seed command skips visual credit-proof inspection."
+                f"QUICK CAPTION MAP READY: {len(proposed)} one-to-one Excel credit proposals are PENDING "
+                "until the exact cards have been visually inspected."
             )
     elif args.mode == "reset-visual-review":
         # A stale test or a rejected visual observation must never retain a
@@ -734,7 +737,7 @@ def main() -> None:
                     continue
                 filename = f"{card['excel_sheet']}_{int(card['excel_look_number']):03}.jpg"
                 proof = root / look_id / filename
-                render_alternative_proof(project, row, card, child(project, args.hires), proof)
+                render_alternative_proof(project, row, card, project_hires(project, args.hires), proof)
                 alternatives.append({
                     "look_id": look_id,
                     "excel_sheet": card["excel_sheet"],

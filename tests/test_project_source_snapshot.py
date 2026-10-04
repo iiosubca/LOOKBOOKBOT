@@ -4,7 +4,7 @@ from datetime import date
 from pathlib import Path
 
 from lookbookbot.domain import ProviderKind
-from lookbookbot.pipeline import PipelineEngine
+from lookbookbot.pipeline import PipelineEngine, _sync_visible_materials, _validate_source_snapshot
 from lookbookbot.state import StateStore
 
 
@@ -48,7 +48,7 @@ def test_prepare_freezes_project_local_sources_and_never_overwrites_them(tmp_pat
         "reference": (controlled / "reference.pdf").read_bytes(),
         "catalog": (controlled / "caption-source.xlsx").read_bytes(),
         "template": (controlled / "automation-template.indd").read_bytes(),
-        "hires": (controlled / "hires" / "look-001.jpg").read_bytes(),
+        "hires": (project.project_dir / "_MAT/hires/look-001.jpg").read_bytes(),
     }
     assert "локальными копиями" in first
     visible = project.project_dir / "_MAT"
@@ -68,4 +68,29 @@ def test_prepare_freezes_project_local_sources_and_never_overwrites_them(tmp_pat
     assert (controlled / "reference.pdf").read_bytes() == frozen["reference"]
     assert (controlled / "caption-source.xlsx").read_bytes() == frozen["catalog"]
     assert (controlled / "automation-template.indd").read_bytes() == frozen["template"]
-    assert (controlled / "hires" / "look-001.jpg").read_bytes() == frozen["hires"]
+    assert (visible / "hires" / "look-001.jpg").read_bytes() == frozen["hires"]
+    assert not (controlled / "hires" / "look-001.jpg").exists()
+    (visible / "hires" / "look-001.jpg").write_bytes(b"manual-retouch")
+    engine._prepare(project)
+    assert (visible / "hires" / "look-001.jpg").read_bytes() == b"manual-retouch"
+    _validate_source_snapshot(project.project_dir)
+
+
+def test_legacy_migration_preserves_manual_photos_and_runs_only_once(tmp_path):
+    import json
+    old = tmp_path / "control/work/_mat/hires"
+    old.mkdir(parents=True)
+    visible = tmp_path / "_MAT/hires"
+    visible.mkdir(parents=True)
+    (old / "same.jpg").write_bytes(b"old")
+    (old / "missing.jpg").write_bytes(b"migrate")
+    (visible / "same.jpg").write_bytes(b"manual")
+    snapshot = tmp_path / "control/work/source-snapshot.json"
+    payload = {"schema": 1, "files": []}
+    snapshot.write_text(json.dumps(payload))
+    _sync_visible_materials(tmp_path, payload)
+    assert (visible / "same.jpg").read_bytes() == b"manual"
+    assert (visible / "missing.jpg").read_bytes() == b"migrate"
+    (visible / "missing.jpg").unlink()
+    _sync_visible_materials(tmp_path, json.loads(snapshot.read_text()))
+    assert not (visible / "missing.jpg").exists()

@@ -8,6 +8,7 @@ import shutil
 from pathlib import Path
 
 from openpyxl import load_workbook
+from project_materials import project_hires
 from PIL import Image, ImageDraw, ImageOps
 
 
@@ -88,7 +89,7 @@ def main() -> None:
     parser.add_argument("--copy-workbook", default="control/work/_mat/caption-source.xlsx")
     parser.add_argument("--excel-images", default="control/work/_mat/excel-images")
     parser.add_argument("--template", default="control/work/caption-map.tsv")
-    parser.add_argument("--hires", default="control/work/_mat/hires")
+    parser.add_argument("--hires", default="_MAT/hires")
     parser.add_argument("--pair-review", default="control/work/mapping-review/required-pdf-looks")
     parser.add_argument("--evidence-dir", default="control/work/mapping-evidence")
     parser.add_argument("--overwrite", action="store_true")
@@ -146,7 +147,7 @@ def main() -> None:
                 "left_filename": row["left_filename"], "right_filename": row["right_filename"],
                 "evidence_file": f"{evidence_dir}/{row['look_id']}.jpg", "visual_status": "PENDING",
             })
-    hires = project / args.hires
+    hires = project_hires(project, args.hires)
     if not hires.is_dir():
         raise SystemExit(f"Hires folder is missing: {hires}")
     pair_review = project / args.pair_review

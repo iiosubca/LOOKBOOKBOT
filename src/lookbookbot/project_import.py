@@ -23,6 +23,7 @@ def open_existing_project(
     *,
     provider: ProviderKind,
     model: str,
+    reasoning_effort: str = "",
 ) -> ProjectRecord:
     """Import durable controller evidence from an existing delivery folder."""
     project_dir = project_dir.resolve()
@@ -43,6 +44,7 @@ def open_existing_project(
         show_date=show_date,
         provider=provider,
         model=model,
+        reasoning_effort=reasoning_effort,
     )
     registry = control / "work" / "look-register.tsv"
     if registry.is_file():
@@ -77,4 +79,3 @@ def open_existing_project(
 def _read_tsv(path: Path) -> list[dict[str, str]]:
     with path.open(newline="", encoding="utf-8-sig") as source:
         return [{key: (value or "").strip() for key, value in row.items()} for row in csv.DictReader(source, delimiter="\t")]
-

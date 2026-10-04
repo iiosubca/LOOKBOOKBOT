@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from project_materials import project_hires
 
 from PIL import Image, ImageDraw, ImageOps
 
@@ -215,13 +216,15 @@ def main() -> None:
     parser.add_argument("--looks", required=True, help="comma-separated rejected LOOK_### IDs")
     parser.add_argument("--map", dest="caption_map", default="control/work/caption-map.tsv")
     parser.add_argument("--index", default="control/work/_mat/excel-images/index.tsv")
-    parser.add_argument("--hires", default="control/work/_mat/hires")
+    parser.add_argument("--hires", default="_MAT/hires")
     parser.add_argument(
         "--missing-reference-dir",
         default="",
         help="Quick-build fallback directory containing extracted PDF-reference photos.",
     )
     parser.add_argument("--output", default="control/work/rematch-evidence")
+    parser.add_argument("--full-catalogue", action="store_true",
+                        help="Search confirmed cards too; changes still require exact proofs and an atomic swap.")
     parser.add_argument(
         "--exclude-json",
         default="",
@@ -245,7 +248,7 @@ def main() -> None:
     cards_by_pair: dict[tuple[str, str], dict[str, str]] = {}
     for row in index:
         pair = (row["excel_sheet"].upper(), row["excel_look_number"])
-        if pair in confirmed_pairs:
+        if pair in confirmed_pairs and not args.full_catalogue:
             continue
         cards_by_pair.setdefault(pair, row)
     cards = [
@@ -255,7 +258,7 @@ def main() -> None:
     per_look_excluded, reserved = excluded_candidates(root, args.exclude_json)
 
     output = child(root, args.output)
-    hires = child(root, args.hires)
+    hires = project_hires(root, args.hires)
     missing_reference_dir = child(root, args.missing_reference_dir) if args.missing_reference_dir else None
     if missing_reference_dir is not None and not missing_reference_dir.is_dir():
         fail(f"Missing reference-photo directory: {missing_reference_dir}")
@@ -268,15 +271,16 @@ def main() -> None:
             card for card in cards
             if (card["excel_sheet"].upper(), card["excel_look_number"]) not in excluded
         ]
-        if not candidates:
+        if not candidates and not args.full_catalogue:
             fail(f"{look_id}: no untried, unreserved Excel candidate remains.")
         folder = output / look_id
         pair_target = folder / "pdf-pair.jpg"
         render_pair(root, row, hires, pair_target, missing_reference_dir)
         pages: list[dict[str, object]] = []
-        for page, offset in enumerate(range(0, len(candidates), 16), start=1):
+        page_size = 8 if args.full_catalogue else 16
+        for page, offset in enumerate(range(0, len(candidates), page_size), start=1):
             target = folder / f"candidates-{page:02}.jpg"
-            batch = candidates[offset : offset + 16]
+            batch = candidates[offset : offset + page_size]
             render_candidate_sheet(root, batch, target, page)
             pages.append({
                 "path": str(target.relative_to(root)).replace("\\", "/"),
@@ -295,7 +299,7 @@ def main() -> None:
             "candidate_pool": [f"{card['excel_sheet']}:{card['excel_look_number']}" for card in candidates],
             "candidate_pages": pages,
         }
-        if len(pages) > 4:
+        if len(pages) > 4 and not args.full_catalogue:
             fail(
                 f"{look_id}: candidate pool has {len(candidates)} cards and cannot be shown in four readable boards. "
                 "Narrow the controlled catalogue before visual rematching."

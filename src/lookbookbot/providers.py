@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import subprocess
+import tempfile
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,7 +19,15 @@ from typing import Any
 
 from .ai_policy import read_only_vision_prompt
 from .config import codex_binary
+from .codex_vision import CodexVisionClient, CodexVisionError, CodexVisionLimitError
 from .domain import ProviderKind
+
+
+CODEX_STANDARD_MODEL = "gpt-5.6-terra"
+"""Economical default for ordinary LOOKBOOKBOT vision work."""
+
+CODEX_ESCALATION_MODEL = "gpt-5.6-sol"
+"""Used only to recheck a bounded, unresolved visual decision."""
 
 
 def _background_creationflags() -> int:
@@ -30,6 +43,10 @@ def _background_creationflags() -> int:
 
 class ProviderError(RuntimeError):
     pass
+
+
+class ProviderLimitError(ProviderError):
+    """A quota stop, not a formatting problem and never an immediate retry."""
 
 
 @dataclass(frozen=True)
@@ -56,6 +73,9 @@ class ModelProvider(ABC):
     def list_models(self) -> list[str]:
         return []
 
+    def close(self) -> None:
+        """Release a reusable provider connection at the end of a pipeline."""
+
     def inspect_proof(self, prompt: str, images: list[Path]) -> VisionDecision:
         raise ProviderError(f"{self.kind.value} не поддерживает прямую проверку изображений.")
 
@@ -81,9 +101,31 @@ class ModelProvider(ABC):
 class CodexProvider(ModelProvider):
     kind = ProviderKind.CODEX
 
-    def __init__(self, model: str = "", binary: Path | None = None) -> None:
-        super().__init__(model)
+    def __init__(self, model: str = "", binary: Path | None = None, reasoning_effort: str = "") -> None:
+        # A blank model delegates to the desktop app's changing default.  That
+        # previously promoted ordinary lookbook work to a frontier model after
+        # a Codex update.  Keep the production baseline explicit and stable.
+        super().__init__(model.strip() or CODEX_STANDARD_MODEL)
         self.binary = binary or codex_binary()
+        self.reasoning_effort = reasoning_effort.strip()
+        self._vision_client: CodexVisionClient | None = None
+        self._vision_lock = threading.Lock()
+        self._escalation: CodexProvider | None = None
+
+    def escalation_provider(self) -> "CodexProvider":
+        """Return the stronger, isolated reviewer without changing the main run.
+
+        The caller uses this only after Terra has produced an unusable or
+        disputed result.  Reusing the resolved binary keeps the provider
+        session/authentication identical while changing only ``--model``.
+        """
+        if self.model == CODEX_ESCALATION_MODEL:
+            return self
+        # A recovery worker has its own model. Let that model's catalog default
+        # apply instead of forwarding an effort the recovery model may reject.
+        if self._escalation is None:
+            self._escalation = CodexProvider(CODEX_ESCALATION_MODEL, binary=self.binary)
+        return self._escalation
 
     def health(self) -> str:
         if self.binary is None or not self.binary.is_file():
@@ -122,6 +164,7 @@ class CodexProvider(ModelProvider):
             raise ProviderError("Не найдены карточки для визуальной сверки: " + ", ".join(missing))
         return self._run_agent(
             read_only_vision_prompt(prompt), workspace, timeout=timeout, sandbox="read-only", images=attachments,
+            ephemeral=True,
         )
 
     def run_readonly_vision(
@@ -132,7 +175,121 @@ class CodexProvider(ModelProvider):
         images: list[Path],
         timeout: int = 3600,
     ) -> str:
-        return self.run_readonly_agent(prompt, workspace, timeout=timeout, images=images)
+        return self._run_vision(prompt, workspace, images=images, timeout=timeout)
+
+    def close(self) -> None:
+        if self._vision_client is not None:
+            self._vision_client.close()
+            self._vision_client = None
+        if self._escalation is not None:
+            self._escalation.close()
+            self._escalation = None
+
+    def _run_vision(
+        self, prompt: str, workspace: Path, *, images: list[Path], timeout: int,
+        output_schema: dict[str, Any] | None = None,
+    ) -> str:
+        missing = [str(path) for path in images if not path.is_file()]
+        if missing:
+            raise ProviderError("Не найдены изображения для Codex: " + ", ".join(missing))
+        if self.binary is None or not self.binary.is_file():
+            raise ProviderError("Не найден Codex App Server.")
+        with self._vision_lock:
+            if self._vision_client is None:
+                self._vision_client = CodexVisionClient(self.binary)
+        task = read_only_vision_prompt(prompt)
+        start = time.monotonic()
+        audit: dict[str, Any] = {
+            "transport": "codex-app-server", "requested_model": self.model,
+            "requested_effort": self.reasoning_effort, "prompt": task,
+            "images": [{"path": str(path.resolve()), "bytes": path.stat().st_size,
+                        "sha256": hashlib.sha256(path.read_bytes()).hexdigest()} for path in images],
+            "output_schema": output_schema,
+        }
+        try:
+            result = self._vision_client.inspect(
+                task, images, model=self.model.removeprefix("codex/"), effort=self.reasoning_effort,
+                schema=output_schema, timeout=min(timeout, 600),
+            )
+            audit.update(result)
+            return str(result["text"])
+        except CodexVisionLimitError as error:
+            audit.update(status="failed", error=str(error), error_code="usageLimitExceeded")
+            raise ProviderLimitError(
+                "Достигнут лимит Codex. Завершённые проверки сохранены; после обновления лимита "
+                "нажмите «Продолжить с места остановки». " + str(error)
+            ) from error
+        except (CodexVisionError, OSError) as error:
+            audit.update(status="failed", error=str(error))
+            raise ProviderError(str(error)) from error
+        finally:
+            audit["elapsed_seconds"] = round(time.monotonic() - start, 3)
+            # Record the exact pixels, final answer and transport outcome. No
+            # authentication config or tokens are copied into project logs.
+            try:
+                folder = workspace / "control" / "work" / "ai-exchanges"
+                folder.mkdir(parents=True, exist_ok=True)
+                (folder / f"{time.time_ns()}-{uuid.uuid4().hex[:8]}.json").write_text(
+                    json.dumps(audit, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+                )
+            except OSError:
+                pass
+
+    def run_readonly_closed_board_vision(
+        self,
+        prompt: str,
+        workspace: Path,
+        *,
+        images: list[Path],
+        look_id: str,
+        allowed_labels: list[str],
+        allow_no_match: bool = False,
+        timeout: int = 3600,
+    ) -> str:
+        """Choose one exact label from a controlled visual candidate board.
+
+        Codex's final-message file is more stable than parsing its progress
+        stream, and a CLI output schema prevents a free-form agent response
+        from becoming a bogus Excel assignment.
+        """
+        labels = [str(label).strip() for label in allowed_labels if str(label).strip()]
+        if not labels:
+            raise ProviderError(f"{look_id}: закрытый список кандидатов пуст.")
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "look_id": {"type": "string", "enum": [look_id]},
+                "choice": {"type": "string", "enum": labels + (["NONE"] if allow_no_match else [])},
+                "note": {"type": "string", "minLength": 12},
+            },
+            "required": ["look_id", "choice", "note"],
+        }
+        if allow_no_match:
+            schema["properties"]["matched"] = {"type": "boolean"}
+            schema["required"].append("matched")
+        return self._run_vision(prompt, workspace, timeout=timeout, images=images, output_schema=schema)
+
+    def run_readonly_decision_vision(
+        self, prompt: str, workspace: Path, *, images: list[Path], look_ids: list[str],
+        timeout: int = 600,
+    ) -> str:
+        schema = {
+            "type": "object", "additionalProperties": False,
+            "properties": {"decisions": {"type": "array", "items": {
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "look_id": {"type": "string", "enum": look_ids},
+                    "accepted": {"type": "boolean"}, "note": {"type": "string"},
+                    "excel_observation": {"type": "string"},
+                    "reference_observation": {"type": "string"},
+                    "contradictions": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["look_id", "accepted", "note", "excel_observation",
+                             "reference_observation", "contradictions"],
+            }}}, "required": ["decisions"],
+        }
+        return self._run_vision(prompt, workspace, timeout=timeout, images=images, output_schema=schema)
 
     def _run_agent(
         self,
@@ -142,46 +299,69 @@ class CodexProvider(ModelProvider):
         timeout: int,
         sandbox: str,
         images: list[Path] | None = None,
+        output_schema: dict[str, Any] | None = None,
+        ephemeral: bool = False,
     ) -> str:
         self.health()
         assert self.binary is not None
-        command = [
-            str(self.binary), "exec", "--json", "--sandbox", sandbox,
-            "--skip-git-repo-check", "--cd", str(workspace),
-        ]
-        if self.model:
-            command.extend(["--model", self.model.removeprefix("codex/")])
-        if images:
-            # ``--image`` accepts several values.  Use the ``--image=...``
-            # form for every attachment so the final text prompt can never be
-            # consumed as another image filename by the CLI parser.
-            command.extend(f"--image={path}" for path in images)
-        command.append(prompt)
-        try:
-            result = subprocess.run(
-                command, cwd=workspace, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                timeout=timeout, stdin=subprocess.DEVNULL, creationflags=_background_creationflags(),
-            )
-        except subprocess.TimeoutExpired as error:
-            raise ProviderError("Codex превысил лимит времени. Контроллер будет перечитан перед повтором.") from error
-        except OSError as error:
-            raise ProviderError(f"Codex CLI не запустился: {error}") from error
-        final = ""
-        for line in result.stdout.splitlines():
+        with tempfile.TemporaryDirectory(prefix="lookbookbot-codex-") as temporary_dir:
+            temporary_root = Path(temporary_dir)
+            final_message = temporary_root / "last-message.txt"
+            command = [
+                str(self.binary), "exec", "--json", "--sandbox", sandbox,
+                "--skip-git-repo-check", "--cd", str(workspace),
+                "--output-last-message", str(final_message),
+            ]
+            if ephemeral:
+                command.append("--ephemeral")
+            if output_schema is not None:
+                schema_path = temporary_root / "output-schema.json"
+                schema_path.write_text(json.dumps(output_schema, ensure_ascii=False), encoding="utf-8")
+                command.extend(["--output-schema", str(schema_path)])
+            if self.model:
+                command.extend(["--model", self.model.removeprefix("codex/")])
+            if self.reasoning_effort:
+                command.extend(["--config", f"model_reasoning_effort={self.reasoning_effort}"])
+            if images:
+                # ``--image`` accepts several values.  Use the ``--image=...``
+                # form for every attachment so the final text prompt can never be
+                # consumed as another image filename by the CLI parser.
+                command.extend(f"--image={path}" for path in images)
+            command.append(prompt)
             try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            item = event.get("item")
-            if event.get("type") == "item.completed" and isinstance(item, dict):
-                if item.get("type") in {"agent_message", "agentMessage"}:
-                    candidate = item.get("text") or item.get("content")
-                    if isinstance(candidate, str) and candidate.strip():
-                        final = candidate.strip()
-        if result.returncode and not final:
-            detail = (result.stderr or result.stdout or "Codex error").strip()
-            raise ProviderError(detail[-4000:])
-        return final or result.stdout.strip()
+                result = subprocess.run(
+                    command, cwd=workspace, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                    timeout=timeout, stdin=subprocess.DEVNULL, creationflags=_background_creationflags(),
+                )
+            except subprocess.TimeoutExpired as error:
+                raise ProviderError("Codex превысил лимит времени. Контроллер будет перечитан перед повтором.") from error
+            except OSError as error:
+                raise ProviderError(f"Codex CLI не запустился: {error}") from error
+
+            final = ""
+            try:
+                final = final_message.read_text(encoding="utf-8").strip()
+            except OSError:
+                pass
+            if not final:
+                for line in result.stdout.splitlines():
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    item = event.get("item")
+                    if event.get("type") == "item.completed" and isinstance(item, dict):
+                        if item.get("type") in {"agent_message", "agentMessage"}:
+                            candidate = item.get("text") or item.get("content")
+                            if isinstance(candidate, str) and candidate.strip():
+                                final = candidate.strip()
+            if result.returncode:
+                detail = (result.stderr or result.stdout or "Codex error").strip()
+                raise ProviderError(detail[-4000:])
+            if not final:
+                detail = (result.stderr or result.stdout or "Codex did not return a final message").strip()
+                raise ProviderError(detail[-4000:])
+            return final
 
 
 class GoogleAiStudioProvider(ModelProvider):
@@ -607,6 +787,7 @@ def make_provider(
     kind: ProviderKind,
     model: str,
     *,
+    reasoning_effort: str = "",
     ollama_endpoint: str = "http://127.0.0.1:11434",
     llama_endpoint: str = "http://127.0.0.1:8080",
     google_api_key: str = "",
@@ -615,7 +796,7 @@ def make_provider(
     usage_store: Any | None = None,
 ) -> ModelProvider:
     if kind == ProviderKind.CODEX:
-        return CodexProvider(model)
+        return CodexProvider(model, reasoning_effort=reasoning_effort)
     if kind == ProviderKind.OLLAMA:
         return OllamaProvider(model, ollama_endpoint)
     if kind == ProviderKind.GOOGLE:

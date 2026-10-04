@@ -32,6 +32,14 @@ a.binaries = [
     if Path(str(entry[0])).name.casefold() not in _CONFLICTING_NATIVE_DLLS
 ]
 
+# Engine scripts run in the external Python runtime. Ship their source, not
+# cached bytecode from whichever interpreter last ran a development test.
+a.datas = [
+    entry for entry in a.datas
+    if "__pycache__" not in Path(str(entry[0])).parts
+    and not str(entry[0]).lower().endswith((".pyc", ".pyo"))
+]
+
 pyz = PYZ(a.pure)
 
 exe = EXE(

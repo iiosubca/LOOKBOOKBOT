@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+
 sys.path.insert(0, str(Path(__file__).parents[1] / "automation-engine" / "lookbook-layout" / "scripts"))
 
 from pdf_page_geometry import draw_fully_covered_by_later, draw_intersects_page
@@ -54,3 +55,18 @@ def test_negligible_visible_strip_is_treated_as_full_occlusion() -> None:
     old = (100.0, 0.0, 0.0, 100.0, 100.0, 0.0)
     replacement = (100.0, 0.0, 0.0, 100.0, 100.0, 1.5)
     assert draw_fully_covered_by_later(_Page(), old, [replacement])
+
+
+def test_nearly_covered_stale_image_is_not_a_third_visible_photo() -> None:
+    """Keep the real September reference export from producing a false third draw."""
+    stale_left = (518.3783, 0.0, 0.0, 777.2638, -4.411567, -6.387114)
+    final_left = (512.4, 0.0, 0.0, 768.0, -22.61792, 0.0)
+
+    assert draw_fully_covered_by_later(_Page(), stale_left, [final_left])
+
+
+def test_meaningful_visible_strip_remains_a_registry_candidate() -> None:
+    stale_left = (518.3783, 0.0, 0.0, 777.2638, -4.411567, -6.387114)
+    partial_replacement = (470.0, 0.0, 0.0, 768.0, 0.0, 0.0)
+
+    assert not draw_fully_covered_by_later(_Page(), stale_left, [partial_replacement])

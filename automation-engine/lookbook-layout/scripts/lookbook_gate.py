@@ -28,6 +28,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from project_materials import project_hires, is_project_hires
 
 
 SCHEMA = 1
@@ -142,6 +143,8 @@ def work_path(project: Path) -> Path:
 
 def require_work_path(project: Path, path: Path, label: str) -> None:
     """Keep controlled inputs out of the delivery folder root."""
+    if label == "Hires folder" and is_project_hires(project, path):
+        return
     try:
         path.resolve().relative_to(work_path(project).resolve())
     except ValueError:
@@ -215,6 +218,8 @@ def child_of(project: Path, raw: str | Path) -> Path:
 
 
 def state_artifact(project: Path, state: dict[str, Any], key: str) -> Path:
+    if key == "hires":
+        return project_hires(project, state[key])
     return child_of(project, state[key])
 
 
@@ -878,6 +883,14 @@ def validate_caption_map(project: Path, path: Path, registry: list[dict[str, str
             "excel_sha256": digest(image),
             "evidence_sha256": digest(proof),
         }
+        from caption_photo_sources import caption_photo_source
+        for side in ("left", "right"):
+            try:
+                visible_source = caption_photo_source(project, row, hires, side)
+            except ValueError as error:
+                fail(str(error))
+            if visible_source != hires / row[f"{side}_filename"]:
+                expected_hashes[f"{side}_reference_sha256"] = digest(visible_source)
         if any(item.get(key) != value for key, value in expected_hashes.items()):
             fail(f"{expected_id}: visual evidence does not match the mapped Excel image and frozen photo pair.")
     return rows
@@ -2219,7 +2232,7 @@ def command_init(args: argparse.Namespace) -> None:
     if master.suffix.lower() != ".indd" or master.parent != project:
         fail("Master must be a saved .indd file directly in the project root; this anchors InDesign audits.")
     registry = child_of(project, args.registry)
-    hires = child_of(project, args.hires)
+    hires = project_hires(project, args.hires)
     reference = child_of(project, args.reference)
     required_artifacts = [("Registry", registry), ("Hires folder", hires), ("PDF reference", reference)]
     caption_paths: dict[str, Path] = {}
@@ -2532,6 +2545,75 @@ def command_validate_map(args: argparse.Namespace) -> None:
     }
     write_json(evidence_file(project, "map"), evidence)
     print(f"PASS map: {len(rows)} PDF-reference-bound photo pairs and {caption_rows} caption rows are frozen from visually confirmed Excel matches.")
+
+
+def command_invalidate_caption_map(args: argparse.Namespace) -> None:
+    """Retire only proof made against an older verified credit map.
+
+    Credit re-matching changes a controlled source file, not the page
+    structure or image links. The old implementation left the former
+    ``passed: true`` files in place, so the desktop app skipped the native
+    captions transaction even when caption-data.tsv had changed.
+    """
+    project = project_path(args.project)
+    state = load_state(project)
+    if state.get("build_mode") == PHOTO_ONLY_BUILD_MODE:
+        print("CAPTION MAP CURRENT: photo-only build has no credit map.")
+        return
+    raw_path = evidence_file(project, "map")
+    if not raw_path.exists():
+        print("CAPTION MAP CURRENT: no earlier map evidence exists.")
+        return
+    raw = read_json(raw_path)
+    if raw.get("schema") != SCHEMA or raw.get("session_id") != state["session_id"] or raw.get("gate") != "map":
+        fail("Map evidence belongs to another controller session; start a new controlled build session.")
+
+    tracked = {
+        "caption_map_sha256": state_artifact(project, state, "caption_map"),
+        "caption_data_sha256": state_artifact(project, state, "captions"),
+        "caption_provenance_sha256": state_artifact(project, state, "caption_provenance"),
+    }
+    try:
+        changed = [key for key, artifact in tracked.items() if raw.get(key) != digest(artifact)]
+    except OSError as error:
+        fail(f"Cannot compare the verified credit inputs before recovery: {error}")
+    if not changed:
+        print("CAPTION MAP CURRENT: verified credit inputs still match the accepted map.")
+        return
+
+    # A changed caption-data.tsv means the page text must be written again and
+    # every later proof belonged to the old text. A map/provenance-only change
+    # still requires new map acceptance, but does not justify needless native
+    # rewriting or a new visual/PDF check when the page text is identical.
+    caption_text_changed = "caption_data_sha256" in changed
+    history = control_path(project) / "history" / (
+        "caption-map-change-" + utc_now().replace(":", "-") + "-" + uuid.uuid4().hex[:8]
+    )
+    relative_paths = ["evidence/map.json"]
+    if caption_text_changed:
+        relative_paths.extend((
+            "evidence/captions.json", "evidence/caption-geometry.json",
+            "evidence/visual.json", "evidence/release.json", "evidence/pdf.json",
+            "arms/captions.json", "arms/visual.json", "arms/release.json", "arms/pdf.json",
+            "progress/captions.json", "progress/caption-repair.json", "progress/composition.json",
+            "visual", "export-permit.json", "final-deliverables.json",
+        ))
+    moved: list[str] = []
+    for relative in relative_paths:
+        source = control_path(project) / relative
+        if not source.exists():
+            continue
+        destination = history / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(source), str(destination))
+        moved.append(relative)
+    (control_path(project) / "visual").mkdir(parents=True, exist_ok=True)
+    scope = "map and dependent captions/proof" if caption_text_changed else "map proof only"
+    print(
+        "CAPTION MAP INVALIDATED: " + scope + " archived after changed "
+        + ", ".join(changed) + ". Retained: structure, dates, frames, and images."
+    )
+    print(f"CAPTION MAP HISTORY: {history} ({len(moved)} item(s))")
 
 
 def command_arm(args: argparse.Namespace) -> None:
@@ -4390,7 +4472,7 @@ def parse_utc(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-def render_pdf_pages(pdf: Path, destination: Path, pages: list[int], resolution: int = 150) -> dict[int, Path]:
+def render_pdf_pages(pdf: Path, destination: Path, pages: list[int], resolution: int = 150, *, crop_box: bool = False) -> dict[int, Path]:
     """Rasterise named PDF pages through the bundled Poppler binary.
 
     The controlled runtime intentionally contains no PyMuPDF/fitz.  Poppler is
@@ -4422,6 +4504,8 @@ def render_pdf_pages(pdf: Path, destination: Path, pages: list[int], resolution:
     for start, end in batches:
         prefix = destination / f"batch-{start:03}-{end:03}"
         command = [renderer, "-f", str(start), "-l", str(end), "-r", str(resolution), "-png"]
+        if crop_box:
+            command.append("-cropbox")
         if start == end:
             command.append("-singlefile")
         completed = subprocess.run(
@@ -6328,6 +6412,9 @@ def parser() -> argparse.ArgumentParser:
     valid = commands.add_parser("validate-map", help="accept only photo pairs with visually confirmed Excel credit mapping")
     valid.add_argument("project")
     valid.set_defaults(func=command_validate_map)
+    invalidate_map = commands.add_parser("invalidate-caption-map", help="archive stale credit-map proof before applying changed credits")
+    invalidate_map.add_argument("project")
+    invalidate_map.set_defaults(func=command_invalidate_caption_map)
     reference_prepare = commands.add_parser("prepare-reference-order", help="render PDF-reference versus registered-pair proof cards before map acceptance")
     reference_prepare.add_argument("project")
     reference_prepare.add_argument("--reference", help="controlled PDF reference inside control/work; required for a legacy session")

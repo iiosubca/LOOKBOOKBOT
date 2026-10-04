@@ -5,13 +5,15 @@ import hashlib
 import json
 import re
 import shutil
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import deque
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from .ai_policy import read_only_vision_prompt
+from .ai_policy import CREDIT_IDENTITY_POLICY, read_only_vision_prompt
 from .config import ToolPaths
+from .credit_notes import visual_observation_is_specific
 from .controller import CommandError, CommandRunner, LookbookController, evidence_passed, final_outputs_passed, read_json
 from .discovery import discover_sources
 from .domain import (
@@ -24,10 +26,20 @@ from .domain import (
     review_pdf_filename,
     visible_date_text,
 )
-from .providers import CodexProvider, ModelProvider, ProviderError, VisionDecision, make_provider
+from .providers import (
+    CODEX_ESCALATION_MODEL,
+    CODEX_STANDARD_MODEL,
+    CodexProvider,
+    ModelProvider,
+    ProviderError,
+    ProviderLimitError,
+    VisionDecision,
+    make_provider,
+)
 from .secrets import get_google_api_key, get_openai_api_key, get_openrouter_api_key
 from .state import StateStore
 from .visual_audit import visual_audit_blocker_message
+from .vision_checkpoints import VisionCheckpoint, atomic_json, set_review_generation
 
 
 class PipelineError(RuntimeError):
@@ -51,7 +63,11 @@ MISSING_REFERENCE_PREFIX = "__lbb_missing_"
 
 
 def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    hasher = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            hasher.update(block)
+    return hasher.hexdigest()
 
 
 def _has_missing_reference(row: dict[str, str]) -> bool:
@@ -78,8 +94,8 @@ def _validate_source_snapshot(root: Path) -> dict:
     """Validate the project's immutable local source snapshot.
 
     Source folders are living input folders.  Once a project is prepared, its
-    PDF, Excel, hires and automation template must be read only from the
-    project-local work area, even if the selected SOURCES folder later changes
+    PDF, Excel and automation template stay frozen. Project photographs live
+    in _MAT/hires and may be updated manually, even if SOURCES later changes
     or disappears.
     """
     manifest = root / SOURCE_SNAPSHOT_RELATIVE
@@ -97,6 +113,10 @@ def _validate_source_snapshot(root: Path) -> dict:
             candidate.relative_to(root.resolve())
         except ValueError as error:
             raise PipelineError("Снимок исходных материалов ссылается за пределы папки проекта.") from error
+        if relative.startswith(("control/work/_mat/hires/", "_MAT/hires/")):
+            # Photo identity belongs to the registry/proof checks, not an
+            # immutable preparation snapshot: users replace retouched photos.
+            continue
         if not relative or not candidate.is_file():
             raise PipelineError(f"В проекте отсутствует зафиксированный исходник: {relative or 'без имени'}.")
         if entry.get("sha256") != _sha256(candidate) or int(entry.get("bytes", -1)) != candidate.stat().st_size:
@@ -122,7 +142,7 @@ def _freeze_source_snapshot(root: Path, bundle) -> dict:
         # own historical inputs rather than silently receiving newer SOURCES.
         if not target.exists():
             shutil.copy2(source, target)
-    hires = controlled / "hires"
+    hires = root / VISIBLE_MATERIALS_DIR / "hires"
     hires.mkdir(parents=True, exist_ok=True)
     for image in sorted((*bundle.hires.glob("*.jpg"), *bundle.hires.glob("*.jpeg")), key=lambda p: p.name.casefold()):
         target = hires / image.name
@@ -154,13 +174,7 @@ def _freeze_source_snapshot(root: Path, bundle) -> dict:
 
 
 def _sync_visible_materials(root: Path, payload: dict | None = None) -> None:
-    """Expose the frozen inputs in the familiar project-root ``_MAT`` folder.
-
-    ``control/work/_mat`` remains the sole operational source of truth.  The
-    root folder is a user-facing mirror for browsing and handoff, refreshed
-    from that frozen snapshot on every prepare/resume.  It therefore cannot
-    reintroduce a changed file from the living SOURCES directory.
-    """
+    """Expose frozen documents; migrate legacy photos once, never overwrite."""
     controlled = root / "control" / "work" / "_mat"
     visible = root / VISIBLE_MATERIALS_DIR
     visible.mkdir(parents=True, exist_ok=True)
@@ -184,10 +198,17 @@ def _sync_visible_materials(root: Path, payload: dict | None = None) -> None:
     visible_hires = visible / "hires"
     visible_hires.mkdir(parents=True, exist_ok=True)
     controlled_hires = controlled / "hires"
-    for source in sorted((*controlled_hires.glob("*.jpg"), *controlled_hires.glob("*.jpeg")), key=lambda p: p.name.casefold()):
-        target = visible_hires / source.name
-        if not target.is_file() or target.stat().st_size != source.stat().st_size or _sha256(target) != _sha256(source):
-            shutil.copy2(source, target)
+    if payload.get("hires_location") != "_MAT/hires":
+        for source in sorted(controlled_hires.iterdir() if controlled_hires.is_dir() else [], key=lambda p: p.name.casefold()):
+            if not source.is_file() or source.suffix.lower() not in {".jpg", ".jpeg"}:
+                continue
+            target = visible_hires / source.name
+            if not target.exists():
+                shutil.copy2(source, target)
+        payload["hires_location"] = "_MAT/hires"
+        snapshot = root / SOURCE_SNAPSHOT_RELATIVE
+        if snapshot.is_file():
+            atomic_json(snapshot, payload)
 
 
 @dataclass(frozen=True)
@@ -223,6 +244,14 @@ class PipelineEngine:
         build_mode: BuildMode | str | None = None,
     ) -> PipelineResult:
         keys = [stage.key for stage in STAGES]
+        # A targeted rematch can complete while the user is inspecting the
+        # result. Before a later Continue, reconcile its newly generated
+        # caption source with controller evidence. Otherwise the database can
+        # still say "passed" even though the stored INDD contains the old
+        # text, making a continuation appear to finish in seconds.
+        if start_key is None and self._reconcile_changed_caption_map(project):
+            self.store.reset_from(project.id, "map")
+            start_key = "map"
         start_key = start_key or self.store.first_incomplete_stage(project.id)
         if start_key not in keys:
             raise PipelineError(f"Неизвестный этап: {start_key}")
@@ -245,6 +274,17 @@ class PipelineEngine:
             )
         self._bind_copied_revision_structure(project, start_key)
         provider = self._provider(project)
+        try:
+            return self._run_stages(project, keys, start_key, mode, provider, continue_after, stop_after)
+        finally:
+            close = getattr(provider, "close", None)
+            if callable(close):
+                close()
+
+    def _run_stages(
+        self, project: ProjectRecord, keys: list[str], start_key: str, mode: BuildMode,
+        provider: ModelProvider, continue_after: bool, stop_after: str | None,
+    ) -> PipelineResult:
         completed: list[str] = []
         for stage in STAGES[keys.index(start_key) :]:
             if mode == BuildMode.PHOTOS and stage.key in PHOTO_ONLY_SKIPPED_STAGES:
@@ -263,7 +303,22 @@ class PipelineEngine:
                 message = self._run_stage(project, stage.key, provider)
             except (PipelineError, CommandError, ProviderError, OSError, ValueError) as error:
                 message = str(error)
-                status = StageStatus.REVIEW if isinstance(error, ReviewRequired) else StageStatus.FAILED
+                status = StageStatus.REVIEW if isinstance(error, (ReviewRequired, ProviderLimitError)) else StageStatus.FAILED
+                if stage.key == "credits_map":
+                    saved_map = project.project_dir / "control/work/caption-map.tsv"
+                    if saved_map.is_file():
+                        try:
+                            saved = _read_tsv(saved_map)
+                            ids = [row.get("look_id", "") for row in saved]
+                            if (not saved or len(set(ids)) != len(ids)
+                                    or any(not re.fullmatch(r"LOOK_\d{3,}", look) for look in ids)):
+                                raise ValueError("Неполная или повреждённая карта кредитов.")
+                            registry = project.project_dir / "control/work/look-register.tsv"
+                            if registry.is_file() and set(ids) != {row["look_id"] for row in _read_tsv(registry)}:
+                                raise ValueError("Карта кредитов не содержит все луки проекта.")
+                            self.store.replace_credits(project.id, saved)
+                        except (OSError, ValueError, KeyError, AttributeError, csv.Error) as sync_error:
+                            self.log(f"Список кредитов в интерфейсе сохранён без изменений: {sync_error}")
                 self.store.set_stage(project.id, stage.key, status, error=message)
                 self.store.finish_run(run_id, status, message)
                 self.progress(stage.key, status, message)
@@ -599,9 +654,20 @@ class PipelineEngine:
             raise PipelineError("Не удалось завершить обязательную проверку кредитов перед PDF: " + result.message)
 
     def _provider(self, project: ProjectRecord) -> ModelProvider:
+        # Only a legacy blank selection uses Terra. Explicit catalog choices
+        # are preserved exactly, including a newly selected Astra.
+        model = project.model
+        if project.provider == ProviderKind.CODEX and not model.strip():
+            model = CODEX_STANDARD_MODEL
+        if project.provider == ProviderKind.CODEX:
+            self.log(
+                f"Codex App Server: модель {model}, размышления {project.reasoning_effort or 'по умолчанию модели'}. "
+                "Каждый лук сверяется отдельно; журнал изображений и ответов — control/work/ai-exchanges."
+            )
         return make_provider(
             project.provider,
-            project.model,
+            model,
+            reasoning_effort=project.reasoning_effort,
             ollama_endpoint=self.store.get_setting("ollama_endpoint", "http://127.0.0.1:11434"),
             llama_endpoint=self.store.get_setting("llama_endpoint", "http://127.0.0.1:8080"),
             google_api_key=get_google_api_key(),
@@ -609,6 +675,18 @@ class PipelineEngine:
             openrouter_api_key=get_openrouter_api_key(),
             usage_store=self.store,
         )
+
+    def _sol_for_problem(self, provider: ModelProvider, reason: str) -> ModelProvider:
+        """Escalate one bounded visual recovery from Terra to Sol.
+
+        A deliberate choice of a different model stays in force throughout
+        the run. The established Terra route still uses 5.6 Sol for disputed
+        proof cards.
+        """
+        if not isinstance(provider, CodexProvider) or provider.model != CODEX_STANDARD_MODEL:
+            return provider
+        self.log(f"{reason}: повторяю только этот фрагмент на Codex Sol.")
+        return provider.escalation_provider()
 
     def _run_stage(self, project: ProjectRecord, key: str, provider: ModelProvider) -> str:
         handlers = {
@@ -644,7 +722,7 @@ class PipelineEngine:
                 shutil.copy2(template, master)
             return (
                 f"Проект подготовлен: {root.name}. Используется сохранённый снимок PDF, Excel, hires и шаблона "
-                "из control/work/_mat; видимая копия также доступна в _MAT; текущая папка SOURCES не читается."
+                "из control/work/_mat; фотографии используются из _MAT/hires; текущая папка SOURCES не читается."
             )
         report = discover_sources(project.source_dir, self.tools)
         if report.bundle is None:
@@ -654,7 +732,7 @@ class PipelineEngine:
         if not master.exists():
             shutil.copy2(root / "control" / "work" / "_mat" / "automation-template.indd", master)
         return (
-            f"Проект подготовлен: {root.name}. PDF, Excel, hires и шаблон скопированы в control/work/_mat и видимую _MAT; "
+            f"Проект подготовлен: {root.name}. PDF, Excel и шаблон сохранены в проекте, фотографии — в _MAT/hires; "
             "InDesign будет работать только с локальными копиями проекта."
         )
 
@@ -712,7 +790,14 @@ class PipelineEngine:
         else:
             self.controller.script("auto_caption_map.py", root, "--mode", "seed", timeout=1800)
         manual_assignments = self._apply_credit_overrides(project)
-        self.controller.script("render_caption_mapping_evidence.py", root, "--map", "control/work/caption-map.tsv", "--hires", "control/work/_mat/hires", timeout=1800)
+        self.controller.script("render_caption_mapping_evidence.py", root, "--map", "control/work/caption-map.tsv", "--hires", "_MAT/hires", timeout=1800)
+        saved = _read_tsv(caption_map) if caption_map.is_file() else []
+        confirmed_count = sum(row.get("visual_status") == "CONFIRMED" for row in saved)
+        if confirmed_count:
+            self.log(
+                f"Возобновление кредитов: сохранено {confirmed_count}/{len(saved)} подтверждений; "
+                f"осталось {len(saved) - confirmed_count}. Подтверждённые луки не отправляются ИИ повторно."
+            )
 
         if isinstance(provider, CodexProvider):
             try:
@@ -728,14 +813,19 @@ class PipelineEngine:
                         + ", ".join(rejected)
                     )
                     self._targeted_credit_rematch(project, provider, rejected)
+            except ProviderLimitError:
+                raise
             except (ProviderError, ReviewRequired, CommandError, OSError, PipelineError) as error:
                 if project.build_mode != BuildMode.QUICK:
                     raise
                 self.log(
-                    "Автосверка кредитов временно недоступна; применяю резервное "
-                    f"один-к-одному сопоставление и продолжаю сборку: {error}"
+                    "Повторяю только незавершённую сверку кредитов через новое соединение Codex. "
+                    f"Непроверенные догадки не подтверждаются: {error}"
                 )
-                self._quick_caption_map_fallback(root)
+                provider.close()
+                rejected = self._confirm_autonomous_credit_proofs(project, provider)
+                if rejected:
+                    self._targeted_credit_rematch(project, provider, rejected)
         elif project.build_mode == BuildMode.QUICK:
             # All built-in HTTP/local vision providers use the same read-only
             # proof contract.  In quick mode this check is autonomous: a
@@ -751,21 +841,23 @@ class PipelineEngine:
                         + ", ".join(rejected)
                     )
                     self._targeted_credit_rematch(project, provider, rejected)
+            except ProviderLimitError:
+                raise
             except (ProviderError, ReviewRequired, CommandError, OSError) as error:
-                # Quick mode is explicitly a no-interaction draft route.  A
-                # temporary provider failure must not turn into a modal error
-                # or leave half-confirmed map rows.  The deterministic
-                # one-to-one result is regenerated and recorded as fallback.
                 self.log(
-                    "Автосверка кредитов временно недоступна; применяю резервное "
-                    f"один-к-одному сопоставление и продолжаю сборку: {error}"
+                    "Повторяю незавершённую сверку кредитов; "
+                    f"непроверенные догадки не подтверждаются: {error}"
                 )
-                self._quick_caption_map_fallback(root)
+                rejected = self._confirm_local_credit_proofs(project, provider, return_rejected=True)
+                if rejected:
+                    self._targeted_credit_rematch(project, provider, rejected)
         else:
             self._select_local_credit_overrides(project, provider, manual_assignments)
             if manual_assignments:
-                self.controller.script("render_caption_mapping_evidence.py", root, "--map", "control/work/caption-map.tsv", "--hires", "control/work/_mat/hires", timeout=1800)
-            self._confirm_local_credit_proofs(project, provider)
+                self.controller.script("render_caption_mapping_evidence.py", root, "--map", "control/work/caption-map.tsv", "--hires", "_MAT/hires", timeout=1800)
+            rejected = self._confirm_local_credit_proofs(project, provider, return_rejected=True)
+            if rejected:
+                self._targeted_credit_rematch(project, provider, rejected)
 
         # ``caption-map.tsv`` is consumed later as a logical Excel-card map,
         # not as an image list. Repair a rare stale/duplicate assignment here
@@ -793,7 +885,7 @@ class PipelineEngine:
         self.controller.script(
             "render_caption_mapping_evidence.py", root,
             "--map", "control/work/caption-map.tsv",
-            "--hires", "control/work/_mat/hires", timeout=1800,
+            "--hires", "_MAT/hires", timeout=1800,
         )
 
     def _repair_duplicate_caption_map(
@@ -823,7 +915,7 @@ class PipelineEngine:
         self.controller.script("auto_caption_map.py", root, "--mode", "repair", timeout=1800)
         self.controller.script(
             "render_caption_mapping_evidence.py", root,
-            "--map", "control/work/caption-map.tsv", "--hires", "control/work/_mat/hires", timeout=1800,
+            "--map", "control/work/caption-map.tsv", "--hires", "_MAT/hires", timeout=1800,
         )
 
         repaired = _read_tsv(caption_map)
@@ -861,7 +953,7 @@ class PipelineEngine:
         provider: ModelProvider,
         requested_looks: list[str],
     ) -> str:
-        """Re-evaluate only operator-marked credit rows; freeze every other map row."""
+        """Re-evaluate marked rows and proof-identified conflicting owners only."""
         root = project.project_dir
         caption_map = root / "control" / "work" / "caption-map.tsv"
         workbook = root / "control" / "work" / "_mat" / "caption-source.xlsx"
@@ -869,6 +961,13 @@ class PipelineEngine:
             raise PipelineError("Не найдена существующая карта кредитов для точечной перепроверки.")
         requested_targets = sorted(set(requested_looks))
         targets = requested_targets.copy()
+        operator_requests = {
+            str(row["look_id"]): str(row.get("rematch_requested_at") or "")
+            for row in self.store.credits(project.id)
+            if row.get("needs_rematch") and row["look_id"] in targets
+        }
+        for look_id, requested_at in operator_requests.items():
+            set_review_generation(root, look_id, requested_at)
         before = _read_tsv(caption_map)
         before_by_look = {row["look_id"]: row.copy() for row in before}
         unknown = [look_id for look_id in targets if look_id not in before_by_look]
@@ -883,6 +982,8 @@ class PipelineEngine:
         skipped_missing = [
             look_id for look_id in targets
             if _has_missing_reference(before_by_look[look_id])
+            and not all((root / "control/work/missing-photo-reference" / f"{look_id}_{side}.jpg").is_file()
+                        for side in ("LEFT", "RIGHT"))
         ] if project.build_mode == BuildMode.QUICK else []
         if skipped_missing:
             for row in before:
@@ -896,57 +997,39 @@ class PipelineEngine:
                 + " — в проекте нет ретушированных фото, сохранено текущее one-to-one назначение."
             )
 
+        manifest = root / "control" / "work" / "ui-overrides" / "targeted-credit-rematch.json"
+        previous = self._load_rematch_manifest(manifest) if manifest.is_file() else {}
+        resuming = (
+            (set(previous.get("requested_looks", previous.get("target_looks", []))) == set(targets)
+             or (not operator_requests and set(targets) <= set(previous.get("target_looks", []))))
+            and previous.get("operator_requests", {}) == operator_requests
+            and bool(previous.get("prior_assignments"))
+        )
+        if resuming:
+            targets = list(previous.get("target_looks", targets))
+            targets = [look_id for look_id in targets if before_by_look[look_id]["visual_status"] != "CONFIRMED"]
+            self.log("Продолжаю сохранённое пересопоставление только незавершённых луков: " + ", ".join(targets))
         for row in before:
             if row["look_id"] in targets:
                 row["visual_status"] = "PENDING"
         _write_tsv(caption_map, before)
-        manifest = root / "control" / "work" / "ui-overrides" / "targeted-credit-rematch.json"
         manifest.parent.mkdir(parents=True, exist_ok=True)
-        manifest.write_text(
-            json.dumps(
-                {
-                    "schema": 1,
-                    "target_looks": targets,
-                    "frozen_looks": [row["look_id"] for row in before if row["look_id"] not in targets],
-                    "prior_assignments": {
-                        look_id: {
-                            "excel_sheet": before_by_look[look_id]["excel_sheet"],
-                            "excel_look_number": before_by_look[look_id]["excel_look_number"],
-                        }
-                        for look_id in targets
-                    },
-                    # A candidate rejected by an actual visual comparison is
-                    # never shown again for that same LOOK. This is a logical
-                    # exhaustion guard, not an arbitrary retry limit.
-                    "attempted_candidates": {
-                        look_id: [
-                            f"{before_by_look[look_id]['excel_sheet'].upper()}:"
-                            f"{before_by_look[look_id]['excel_look_number']}"
-                        ]
-                        for look_id in targets
-                    },
-                    "reserved_candidates": [],
-                },
-                ensure_ascii=False,
-                indent=2,
-            ) + "\n",
-            encoding="utf-8",
-        )
+        if not resuming:
+            self._initialize_rematch_manifest(manifest, before, before_by_look, targets, operator_requests)
+        payload = self._load_rematch_manifest(manifest)
+        # Explicit operator assignments are never displaced by automatic recovery.
+        payload["locked_candidates"] = [
+            f"{row['excel_sheet'].upper()}:{row['excel_look_number']}"
+            for row in self.store.credits(project.id)
+            if row.get("manual_override") and row["look_id"] not in requested_targets
+        ]
+        atomic_json(manifest, payload)
         observations = root / "control" / "work" / "caption-map-observations"
-        for look_id in targets:
+        for look_id in targets if not resuming else []:
             (observations / f"{look_id}.json").unlink(missing_ok=True)
 
-        if isinstance(provider, CodexProvider) or project.build_mode == BuildMode.QUICK:
-            self._resolve_codex_targeted_credit_rematch(project, provider, targets, manifest)
-        else:
-            # Other model providers retain the existing conservative path.
-            # They never mutate the map themselves and therefore cannot turn
-            # an unconfirmed proposal into a false CONFIRMED match.
-            self.controller.script(
-                "render_caption_mapping_evidence.py", root,
-                "--map", "control/work/caption-map.tsv", "--hires", "control/work/_mat/hires", timeout=1800,
-            )
-            self._confirm_local_credit_proofs(project, provider, only_looks=set(targets))
+        rematch_provider = self._sol_for_problem(provider, "Спорные кредитные карточки")
+        self._resolve_codex_targeted_credit_rematch(project, rematch_provider, targets, manifest)
 
         after = _read_tsv(caption_map)
         after_by_look = {row["look_id"]: row for row in after}
@@ -961,7 +1044,7 @@ class PipelineEngine:
         if changed_non_targets:
             _write_tsv(caption_map, after)
             self.log("Восстановлены замороженные строки карты: " + ", ".join(changed_non_targets))
-        after = self._repair_duplicate_caption_map(project, provider)
+        after = self._repair_duplicate_caption_map(project, rematch_provider)
         after_by_look = {row["look_id"]: row for row in after}
         pending = [look_id for look_id in targets if after_by_look.get(look_id, {}).get("visual_status") != "CONFIRMED"]
         if pending:
@@ -977,7 +1060,31 @@ class PipelineEngine:
             "; без фото сохранены текущие назначения: " + ", ".join(skipped_missing)
             if skipped_missing else ""
         )
-        return f"Точечно перепроверены только отмеченные луки: {', '.join(targets) or 'новых кандидатов нет'}. Остальные строки карты сохранены без изменений{suffix}."
+        return f"Перепроверены отмеченные луки и связанные конфликты: {', '.join(targets) or 'новых кандидатов нет'}. Остальные строки карты сохранены без изменений{suffix}."
+
+    @staticmethod
+    def _initialize_rematch_manifest(manifest: Path, before: list[dict[str, str]],
+                                     before_by_look: dict[str, dict[str, str]], targets: list[str],
+                                     operator_requests: dict[str, str]) -> None:
+        atomic_json(manifest,
+                {
+                    "schema": 1,
+                    "operator_requests": operator_requests,
+                    "target_looks": targets,
+                    "requested_looks": targets.copy(),
+                    "frozen_looks": [row["look_id"] for row in before if row["look_id"] not in targets],
+                    "prior_assignments": {
+                        look_id: {
+                            "excel_sheet": before_by_look[look_id]["excel_sheet"],
+                            "excel_look_number": before_by_look[look_id]["excel_look_number"],
+                        }
+                        for look_id in targets
+                    },
+                    "search_algorithm": "full-catalogue-v2",
+                    "attempted_candidates": {},
+                    "reserved_candidates": [],
+                },
+        )
 
     def _resolve_codex_targeted_credit_rematch(
         self,
@@ -1001,6 +1108,12 @@ class PipelineEngine:
             selections = self._choose_and_verify_codex_rematch_candidates(
                 provider, root, unresolved, manifest,
             )
+            # Discovery may have pulled a confirmed owner into this connected
+            # swap. Only explicitly recorded conflicts can escape the freeze.
+            expanded = self._load_rematch_manifest(manifest).get("expanded_looks", [])
+            for look_id in expanded:
+                if look_id not in targets:
+                    targets.append(look_id)
             assignment_text = ",".join(
                 f"{look_id}={sheet}:{number}"
                 for look_id, (sheet, number) in sorted(selections.items())
@@ -1013,10 +1126,10 @@ class PipelineEngine:
             )
             self.controller.script(
                 "render_caption_mapping_evidence.py", root,
-                "--map", "control/work/caption-map.tsv", "--hires", "control/work/_mat/hires", timeout=1800,
+                "--map", "control/work/caption-map.tsv", "--hires", "_MAT/hires", timeout=1800,
             )
             rejected = self._confirm_autonomous_credit_proofs(project, provider)
-            unresolved = [look_id for look_id in unresolved if look_id in set(rejected)]
+            unresolved = [look_id for look_id in selections if look_id in set(rejected)]
             if unresolved:
                 self.log(
                     "New ordinary proof cards still reject only: " + ", ".join(unresolved)
@@ -1034,16 +1147,25 @@ class PipelineEngine:
     ) -> dict[str, tuple[str, str]]:
         """Choose unique alternatives, then inspect their exact proof cards.
 
-        Each candidate can be tried once per LOOK. If the exact alternative
-        card is rejected, only that LOOK returns to the remaining candidate
-        pool. Provisional matches deliberately stay visible to unresolved
-        LOOKs: a later proof may correctly claim the same card and displace
-        its provisional owner. This avoids a greedy dead end where the final
-        LOOK is shown only visually impossible cards because earlier choices
-        were hidden too soon.
+        Search the entire catalogue, not only unclaimed cards. Rejections
+        belong to actual visual evidence, never ordering or reservations.
+        Confirmed owners reopen only after an exact positive claim; competing
+        provisional claims are compared together. The connected group is
+        committed atomically, then each ordinary proof is confirmed.
         """
         remaining = sorted(set(targets))
+        active = set(targets)
         accepted: dict[str, tuple[str, str]] = {}
+        payload = self._load_rematch_manifest(manifest)
+        if payload.get("search_algorithm") != "full-catalogue-v2":
+            # Old logs include reservations and forced nearest choices, not
+            # actual negative visual evidence. Keep an audit, not a permanent ban.
+            payload["legacy_attempted_candidates"] = payload.get("attempted_candidates", {})
+            payload["attempted_candidates"] = {}
+            payload["requested_looks"] = payload.get("target_looks", targets).copy()
+            payload["search_algorithm"] = "full-catalogue-v2"
+            atomic_json(manifest, payload)
+            self.log("Восстанавливаю поиск по полному Excel-каталогу: старые отказы проверю заново с учётом позы и видимости аксессуаров. Подтверждённые луки не пересобираются.")
         while remaining:
             # ``accepted`` is only provisional until every target is resolved.
             # Do not reserve it from later candidate boards: a matching proof
@@ -1053,6 +1175,7 @@ class PipelineEngine:
             rematch_args: list[str | Path] = [
                 "--looks", ",".join(remaining),
                 "--exclude-json", "control/work/ui-overrides/targeted-credit-rematch.json",
+                "--full-catalogue",
             ]
             missing_reference_dir = root / "control" / "work" / "missing-photo-reference"
             if missing_reference_dir.is_dir():
@@ -1066,32 +1189,15 @@ class PipelineEngine:
             duplicate_pairs: dict[tuple[str, str], list[str]] = {}
             for look_id, pair in choices.items():
                 duplicate_pairs.setdefault(pair, []).append(look_id)
-            collisions: dict[str, tuple[str, str]] = {}
-            for pair, look_ids in duplicate_pairs.items():
-                # One Excel card cannot be assigned twice. Keep one candidate
-                # for exact proof and let each other contender choose a new
-                # card on the next controlled board. This is a one-to-one
-                # constraint, not a visual rejection of the retained choice.
-                for look_id in sorted(look_ids)[1:]:
-                    collisions[look_id] = pair
-                    choices.pop(look_id, None)
-            if collisions:
-                self._append_rematch_attempts(manifest, collisions)
-                self.log(
-                    "Resolved simultaneous alternative-card collisions: "
-                    + ", ".join(f"{look_id}={sheet}:{number}" for look_id, (sheet, number) in sorted(collisions.items()))
+            # Prove BOTH claimants before applying uniqueness. Excluding one
+            # merely because its LOOK sorts later was a false visual rejection.
+            for look_id, (sheet, number) in sorted(choices.items()):
+                self.controller.script(
+                    "auto_caption_map.py", root,
+                    "--mode", "alternative-proofs", "--controller-batch",
+                    "--looks", look_id, "--assignments", f"{look_id}={sheet}:{number}",
+                    timeout=1800,
                 )
-
-            assignment_text = ",".join(
-                f"{look_id}={sheet}:{number}"
-                for look_id, (sheet, number) in sorted(choices.items())
-            )
-            self.controller.script(
-                "auto_caption_map.py", root,
-                "--mode", "alternative-proofs", "--controller-batch",
-                "--looks", ",".join(sorted(choices)), "--assignments", assignment_text,
-                timeout=1800,
-            )
             alternative_rows = self._alternative_evidence_rows(root, choices)
             decisions = self._inspect_codex_credit_evidence_parallel(provider, root, alternative_rows)
             rejected = [
@@ -1102,10 +1208,17 @@ class PipelineEngine:
                 self._append_rematch_attempts(manifest, {look_id: choices[look_id] for look_id in rejected})
             accepted_by_pair = {pair: look_id for look_id, pair in accepted.items()}
             displaced: list[str] = []
+            current_rows = _read_tsv(root / "control/work/caption-map.tsv") if (root / "control/work/caption-map.tsv").is_file() else []
+            owners = {(row["excel_sheet"], row["excel_look_number"]): row["look_id"] for row in current_rows}
             for look_id, pair in choices.items():
                 if look_id not in rejected:
                     former_owner = accepted_by_pair.get(pair)
                     if former_owner and former_owner != look_id:
+                        winner = self._decide_credit_owner(provider, root, pair, former_owner, look_id)
+                        if winner == former_owner:
+                            rejected.append(look_id)
+                            self._append_rematch_attempts(manifest, {look_id: pair})
+                            continue
                         # The newly inspected exact proof has priority over a
                         # merely provisional reservation. Re-evaluate only the
                         # displaced owner; its old pair is unavailable from now
@@ -1118,9 +1231,64 @@ class PipelineEngine:
                             f"only {former_owner} is being re-evaluated."
                         )
                     accepted[look_id] = pair
-            remaining = sorted(set(rejected + displaced + list(collisions)))
+                    accepted_by_pair[pair] = look_id
+                    owner = owners.get(pair)
+                    if owner and owner != look_id and owner not in active:
+                        self._expand_credit_conflict(root, manifest, owner)
+                        active.add(owner)
+                        displaced.append(owner)
+            remaining = sorted(set(rejected + displaced))
         self._write_rematch_reserved(manifest, [])
         return accepted
+
+    def _decide_credit_owner(
+        self, provider: ModelProvider, root: Path, pair: tuple[str, str], first: str, second: str,
+    ) -> str:
+        """Resolve two positive claims by comparing the actual proofs together."""
+        rows = self._alternative_evidence_rows(root, {first: pair, second: pair})
+        images = [root / row["evidence_file"] for row in rows]
+        prompt = f"""One Excel card {pair[0]}:{pair[1]} was provisionally claimed by TWO different PDF looks.
+The attached exact proof cards correspond to {first}, then {second}; each shows Excel / PDF LEFT / PDF RIGHT.
+Compare both outfits together. Identify the card's garment silhouette and colour, model presentation,
+bag, shoes and accessories independently. Select the ONE PDF pair showing this SAME outfit, not a similar one.
+Never use LOOK order or the earlier accepted flags to decide. A visible contradiction disqualifies a claim.
+Return JSON only: {{"choice":"{first}","note":"garment=concrete cue; bag/shoes=concrete cue"}}.
+Allowed choices are {first}, {second}."""
+        prompt += "\n" + CREDIT_IDENTITY_POLICY
+        checkpoint = VisionCheckpoint(root, provider, prompt, images, [first, second])
+        raw = checkpoint.read() or _run_readonly_vision(provider, prompt, root, images, timeout=600)
+        try:
+            result = json.loads(raw[raw.index("{"):raw.rindex("}") + 1])
+        except (ValueError, TypeError) as error:
+            raise ProviderError("Не удалось прочитать совместное сравнение конфликтующих луков.") from error
+        if not isinstance(result, dict):
+            raise ProviderError("Совместное сравнение вернуло неверный формат ответа.")
+        winner = result.get("choice")
+        if winner not in {first, second} or not visual_observation_is_specific(result.get("note", "")):
+            raise ProviderError("Совместное сравнение не вернуло обоснованного владельца карточки.")
+        checkpoint.save(raw)
+        return winner
+
+    def _expand_credit_conflict(self, root: Path, manifest: Path, look_id: str) -> None:
+        """Reopen ONLY an owner of a card proven to match another PDF pair."""
+        payload = self._load_rematch_manifest(manifest)
+        path = root / "control/work/caption-map.tsv"
+        rows = _read_tsv(path)
+        row = next(row for row in rows if row["look_id"] == look_id)
+        label = f"{row['excel_sheet'].upper()}:{row['excel_look_number']}"
+        if label in payload.get("locked_candidates", []):
+            raise PipelineError(f"{look_id}: автоматический обмен затронул бы ручное назначение.")
+        payload.setdefault("expanded_prior_rows", {}).setdefault(look_id, row.copy())
+        for key in ("target_looks", "expanded_looks"):
+            values = payload.setdefault(key, [])
+            if look_id not in values:
+                values.append(look_id)
+        payload["frozen_looks"] = [value for value in payload.get("frozen_looks", []) if value != look_id]
+        # Save the recovery intent BEFORE the map, so interruption is resumable.
+        atomic_json(manifest, payload)
+        row["visual_status"] = "PENDING"
+        _write_tsv(path, rows)
+        self.log(f"Точное совпадение выявило конфликт с {look_id}; перепроверяю только связанную группу.")
 
     def _confirm_autonomous_credit_proofs(
         self,
@@ -1140,7 +1308,8 @@ class PipelineEngine:
     ) -> dict[str, tuple[str, str]]:
         workers = min(4, len(targets))
         choices: dict[str, tuple[str, str]] = {}
-        failures: list[str] = []
+        failures: dict[str, str] = {}
+        quota_error: ProviderLimitError | None = None
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="lookbook-rematch") as executor:
             futures = {
                 executor.submit(self._inspect_codex_rematch_candidate, provider, root, look_id): look_id
@@ -1150,10 +1319,38 @@ class PipelineEngine:
                 look_id = futures[future]
                 try:
                     choices[look_id] = future.result()
+                except CancelledError:
+                    continue
+                except ProviderLimitError as error:
+                    quota_error = error
+                    for queued in futures:
+                        queued.cancel()
                 except (ProviderError, ValueError, OSError) as error:
-                    failures.append(f"{look_id}: {error}")
+                    failures[look_id] = str(error)
+        if quota_error:
+            raise quota_error
         if failures:
-            raise ReviewRequired("Automatic alternative selection did not finish:\n" + "\n".join(failures))
+            # The first pass is intentionally parallel for speed.  A changed
+            # CLI event stream or a transient shared-runtime interruption must
+            # not turn a correct controlled board into a user-facing queue, so
+            # retry only the affected looks one-by-one with fresh workers.
+            self.log(
+                "Codex не вернул пригодный ответ для части точечных credit-проверок; "
+                "повторяю только их последовательно."
+            )
+            unresolved: dict[str, str] = {}
+            for look_id in targets:
+                if look_id not in failures:
+                    continue
+                try:
+                    choices[look_id] = self._inspect_codex_rematch_candidate(provider, root, look_id)
+                except ProviderLimitError:
+                    raise
+                except (ProviderError, ValueError, OSError) as error:
+                    unresolved[look_id] = str(error)
+            if unresolved:
+                details = [f"{look_id}: {unresolved[look_id]}" for look_id in targets if look_id in unresolved]
+                raise ReviewRequired("Automatic alternative selection did not finish:\n" + "\n".join(details))
         return choices
 
     def _inspect_codex_rematch_candidate(
@@ -1173,48 +1370,109 @@ class PipelineEngine:
             for item in evidence.get("candidate_pool", [])
             if isinstance(item, str) and item.count(":") == 1
         }
-        attachments = [root / str(evidence.get("pdf_pair", ""))]
-        attachments.extend(
-            root / str(page.get("path", ""))
-            for page in evidence.get("candidate_pages", []) if isinstance(page, dict)
-        )
-        if not candidates or len(attachments) < 2 or len(attachments) > 5 or any(not path.is_file() for path in attachments):
+        pair_image = root / str(evidence.get("pdf_pair", ""))
+        pages = [page for page in evidence.get("candidate_pages", []) if isinstance(page, dict)]
+        if not candidates or not pages or not pair_image.is_file():
             raise ValueError(f"{look_id}: incomplete controlled candidate evidence.")
+        # Unbounded catalogue size, bounded readable requests. A NONE is a
+        # successful visual observation, not a malformed reply or a reason to
+        # manufacture a nearest-card choice. Cached NONE pages cost no tokens.
+        for offset in range(0, len(pages), 2):
+            batch = pages[offset:offset + 2]
+            labels = [label for page in batch for label in page.get("cards", [])]
+            board_candidates = {tuple(label.split(":", 1)) for label in labels} if labels else candidates
+            if not board_candidates <= candidates:
+                raise ValueError(f"{look_id}: candidate page contains an unregistered label.")
+            attachments = [pair_image, *[root / str(page.get("path", "")) for page in batch]]
+            if any(not path.is_file() for path in attachments):
+                raise ValueError(f"{look_id}: missing controlled candidate page.")
+            selected = self._inspect_codex_rematch_board(provider, root, look_id, board_candidates, attachments)
+            if selected is not None:
+                return selected
+        # One close-reading pass of individual sheets, with no forced choice.
+        # Larger catalogues never become a `> 5 attachments` format error.
+        if len(pages) > 1:
+            for page in pages:
+                labels = page.get("cards", [])
+                board_candidates = {tuple(label.split(":", 1)) for label in labels} if labels else candidates
+                selected = self._inspect_codex_rematch_board(
+                    provider, root, look_id, board_candidates,
+                    [pair_image, root / str(page.get("path", ""))], close_reading=True,
+                )
+                if selected is not None:
+                    return selected
+        raise ProviderError(f"{look_id}: полный каталог просмотрен без подтверждённого визуального кандидата.")
+
+    def _inspect_codex_rematch_board(
+        self, provider: ModelProvider, root: Path, look_id: str,
+        candidates: set[tuple[str, str]], attachments: list[Path], *, close_reading: bool = False,
+    ) -> tuple[str, str] | None:
         ordered_candidates = sorted(candidates, key=lambda pair: (pair[0], int(pair[1])))
         allowed_labels = ", ".join(f"{sheet}:{number}" for sheet, number in ordered_candidates)
         allowed_lines = "\n".join(f"- {sheet}:{number}" for sheet, number in ordered_candidates)
         prompt = f"""Choose the single Excel card for one PDF look by visible identity.
 
 LOOK: {look_id}
-The first image contains the two PDF-look photographs. The other images are all allowed, currently unclaimed Excel cards, each labelled `EXCEL W:12` or `EXCEL M:9`.
-This is a closed candidate board. The only valid labels are: {allowed_labels}.
-Print the selected label exactly as one of these board labels (one per line):
+The first image contains the two PDF-look photographs. The other images contain a PAGE of the complete Excel catalogue, each labelled `EXCEL W:12` or `EXCEL M:9`. Cards may be assigned elsewhere: that assignment is not evidence and can be corrected through a verified swap.
+This is a closed candidate board. The only valid choices are: {allowed_labels}, NONE.
+Printed card labels (or return NONE when none matches):
 {allowed_lines}
 
 Use a deliberate two-pass comparison. First identify the model and the complete outfit in both PDF photos; then compare every plausible Excel card by at least two distinctive cues: garment type and colour, silhouette, bag, shoes, accessories, pose or crop. Recheck the leading candidates against both PDF photos before choosing. Model presentation is a valid visible cue. Do not use card numbers, ordering, filenames or background as evidence. Select the one label whose card visibly matches the same look, not merely a similar studio image.
 
+Every required PDF look has a corresponding Excel card somewhere in the FULL catalogue, but not necessarily on THESE pages. If no shown card matches, return choice="NONE" and describe the reference outfit. Never select the closest wrong outfit, a different model presentation or a different garment colour. NONE causes the application to search the next pages, not to stop assembly.
+
 Reply with exactly one JSON object and no Markdown:
-{{"look_id":"{look_id}","choice":"W:12","note":"at least two concrete visible identity cues"}}"""
+{{"look_id":"{look_id}","matched":true,"choice":"W:12","note":"at least two concrete visible identity cues"}}
+If no shown card matches, return matched=false, choice=NONE, and describe the reference."""
+        prompt += "\n" + CREDIT_IDENTITY_POLICY
+        if close_reading:
+            prompt += "\nClose-reading recovery: inspect this single sheet in detail. Re-evaluate garment silhouette, layering, bag and shoes independently of any previous candidate rejection."
         prompts = [
             prompt,
             prompt + (
                 "\n\nThe previous response was not usable. This is a schema repair with the same images, "
                 "not a new visual task. Return exactly one JSON object with a `choice` field. "
-                f"Return one of these exact labels only: {allowed_labels}. "
+                f"Return one of these exact labels only: {allowed_labels}. Or NONE if none matches. "
                 f"The `choice` must be one of these exact labels and nothing else:\n{allowed_lines}"
             ),
             prompt + (
                 "\n\nFinal closed-board response repair. Do not explain your reasoning and do not use "
                 "excel_sheet/excel_look_number. Return only this shape, replacing CHOICE with one exact "
-                f"board label:\n{{\"look_id\":\"{look_id}\",\"choice\":\"CHOICE\",\"note\":\"garment=...; bag/shoes=...\"}}\n"
-                f"Allowed CHOICE values:\n{allowed_lines}"
+                f"board label or NONE:\n{{\"look_id\":\"{look_id}\",\"matched\":true,\"choice\":\"CHOICE\",\"note\":\"garment=...; bag/shoes=...\"}}\n"
+                f"Allowed CHOICE values:\n{allowed_lines}\nNONE"
             ),
         ]
         failures: list[str] = []
         for attempt, selection_prompt in enumerate(prompts, start=1):
+            checkpoint = VisionCheckpoint(root, provider, selection_prompt, attachments, [look_id])
+            cached = checkpoint.read()
+            if cached:
+                try:
+                    selected = _parse_codex_rematch_candidate(cached, look_id, candidates, allow_no_match=True)
+                    checkpoint.save(cached)
+                    self.log(f"Сохранённый выбор кандидата восстановлен без запроса ИИ: {look_id}")
+                    return selected
+                except (ProviderError, ValueError):
+                    pass
             try:
-                raw = _run_readonly_vision(provider, selection_prompt, root, attachments, timeout=3600)
-                return _parse_codex_rematch_candidate(raw, look_id, candidates)
+                if isinstance(provider, CodexProvider):
+                    raw = provider.run_readonly_closed_board_vision(
+                        selection_prompt,
+                        root,
+                        images=attachments,
+                        look_id=look_id,
+                        allowed_labels=[f"{sheet}:{number}" for sheet, number in ordered_candidates],
+                        allow_no_match=True,
+                        timeout=3600,
+                    )
+                else:
+                    raw = _run_readonly_vision(provider, selection_prompt, root, attachments, timeout=3600)
+                selected = _parse_codex_rematch_candidate(raw, look_id, candidates, allow_no_match=True)
+                checkpoint.save(raw)
+                return selected
+            except ProviderLimitError:
+                raise
             except (ProviderError, ValueError, OSError) as error:
                 failures.append(f"attempt {attempt}: {error}")
         raise ProviderError(
@@ -1248,7 +1506,8 @@ Reply with exactly one JSON object and no Markdown:
     ) -> dict[str, VisionDecision]:
         decisions: dict[str, VisionDecision] = {}
         failures: list[str] = []
-        batches = _row_batches(rows, size=5)
+        quota_error: ProviderLimitError | None = None
+        batches = _row_batches(rows, size=1 if isinstance(provider, CodexProvider) else 5)
         workers = min(4, len(batches))
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="lookbook-alt-proof") as executor:
             futures = {
@@ -1259,8 +1518,16 @@ Reply with exactly one JSON object and no Markdown:
                 batch = futures[future]
                 try:
                     decisions.update(future.result())
+                except CancelledError:
+                    continue
+                except ProviderLimitError as error:
+                    quota_error = error
+                    for queued in futures:
+                        queued.cancel()
                 except (ProviderError, ValueError, OSError) as error:
                     failures.append(f"{', '.join(row['look_id'] for row in batch)}: {error}")
+        if quota_error:
+            raise quota_error
         if failures:
             raise ReviewRequired("Alternative proof verification did not finish:\n" + "\n".join(failures))
         return decisions
@@ -1286,15 +1553,19 @@ Reply with exactly one JSON object and no Markdown:
                 values.append(value)
             attempted[look_id] = values
         payload["attempted_candidates"] = attempted
-        manifest.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        atomic_json(manifest, payload)
 
     def _write_rematch_reserved(self, manifest: Path, pairs: object) -> None:
         payload = self._load_rematch_manifest(manifest)
-        payload["reserved_candidates"] = sorted({f"{sheet}:{number}" for sheet, number in pairs})
-        manifest.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        payload["reserved_candidates"] = sorted({f"{sheet}:{number}" for sheet, number in pairs} | set(payload.get("locked_candidates", [])))
+        atomic_json(manifest, payload)
 
     def _map_gate(self, project: ProjectRecord, provider: ModelProvider) -> str:
         root = project.project_dir
+        # The same reconciliation is needed in a continuous normal build:
+        # credits_map may have regenerated caption-data.tsv immediately before
+        # this stage, rather than in a separate operator action.
+        self._reconcile_changed_caption_map(project)
         # A targeted credit review can finish with the same approved mapping.
         # In that case the controller still legitimately points to structure;
         # trying to accept the identical map again produces a false block.
@@ -1316,7 +1587,7 @@ Reply with exactly one JSON object and no Markdown:
             init_args: list[str | Path] = [
                 "--master", master_filename(project.show_date),
                 "--registry", "control/work/look-register.tsv",
-                "--hires", "control/work/_mat/hires",
+                "--hires", "_MAT/hires",
                 "--reference", "control/work/_mat/reference.pdf",
                 "--looks", str(len(rows)),
                 "--show-date", project.show_date.strftime("%d.%m.%Y"),
@@ -1358,6 +1629,31 @@ Reply with exactly one JSON object and no Markdown:
         if not evidence_passed(root, "map"):
             raise PipelineError("Контроллер не записал PASS map.")
         return "PDF-порядок, пары изображений и кредитная карта зафиксированы контроллером."
+
+    def _reconcile_changed_caption_map(self, project: ProjectRecord) -> bool:
+        """Let the controller retire proof bound to superseded credit text.
+
+        No state file means a new project that has not reached map yet. A
+        malformed test/legacy stub is left to the normal init path; the
+        controller validates every real state before moving files.
+        """
+        if project.build_mode == BuildMode.PHOTOS:
+            return False
+        state = project.project_dir / "control" / "lookbook-state.json"
+        if not state.is_file() or read_json(state).get("schema") != 1:
+            return False
+        result = self.controller.gate(
+            "invalidate-caption-map", project.project_dir, timeout=180, check=False,
+        )
+        if result.returncode:
+            raise PipelineError(result.text or "Не удалось сверить актуальность карты кредитов.")
+        if "CAPTION MAP INVALIDATED:" not in result.text:
+            return False
+        self.log(
+            "Карта кредитов изменилась: контроллер снял только устаревшие подтверждения "
+            "кредитов и последующих проверок. Структура, даты и фотографии сохранены."
+        )
+        return True
 
     def _native(self, project: ProjectRecord, gate: str) -> str:
         self._require_initialized(project)
@@ -1637,6 +1933,16 @@ Reply with exactly one JSON object and no Markdown:
         notes = "||".join(f"{look}={note}" for look, note in accepted)
         self.controller.script("auto_caption_map.py", root, "--mode", "confirm-review", "--looks", looks, "--notes", notes, timeout=600)
 
+    def _confirm_credit_batch_after_quota(self, root: Path, accepted: list[tuple[str, str]]) -> None:
+        """Commit valid notes without asking for wording repairs after quota ends."""
+        for pair in accepted:
+            try:
+                self._confirm_credit_batch(root, [pair])
+            except CommandError as error:
+                if "visual observation is not specific enough" not in str(error).casefold():
+                    raise
+                self.log(f"{pair[0]}: ответ сохранён; уточнение признаков отложено до возобновления.")
+
     def _confirm_codex_credit_proofs_parallel(self, project: ProjectRecord, provider: CodexProvider) -> list[str]:
         """Inspect disjoint proposed credit cards concurrently, then commit serially.
 
@@ -1653,13 +1959,16 @@ Reply with exactly one JSON object and no Markdown:
         ]
         if not pending:
             return []
-        batches = _row_batches(pending, size=5)
+        # One outfit per vision thread prevents the model from transferring
+        # an observation or decision between five adjacent look cards.
+        batches = _row_batches(pending, size=1)
         workers = min(4, len(batches))
         self.log(
             f"Сверка кредитов: {len(pending)} карточек в {len(batches)} независимых пакетах, параллельно до {workers}."
         )
         decisions: dict[str, VisionDecision] = {}
-        failures: list[str] = []
+        failures: list[tuple[list[dict[str, str]], str]] = []
+        quota_error: ProviderLimitError | None = None
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="lookbook-credits") as executor:
             futures = {
                 executor.submit(self._inspect_codex_credit_batch, provider, root, batch): batch
@@ -1670,12 +1979,34 @@ Reply with exactly one JSON object and no Markdown:
                 labels = ", ".join(str(row["look_id"]) for row in batch)
                 try:
                     decisions.update(future.result())
+                except CancelledError:
+                    continue
+                except ProviderLimitError as error:
+                    quota_error = error
+                    for queued in futures:
+                        queued.cancel()
                 except (ProviderError, ValueError, OSError) as error:
-                    failures.append(f"{labels}: {error}")
+                    failures.append((batch, f"{labels}: {error}"))
                 else:
                     self.log(f"Пакет кредитов просмотрен: {labels}")
-        if failures:
-            raise ReviewRequired("Не завершены независимые пакеты сверки кредитов:\n" + "\n".join(failures))
+        remaining_failures: list[str] = []
+        if failures and quota_error is None:
+            recovery_provider = self._sol_for_problem(
+                provider,
+                "Terra не вернула пригодный ответ для credit proof",
+            )
+            if recovery_provider is provider:
+                remaining_failures = [message for _batch, message in failures]
+            for batch, previous_error in failures if recovery_provider is not provider else []:
+                labels = ", ".join(str(row["look_id"]) for row in batch)
+                try:
+                    decisions.update(self._inspect_codex_credit_batch(recovery_provider, root, batch))
+                    self.log(f"Пакет кредитов уточнён на Sol: {labels}")
+                except ProviderLimitError as error:
+                    quota_error = error
+                    break
+                except (ProviderError, ValueError, OSError) as error:
+                    remaining_failures.append(f"{labels}: Terra={previous_error}; Sol={error}")
 
         rows_by_look = {str(row["look_id"]): row for row in pending}
         accepted = [
@@ -1683,14 +2014,13 @@ Reply with exactly one JSON object and no Markdown:
             for row in pending
             if decisions.get(str(row["look_id"])) and decisions[str(row["look_id"])].accepted
         ]
-        for batch in _pair_batches(accepted, size=5):
+        queue = deque(_pair_batches(accepted, size=5))
+        repairs: dict[str, int] = {}
+        while queue:
+            batch = queue.popleft()
             try:
                 self._confirm_credit_batch(root, batch)
             except CommandError as error:
-                # The map writer has not changed the TSV when it rejects a
-                # batch of proof notes, so it is safe to re-inspect only the
-                # named cards and retry the same batch.  This bridges wording
-                # differences between models without weakening visual proof.
                 if "visual observation is not specific enough" not in str(error).casefold():
                     raise
                 failed_looks = [
@@ -1699,20 +2029,46 @@ Reply with exactly one JSON object and no Markdown:
                 ]
                 if not failed_looks:
                     raise
-                self.log(
-                    "Уточняю визуальные признаки только для: " + ", ".join(failed_looks)
-                )
-                repaired = self._inspect_codex_credit_batch(
-                    provider, root, [rows_by_look[look_id] for look_id in failed_looks], strict_notes=True,
-                )
-                decisions.update(repaired)
-                retry_batch = [
-                    (look_id, _safe_confirmation_note(decisions[look_id].note))
-                    for look_id, _note in batch
-                    if decisions.get(look_id) and decisions[look_id].accepted
-                ]
-                if retry_batch:
-                    self._confirm_credit_batch(root, retry_batch)
+                # The writer validates all notes before changing any row.
+                # Commit unaffected cards separately so a second weak note
+                # cannot discard the first repair or other successful checks.
+                unaffected = [pair for pair in batch if pair[0] not in failed_looks]
+                if unaffected:
+                    queue.appendleft(unaffected)
+                if quota_error:
+                    self._confirm_credit_batch_after_quota(
+                        root, [pair for pair in batch if pair[0] in failed_looks],
+                    )
+                    continue
+                for look_id in failed_looks:
+                    repairs[look_id] = repairs.get(look_id, 0) + 1
+                    if repairs[look_id] > 2:
+                        remaining_failures.append(
+                            f"{look_id}: описание признаков пока не принято; "
+                            "ответ сохранён, остальные подтверждения не потеряны."
+                        )
+                        continue
+                    self.log("Уточняю визуальные признаки только для: " + look_id)
+                    try:
+                        repaired = self._inspect_codex_credit_batch(
+                            self._sol_for_problem(provider, "Нужно уточнить признаки credit proof"),
+                            root, [rows_by_look[look_id]], strict_notes=True,
+                        )
+                    except ProviderLimitError as error:
+                        quota_error = error
+                        continue
+                    except (ProviderError, ValueError, OSError) as error:
+                        remaining_failures.append(f"{look_id}: {error}")
+                        continue
+                    decisions.update(repaired)
+                    if decisions.get(look_id) and decisions[look_id].accepted:
+                        queue.append([(look_id, _safe_confirmation_note(decisions[look_id].note))])
+        if quota_error:
+            raise quota_error
+        if remaining_failures:
+            raise ReviewRequired(
+                "Не завершены независимые пакеты сверки кредитов:\n" + "\n".join(remaining_failures)
+            )
         rejected = [
             str(row["look_id"]) for row in pending
             if not decisions.get(str(row["look_id"])) or not decisions[str(row["look_id"])].accepted
@@ -1737,12 +2093,13 @@ Reply with exactly one JSON object and no Markdown:
 Тебе разрешено смотреть только эти proof-карточки:
 {chr(10).join(cards)}
 
-Каждая карточка состоит из Excel-лука и двух фотографий PDF-лука. Для каждого LOOK сначала определи модель и полный образ на обеих фотографиях PDF, затем сравни минимум два отличительных признака с Excel-фото: тип и цвет одежды, сумку, обувь, аксессуары, силуэт или позу. Перед решением сделай второй проход сравнения; отклоняй карточку, если совпадают только общий фон, типовая поза или один изолированный цвет. Нельзя использовать порядок, номера строк, гендер, названия файлов или фон как доказательство.
+Каждая карточка состоит из Excel-лука СЛЕВА и двух фотографий PDF-лука В ЦЕНТРЕ И СПРАВА. Это могут быть разные кадры одного образа. Сначала независимо опиши Excel в excel_observation, затем обе фотографии PDF в reference_observation. Сравни модель, крой, материал, цвет и слои одежды, сумку, обувь и аксессуары. Запиши только доказанные противоречия идентичности образа в contradictions, а различия позы, видимости аксессуаров и способа держать сумку — в note. Разные модели, другой тип одежды или явно другой цвет означают accepted=false, даже если фон и поза похожи. Пустое или повреждённое фото не даёт основания для accepted=true. Подтверждай только при минимум трёх конкретных совпадающих признаках (в том числе отличительная основная одежда и ещё один признак одежды) и отсутствии противоречий. Нельзя использовать порядок, номера строк, W/M-метку, названия файлов или фон как доказательство.
 
 Ничего не записывай, не запускай команды, не меняй TSV и не открывай InDesign. Верни только JSON без Markdown:
-{{"decisions":[{{"look_id":"LOOK_001","accepted":true,"note":"не менее двух конкретных видимых признаков"}}]}}
+{{"decisions":[{{"look_id":"LOOK_001","excel_observation":"наблюдаемый образ Excel","reference_observation":"наблюдаемый образ PDF","contradictions":[],"accepted":true,"note":"не менее двух конкретных видимых признаков"}}]}}
 
 В JSON должны быть ровно эти LOOK: {", ".join(expected)}. Если карточка не совпадает, верни accepted=false и укажи конкретную причину."""
+        prompt += "\n" + CREDIT_IDENTITY_POLICY
         note_contract = (
             "\nFor every accepted decision, write note as at least two explicit, visible labels with values: "
             "`garment=<item and colour>; bag=<item>` or `garment=<item>; shoes=<item>; accessory=<item>`. "
@@ -1754,9 +2111,28 @@ Reply with exactly one JSON object and no Markdown:
                 " This is a recovery pass after a note-format rejection: comply with the label format exactly "
                 "for every accepted LOOK."
             )
+        checkpoint = VisionCheckpoint(root, provider, prompt + note_contract, attachments, expected)
+        cached = checkpoint.read()
+        if cached:
+            try:
+                restored = _parse_codex_batch_decisions(cached, expected, credit_notes=True)
+                checkpoint.save(cached)
+                getattr(self, "log", lambda _: None)("Сохранённая проверка восстановлена без запроса ИИ: " + ", ".join(expected))
+                return restored
+            except (ProviderError, ValueError):
+                pass
         try:
-            raw = _run_readonly_vision(provider, prompt + note_contract, root, attachments, timeout=3600)
-            return _parse_codex_batch_decisions(raw, expected)
+            if isinstance(provider, CodexProvider):
+                raw = provider.run_readonly_decision_vision(
+                    prompt + note_contract, root, images=attachments, look_ids=expected,
+                )
+            else:
+                raw = _run_readonly_vision(provider, prompt + note_contract, root, attachments, timeout=600)
+            result = _parse_codex_batch_decisions(raw, expected, credit_notes=True)
+            checkpoint.save(raw)
+            return result
+        except ProviderLimitError:
+            raise
         except ProviderError as first_error:
             # Repair only the response format with the same pixels and the
             # same closed proof batch. This avoids a user-facing stop when a
@@ -1765,10 +2141,21 @@ Reply with exactly one JSON object and no Markdown:
                 "\n\nПредыдущий ответ нельзя применить. Верни ровно один JSON-объект, "
                 "включи каждый запрошенный LOOK ровно один раз, используй accepted=true/false "
                 "и конкретное поле note."
+                f" Причина отклонения: {first_error}. Не придумывай признаки ради формата; "
+                "если совпадение не доказано, верни accepted=false."
             )
             try:
-                repaired = _run_readonly_vision(provider, repair_prompt, root, attachments, timeout=3600)
-                return _parse_codex_batch_decisions(repaired, expected)
+                if isinstance(provider, CodexProvider):
+                    repaired = provider.run_readonly_decision_vision(
+                        repair_prompt, root, images=attachments, look_ids=expected,
+                    )
+                else:
+                    repaired = _run_readonly_vision(provider, repair_prompt, root, attachments, timeout=600)
+                result = _parse_codex_batch_decisions(repaired, expected, credit_notes=True)
+                checkpoint.save(repaired)
+                return result
+            except ProviderLimitError:
+                raise
             except ProviderError as repair_error:
                 raise ProviderError(
                     "Не удалось получить корректный ответ автоматической сверки кредитов "
@@ -1789,7 +2176,7 @@ Reply with exactly one JSON object and no Markdown:
             f"Сверка PDF-референса: {len(pending)} карточек в {len(batches)} независимых пакетах, параллельно до {workers}."
         )
         decisions: dict[str, VisionDecision] = {}
-        failures: list[str] = []
+        failures: list[tuple[list[Path], str]] = []
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="lookbook-reference") as executor:
             futures = {
                 executor.submit(self._inspect_codex_reference_batch, provider, root, batch): batch
@@ -1801,12 +2188,48 @@ Reply with exactly one JSON object and no Markdown:
                 try:
                     decisions.update(future.result())
                 except (ProviderError, ValueError, OSError) as error:
-                    failures.append(f"{labels}: {error}")
+                    failures.append((batch, f"{labels}: {error}"))
                 else:
                     self.log(f"Пакет PDF-референса просмотрен: {labels}")
         if failures:
-            raise ReviewRequired("Не завершены независимые пакеты PDF-референса:\n" + "\n".join(failures))
+            recovery_provider = self._sol_for_problem(
+                provider,
+                "Terra не вернула пригодный ответ для PDF-референса",
+            )
+            if recovery_provider is provider:
+                raise ReviewRequired(
+                    "Не завершены независимые пакеты PDF-референса:\n"
+                    + "\n".join(message for _batch, message in failures)
+                )
+            remaining_failures: list[str] = []
+            for batch, previous_error in failures:
+                labels = ", ".join(card.stem for card in batch)
+                try:
+                    decisions.update(self._inspect_codex_reference_batch(recovery_provider, root, batch))
+                    self.log(f"Пакет PDF-референса уточнён на Sol: {labels}")
+                except (ProviderError, ValueError, OSError) as error:
+                    remaining_failures.append(f"{labels}: Terra={previous_error}; Sol={error}")
+            if remaining_failures:
+                raise ReviewRequired(
+                    "Не завершены независимые пакеты PDF-референса:\n" + "\n".join(remaining_failures)
+                )
         rejected = [card.stem for card in pending if not decisions.get(card.stem) or not decisions[card.stem].accepted]
+        if rejected:
+            retry_cards = [card for card in pending if card.stem in set(rejected)]
+            recovery_provider = self._sol_for_problem(
+                provider,
+                "Terra отклонила часть PDF-референса",
+            )
+            if recovery_provider is not provider:
+                try:
+                    decisions.update(self._inspect_codex_reference_batch(recovery_provider, root, retry_cards))
+                except (ProviderError, ValueError, OSError) as error:
+                    self.log(f"Sol не смог перепроверить PDF-референс; сохраняю наблюдение Terra: {error}")
+                else:
+                    rejected = [
+                        card.stem for card in retry_cards
+                        if not decisions.get(card.stem) or not decisions[card.stem].accepted
+                    ]
         if rejected:
             details = "; ".join(
                 f"{look}: {decisions[look].note}" for look in rejected if look in decisions
@@ -2009,6 +2432,7 @@ Reply with exactly one JSON object and no Markdown:
             )
             attempt_decisions: dict[str, VisionDecision] = {}
             failures: list[str] = []
+            failed_batches: list[list[Path]] = []
             with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="lookbook-visual") as executor:
                 futures = {
                     executor.submit(self._confirm_codex_visual_batch, provider, root, batch): batch
@@ -2021,11 +2445,29 @@ Reply with exactly one JSON object and no Markdown:
                         batch_decisions = future.result()
                     except (ProviderError, CommandError, OSError, ValueError) as error:
                         failures.append(f"{labels}: {error}")
+                        failed_batches.append(batch)
                         for proof in batch:
                             diagnostics[proof.stem] = str(error)
                     else:
                         attempt_decisions.update(batch_decisions)
                         self.log(f"Визуальный пакет просмотрен: {labels}")
+
+            if failed_batches:
+                recovery_provider = self._sol_for_problem(
+                    provider,
+                    "Terra не вернула пригодный ответ для visual-proof",
+                )
+                if recovery_provider is not provider:
+                    for batch in failed_batches:
+                        labels = ", ".join(proof.stem for proof in batch)
+                        try:
+                            attempt_decisions.update(
+                                self._confirm_codex_visual_batch(recovery_provider, root, batch)
+                            )
+                            self.log(f"Визуальный пакет уточнён на Sol: {labels}")
+                        except (ProviderError, CommandError, OSError, ValueError) as error:
+                            for proof in batch:
+                                diagnostics[proof.stem] = str(error)
 
             for look_id, decision in attempt_decisions.items():
                 decisions[look_id] = decision
@@ -2489,7 +2931,9 @@ def _run_readonly_vision(
     raise ProviderError(f"{getattr(provider, 'kind', 'AI')} не поддерживает автоматический выбор Excel-карточки.")
 
 
-def _parse_codex_batch_decisions(raw: str, expected_looks: list[str]) -> dict[str, VisionDecision]:
+def _parse_codex_batch_decisions(
+    raw: str, expected_looks: list[str], *, credit_notes: bool = False,
+) -> dict[str, VisionDecision]:
     """Validate a no-write Codex batch response before any controller mutation."""
     text = str(raw).strip()
     start, end = text.find("{"), text.rfind("}")
@@ -2513,10 +2957,24 @@ def _parse_codex_batch_decisions(raw: str, expected_looks: list[str]) -> dict[st
         accepted = item.get("accepted", item.get("match"))
         if not isinstance(accepted, bool):
             raise ProviderError(f"{look_id}: поле accepted должно быть true или false.")
+        contradictions = item.get("contradictions", [])
+        if not isinstance(contradictions, list):
+            raise ProviderError(f"{look_id}: contradictions должен быть списком.")
+        if any(str(value).strip() for value in contradictions):
+            accepted = False
+        if accepted and ("excel_observation" in item or "reference_observation" in item):
+            if not str(item.get("excel_observation", "")).strip() or not str(item.get("reference_observation", "")).strip():
+                raise ProviderError(f"{look_id}: для подтверждения нужны независимые наблюдения Excel и PDF.")
         raw_note = str(item.get("note", "")).strip()
         # A rejected proposal is an internal rematch signal in autonomous
         # mode; it does not need to satisfy the human-facing confirmation-note
         # contract. Accepted decisions still require grounded evidence.
+        if accepted and credit_notes and not visual_observation_is_specific(raw_note):
+            raise ProviderError(
+                f"{look_id}: note требует минимум двух конкретных видимых признаков и 28 символов; "
+                "используйте garment=<наблюдаемая одежда>; bag=<наблюдаемая сумка>, "
+                "либо другие действительно видимые признаки."
+            )
         note = _safe_confirmation_note(raw_note) if accepted else (
             raw_note or "Совпадение не подтверждено; требуется автоматический подбор другой карточки."
         )
@@ -2531,7 +2989,8 @@ def _parse_codex_rematch_candidate(
     raw: str,
     expected_look: str,
     candidates: set[tuple[str, str]],
-) -> tuple[str, str]:
+    *, allow_no_match: bool = False,
+) -> tuple[str, str] | None:
     """Validate one read-only selection before it can enter the map.
 
     The model may describe a plausible card, but only an exact printed label
@@ -2548,6 +3007,16 @@ def _parse_codex_rematch_candidate(
         raise ProviderError("Codex returned invalid JSON for the rematch candidate.") from error
     if not isinstance(payload, dict) or str(payload.get("look_id", "")).strip() != expected_look:
         raise ProviderError(f"{expected_look}: Codex returned a candidate for another LOOK.")
+    negative_note = re.search(
+        r"no (?:shown |supplied |visible )?card matches|none (?:of .*? )?match|"
+        r"(?:card|outfit) (?:does not|doesn't) match|"
+        r"нет (?:подходящ|совпадающ)|ни одн\w*.*не совпад",
+        str(payload.get("note", "")), re.IGNORECASE,
+    )
+    if allow_no_match and (str(payload.get("choice", "")).strip().upper() == "NONE"
+                           or payload.get("matched") is False or negative_note):
+        _safe_confirmation_note(str(payload.get("note", "")))
+        return None
     board: dict[tuple[str, str], tuple[str, str]] = {}
     for candidate_sheet, candidate_number in candidates:
         canonical_sheet = str(candidate_sheet).strip().upper()

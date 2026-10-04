@@ -1,8 +1,11 @@
 from datetime import date
 from pathlib import Path
 
+import pytest
+
 from lookbookbot.domain import BuildMode, ProviderKind, StageStatus
 from lookbookbot.pipeline import PipelineEngine
+from lookbookbot.providers import CodexProvider, ProviderError
 from lookbookbot.state import StateStore
 
 
@@ -92,3 +95,32 @@ def test_project_build_mode_is_persistent_and_can_be_switched(tmp_path: Path) ->
     store.set_build_mode(project.id, BuildMode.FULL)
 
     assert store.get_project(project.id).build_mode == BuildMode.FULL
+
+
+@pytest.mark.parametrize("codex", [True, False])
+def test_visual_transport_failure_never_confirms_a_quick_guess(tmp_path, monkeypatch, codex):
+    store, project = _project(tmp_path)
+    registry = project.project_dir / "control/work/look-register.tsv"
+    registry.parent.mkdir(parents=True)
+    registry.touch()
+    engine = PipelineEngine(store)
+    scripts = []
+    monkeypatch.setattr(engine.controller, "script", lambda *args, **kwargs: scripts.append(args))
+    monkeypatch.setattr(engine, "_apply_credit_overrides", lambda _: [])
+    attempts = []
+
+    def broken_check(*args, **kwargs):
+        attempts.append(True)
+        raise ProviderError("transport interrupted before visual confirmation")
+
+    monkeypatch.setattr(engine, "_confirm_autonomous_credit_proofs", broken_check)
+    monkeypatch.setattr(engine, "_confirm_local_credit_proofs", broken_check)
+    monkeypatch.setattr(engine, "_quick_caption_map_fallback", lambda _: pytest.fail("A failed model must not confirm a heuristic guess"))
+    provider = CodexProvider("gpt-6.1-sol") if codex else object()
+    if codex:
+        monkeypatch.setattr(provider, "close", lambda: None)
+    with pytest.raises(ProviderError, match="transport interrupted"):
+        engine._credits_map(project, provider)
+    assert len(attempts) == 2
+    assert not any("quick-fallback" in args for args in scripts)
+    assert not any(args[0] == "build_verified_caption_data.py" for args in scripts)

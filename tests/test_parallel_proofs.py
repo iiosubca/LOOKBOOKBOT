@@ -67,3 +67,12 @@ def test_readonly_vision_keeps_legacy_provider_doubles_compatible(tmp_path) -> N
     assert _run_readonly_vision(
         LegacyProvider(), "choose", tmp_path, [tmp_path / "proof.jpg"], timeout=12,
     ) == "{}"
+
+
+def test_a_reported_contradiction_cannot_be_confirmed() -> None:
+    decisions = _parse_codex_batch_decisions(
+        '{"decisions":[{"look_id":"LOOK_001","accepted":true,"note":"garment=coat; bag=black tote",'
+        '"contradictions":["Excel has a red cardigan; reference has a brown shearling coat"]}]}',
+        ["LOOK_001"],
+    )
+    assert decisions["LOOK_001"].accepted is False

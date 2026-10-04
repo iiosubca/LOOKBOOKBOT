@@ -50,14 +50,21 @@ def codex_binary() -> Path | None:
     if explicit and Path(explicit).is_file():
         return Path(explicit)
     home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+    # ``.sandbox-bin`` is an implementation detail of an already running
+    # Codex session.  It can remain on disk after the desktop app has upgraded
+    # and, unlike the app-server CLI, may no longer support the configured
+    # model.  Prefer the current application CLI (or the user's PATH) and use
+    # the sandbox copy only as a last-resort compatibility fallback.
     for candidate in (
-        home / ".sandbox-bin" / "codex.exe",
         home / "plugins" / ".plugin-appserver" / "codex.exe",
     ):
         if candidate.is_file():
             return candidate
     located = shutil.which("codex.exe") or shutil.which("codex")
-    return Path(located) if located else None
+    if located:
+        return Path(located)
+    fallback = home / ".sandbox-bin" / "codex.exe"
+    return fallback if fallback.is_file() else None
 
 
 @dataclass(frozen=True)

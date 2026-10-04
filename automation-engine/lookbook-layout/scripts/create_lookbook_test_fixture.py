@@ -90,7 +90,7 @@ def main() -> None:
     run([sys.executable, str(WORK_AREA), str(project)])
     work = project / "control" / "work"
     target_reference = work / "_mat" / "reference.pdf"
-    target_hires = work / "_mat" / "hires"
+    target_hires = project / "_MAT" / "hires"
     candidates = work / "scratch" / "fixture-candidates"
     candidates.mkdir(parents=True, exist_ok=False)
     write_short_reference(reference, target_reference, args.looks)

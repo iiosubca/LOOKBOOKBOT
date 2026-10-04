@@ -19,15 +19,16 @@ IDENTITY_CUE_PATTERNS: dict[str, str] = {
     ),
     "garment": (
         r"(?:\b(?:coat|trench|jacket|blazer|shirt|top|dress|skirt|trouser|pants|jeans|shorts|"
-        r"jumpsuit|vest|suit|cardigan|hoodie|sweater|polo|swimwear|bikini|bodysuit|gown)\b|"
+        r"jumpsuit|vest|suit|cardigan|hoodie|sweater|polo|swimwear|bikini|bodysuit|gown|"
+        r"cape|poncho|shearling|turtleneck|pullover)\b|"
         r"пальто|плащ|куртк|жакет|пиджак|рубаш|топ|плать|юбк|брюк|джинс|шорт|комбинез|жилет|"
-        r"костюм|кардиган|худи|свитер|поло|купаль|боди)"
+        r"костюм|кардиган|худи|свитер|поло|купаль|боди|накидк|пончо|дубл[её]н|водолаз|джемпер)"
     ),
     "colour": (
         r"(?:\b(?:black|white|grey|gray|brown|beige|pink|blue|red|green|yellow|orange|purple|"
-        r"gold|silver|denim|colour|color)\b|"
+        r"gold|silver|denim|colour|color|mustard|burgundy|khaki|cream|navy|ivory|camel)\b|"
         r"ч[её]рн|бел|сер|корич|беж|розов|син|голуб|красн|зел[её]н|желт|оранж|фиолет|золот|серебр|"
-        r"деним|цвет)"
+        r"деним|цвет|горчич|бордов|хаки|кремов|молочн|ж[её]лт)"
     ),
     "bag": r"(?:\b(?:bag|tote|clutch|pouch|handbag|crossbody)\b|сумк|клатч|тоут|ридикюл)",
     "shoes": (
@@ -49,8 +50,30 @@ def visible_identity_cue_categories(note: str) -> set[str]:
     recognised as well as natural-language descriptions.
     """
     lowered = str(note).casefold()
-    return {
+    explicit: set[str] = set()
+    # A nonempty labelled visual value does not have to appear in a finite
+    # English/Russian clothing dictionary. Never count bare labels or fillers.
+    aliases = {"color": "colour", "accessories": "accessory", "clothing": "garment"}
+    def labelled(match: re.Match[str]) -> str:
+        category = aliases.get(match.group(1), match.group(1))
+        value = match.group(2).strip()
+        if (len(value) >= 3 and re.search(r"[^\W\d_]", value)
+                and value not in {"unknown", "none", "n/a", "same", "matching", "matches", "present",
+                                  "not visible", "не видно", "нет", "совпадает", "одинаковые"}
+                and not re.fullmatch(r"<.*>|\[.*\]", value)):
+            explicit.add(category)
+            return value
+        return ""
+    prose = re.sub(
+        r"\b(model|garment|clothing|colour|color|bag|shoes|accessory|accessories|pose)\s*[:=]\s*([^;\n]*)(?:;|$)",
+        labelled, lowered,
+    )
+    return explicit | {
         category
         for category, pattern in IDENTITY_CUE_PATTERNS.items()
-        if re.search(pattern, lowered, flags=re.IGNORECASE)
+        if re.search(pattern, prose, flags=re.IGNORECASE)
     }
+
+
+def visual_observation_is_specific(note: str) -> bool:
+    return len(str(note).strip()) >= 28 and len(visible_identity_cue_categories(note)) >= 2

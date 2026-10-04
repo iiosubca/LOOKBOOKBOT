@@ -113,3 +113,4 @@ class ProjectRecord:
     provider: ProviderKind
     model: str
     build_mode: BuildMode = BuildMode.FULL
+    reasoning_effort: str = ""

@@ -7,7 +7,6 @@ from pathlib import Path
 
 
 WORK_FOLDERS = (
-    "_mat/hires",
     "_mat/excel-images",
     "mapping-review/required-pdf-looks",
     "mapping-review/excel",
@@ -47,6 +46,7 @@ def main() -> None:
             f"move these items before starting: {names}"
         )
     work = project / "control" / "work"
+    (project / "_MAT" / "hires").mkdir(parents=True, exist_ok=True)
     for relative in WORK_FOLDERS:
         (work / relative).mkdir(parents=True, exist_ok=True)
     print(f"WORK AREA READY: {work}")

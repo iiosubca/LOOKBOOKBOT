@@ -1,5 +1,6 @@
 from datetime import date
 from pathlib import Path
+import sqlite3
 
 from lookbookbot.domain import ProviderKind, StageStatus
 from lookbookbot.state import StateStore
@@ -23,6 +24,30 @@ def test_state_resumes_first_incomplete_stage(tmp_path: Path) -> None:
 
     store.reset_from(project.id, "looks")
     assert store.first_incomplete_stage(project.id) == "looks"
+
+
+def test_pre_catalog_astra_project_migrates_to_established_terra_default(tmp_path: Path) -> None:
+    database = tmp_path / "legacy.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute("""
+            CREATE TABLE projects (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, source_dir TEXT NOT NULL,
+                output_root TEXT NOT NULL, project_dir TEXT NOT NULL UNIQUE,
+                show_date TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL DEFAULT '',
+                build_mode TEXT NOT NULL DEFAULT 'full', active INTEGER NOT NULL DEFAULT 0,
+                approved INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            )
+        """)
+        connection.execute(
+            "INSERT INTO projects VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("old", "old", str(tmp_path), str(tmp_path), str(tmp_path / "old"),
+             "2026-09-01", "codex", "gpt-6-astra", "quick", 1, 0, "earlier", "earlier"),
+        )
+
+    store = StateStore(database)
+    project = store.get_project("old")
+    assert project.model == "gpt-5.6-terra"
+    assert project.reasoning_effort == ""
 
 
 def test_controller_reconciliation_clears_stale_prior_failure(tmp_path: Path) -> None:

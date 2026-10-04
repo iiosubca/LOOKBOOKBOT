@@ -16,7 +16,7 @@ from lookbookbot.pipeline import (
     _read_tsv,
     _write_tsv,
 )
-from lookbookbot.providers import CodexProvider
+from lookbookbot.providers import CodexProvider, ProviderError
 from lookbookbot.providers import VisionDecision
 from lookbookbot.state import StateStore
 
@@ -170,8 +170,30 @@ def test_rematch_selection_repairs_an_out_of_board_provider_answer(tmp_path: Pat
     provider = Provider()
     assert engine._inspect_codex_rematch_candidate(provider, root, "LOOK_007") == ("W", "7")
     assert len(provider.prompts) == 2
-    assert "The only valid labels are: W:7." in provider.prompts[0]
+    assert "The only valid choices are: W:7, NONE." in provider.prompts[0]
     assert "Return one of these exact labels only: W:7." in provider.prompts[1]
+
+
+def test_rematch_retries_only_failed_parallel_choices_sequentially(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = StateStore(tmp_path / "state.db")
+    engine = PipelineEngine(store)
+    calls: list[str] = []
+
+    def inspect(_provider, _root, look_id: str):
+        calls.append(look_id)
+        if look_id == "LOOK_002" and calls.count(look_id) == 1:
+            raise ProviderError("transient CLI output")
+        return ("W", "1" if look_id == "LOOK_001" else "2")
+
+    monkeypatch.setattr(engine, "_inspect_codex_rematch_candidate", inspect)
+
+    choices = engine._choose_codex_rematch_candidates(
+        CodexProvider(), tmp_path, ["LOOK_001", "LOOK_002"],
+    )
+
+    assert choices == {"LOOK_001": ("W", "1"), "LOOK_002": ("W", "2")}
+    assert calls.count("LOOK_001") == 1
+    assert calls.count("LOOK_002") == 2
 
 
 def test_rematch_can_transfer_a_provisional_card_and_resolve_only_the_displaced_look(
@@ -204,6 +226,7 @@ def test_rematch_can_transfer_a_provisional_card_and_resolve_only_the_displaced_
         {"look_id": look_id, "evidence_file": f"{look_id}.jpg"} for look_id in selected
     ])
     monkeypatch.setattr(engine, "_inspect_codex_credit_evidence_parallel", lambda *_args: next(decisions))
+    monkeypatch.setattr(engine, "_decide_credit_owner", lambda _p, _root, _pair, _first, second: second)
 
     resolved = engine._choose_and_verify_codex_rematch_candidates(
         CodexProvider(), root, ["LOOK_001", "LOOK_002"], manifest,

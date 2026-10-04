@@ -4,7 +4,13 @@ from __future__ import annotations
 
 
 OCCLUSION_TOLERANCE_PT = 1.0
-OCCLUSION_COVERAGE_THRESHOLD = 0.98
+# A stale photo placement can remain beneath its final replacement with a
+# narrow background-only seam left by export rounding or by the replacement's
+# intentional crop.  That seam is not a third visible look photograph.  The
+# threshold stays high enough that a genuinely separate placement, including a
+# thumbnail or a meaningful partial photograph, is still retained for the
+# registry's explicit three-photo block.
+OCCLUSION_COVERAGE_THRESHOLD = 0.95
 
 
 def page_bounds(page) -> tuple[float, float, float, float]:
@@ -114,8 +120,9 @@ def draw_fully_covered_by_later(
             return False
         later_left, later_bottom, later_right, later_top = transformed_bounds(later)
         # A PDF export can round an otherwise identical replacement by a few
-        # hundredths of a point, leaving an invisible hairline at its edge.
-        # Absorb that export noise, but keep genuinely visible partial strips.
+        # hundredths of a point, leaving an invisible hairline or a narrow
+        # background-only seam at its edge.  Absorb that export noise, but
+        # keep genuinely visible partial photographs.
         tolerance = OCCLUSION_TOLERANCE_PT
         box = _intersection(
             later_left - tolerance,
