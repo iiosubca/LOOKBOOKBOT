@@ -173,7 +173,8 @@ def test_stage_quota_stop_keeps_progress_visible_and_continue_skips_old_stages(t
     assert [row["visual_status"] for row in engine.store.credits(project.id)] == ["CONFIRMED", "PENDING"]
 
 
-def test_targeted_rematch_resumes_history_and_does_not_reset_a_completed_target(tmp_path, monkeypatch):
+@pytest.mark.parametrize("clear_completed_request", [False, True])
+def test_targeted_rematch_resumes_history_and_does_not_reset_a_completed_target(tmp_path, monkeypatch, clear_completed_request):
     engine, project, root, rows = _engine(tmp_path)
     mapping = root / "control/work/caption-map.tsv"
     for number, row in enumerate(rows, 1):
@@ -193,6 +194,9 @@ def test_targeted_rematch_resumes_history_and_does_not_reset_a_completed_target(
             actual = _read_tsv(mapping)
             actual[0].update(excel_look_number="7", visual_status="CONFIRMED")
             _write_tsv(mapping, actual)
+            if clear_completed_request:
+                engine.store.replace_credits(project.id, actual)
+                engine.store.clear_credit_rematches(project.id, ["LOOK_001"])
             observation.parent.mkdir(parents=True)
             observation.write_text('{"already_inspected":true}')
             raise ProviderLimitError("Quota ended")
@@ -213,7 +217,7 @@ def test_targeted_rematch_resumes_history_and_does_not_reset_a_completed_target(
     monkeypatch.setattr(engine.controller, "script", lambda *args, **kwargs: "")
     with pytest.raises(ProviderLimitError):
         engine._targeted_credit_rematch(project, FakeVision(), ["LOOK_001", "LOOK_002"])
-    engine._targeted_credit_rematch(project, FakeVision(), ["LOOK_001", "LOOK_002"])
+    engine._targeted_credit_rematch(project, FakeVision(), engine.store.requested_credit_rematches(project.id))
     assert visited == [["LOOK_001", "LOOK_002"], ["LOOK_002"]]
     assert [row["excel_look_number"] for row in _read_tsv(mapping)] == ["7", "9"]
     assert engine.store.requested_credit_rematches(project.id) == []

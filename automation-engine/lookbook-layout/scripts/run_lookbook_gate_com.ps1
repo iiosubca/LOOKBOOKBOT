@@ -86,7 +86,7 @@ function Close-SavedAutomationMaster($Application, [string]$MasterPath, [string]
         if ((Normalize-Path ([string]$openDocument.FullName)) -eq (Normalize-Path $MasterPath)) { $matches += $openDocument }
     }
     foreach ($openDocument in $matches) {
-        if (-not $openDocument.Saved) { Fail "$Context found the master open with unsaved changes; automatic close is unsafe." }
+        if (-not $openDocument.Saved -or $openDocument.Modified) { Fail "$Context found the master open with unsaved changes; automatic close is unsafe." }
         try { $openDocument.Close($SAVE_NO) } catch { Fail "$Context could not close the saved automation master." }
     }
 }
@@ -101,7 +101,15 @@ function Master-Identity([string]$Path) {
 }
 function Get-FileSha256([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { Fail "Missing file for SHA-256: $Path" }
-    return ([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.IO.File]::ReadAllBytes($Path)) | ForEach-Object { $_.ToString('x2') }) -join ''
+    $stream = [System.IO.File]::OpenRead($Path)
+    $hasher = [System.Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($hasher.ComputeHash($stream))).Replace('-', '').ToLowerInvariant() }
+    finally { $stream.Dispose(); $hasher.Dispose() }
+}
+function Write-NativeActivity([string]$Control, [string]$GateName, [string]$Step, [string]$Look = '') {
+    $entry = [ordered]@{ schema = 1; pid = $PID; gate = $GateName; step = $Step; look_id = $Look; at = (Get-Date).ToUniversalTime().ToString('o') }
+    Write-Json (Join-Path $Control 'progress\native-activity.json') $entry
+    [System.IO.File]::AppendAllText((Join-Path $Control 'progress\native-timing.jsonl'), (($entry | ConvertTo-Json -Compress) + [Environment]::NewLine), [System.Text.UTF8Encoding]::new($false))
 }
 function Same-Identity($Left, $Right) {
     return (Normalize-Path ([string]$Left.path)) -eq (Normalize-Path ([string]$Right.path)) -and
@@ -476,16 +484,28 @@ function Get-CreditsNestedStyle($Document, [int]$FieldIndex, [string]$LookId) {
     if ([string]$style.Name -ne $name) { Fail "$LookId required nested credits style $name is missing." }
     return $style
 }
-function Assert-CaptionTypography($Paragraph, $ParagraphStyle, $CharacterStyle, [string]$LookId, [int]$FieldIndex, $ExpectedJustification = $null) {
+function Get-CaptionStyleProfile($ParagraphStyle, $CharacterStyle) {
+    $paragraph = @{}; $character = @{}
+    foreach ($property in @('SpaceBefore','SpaceAfter','Justification')) { $paragraph[$property] = [double]$ParagraphStyle.$property }
+    foreach ($property in @('PointSize','Leading','Tracking')) {
+        $value = $CharacterStyle.$property
+        $character[$property] = if ($null -eq $value -or [int]$value -eq $NOTHING) { $null } else { [double]$value }
+    }
+    return @{ name = [string]$CharacterStyle.Name; paragraph = $paragraph; character = $character }
+}
+function Assert-CaptionTypography($Paragraph, $ParagraphStyle, $CharacterStyle, [string]$LookId, [int]$FieldIndex, $ExpectedJustification = $null, $StyleProfile = $null) {
     # CREDiTs intentionally has nested styles: CATEGORY / BRAND / PRICE / SKU.
     # The visible point size and leading therefore differ by the field within a
     # product. Verify the paragraph rhythm against CREDiTs and the glyph rhythm
     # against the appropriate nested character style instead of flattening the
     # four fields to one misleading leading value.
+    # Capture the current style's expectations once per field type in this
+    # block, not once for every paragraph/range. Actual text is always read.
+    if ($null -eq $StyleProfile) { $StyleProfile = Get-CaptionStyleProfile $ParagraphStyle $CharacterStyle }
     foreach ($property in @('SpaceBefore','SpaceAfter','Justification')) {
         try {
             $actual = [double]$Paragraph.$property
-            $expected = if ($property -eq 'Justification' -and $null -ne $ExpectedJustification) { [double]$ExpectedJustification } else { [double]$ParagraphStyle.$property }
+            $expected = if ($property -eq 'Justification' -and $null -ne $ExpectedJustification) { [double]$ExpectedJustification } else { [double]$StyleProfile.paragraph[$property] }
         } catch { Fail "$LookId credits cannot verify CREDiTs paragraph $property." }
         if ([double]::IsNaN($actual) -or [double]::IsInfinity($actual) -or [math]::Abs($actual - $expected) -gt 0.01) {
             Fail "$LookId credits paragraph $property does not equal CREDiTs."
@@ -495,15 +515,15 @@ function Assert-CaptionTypography($Paragraph, $ParagraphStyle, $CharacterStyle, 
     if ($rangeCount -eq 0) { Fail "$LookId credits field $($FieldIndex + 1) has no visible text range." }
     for ($rangeIndex = 1; $rangeIndex -le $rangeCount; $rangeIndex++) {
         $range = $Paragraph.TextStyleRanges.Item($rangeIndex)
-        if ([string]$range.AppliedCharacterStyle.Name -ne [string]$CharacterStyle.Name) { Fail "$LookId credits field $($FieldIndex + 1) does not use nested style $($CharacterStyle.Name)." }
+        if ([string]$range.AppliedCharacterStyle.Name -ne [string]$StyleProfile.name) { Fail "$LookId credits field $($FieldIndex + 1) does not use nested style $($StyleProfile.name)." }
         foreach ($property in @('PointSize','Leading','Tracking')) {
             try {
-                $expectedRaw = $CharacterStyle.$property
+                $expectedRaw = $StyleProfile.character[$property]
                 # A character style can deliberately leave tracking inherited.
                 # InDesign then exposes an effective numeric value on the text
                 # range, while the style exposes NothingEnum. That is correct
                 # and must not be mistaken for a formatting override.
-                if ($null -eq $expectedRaw -or [int]$expectedRaw -eq $NOTHING) { continue }
+                if ($null -eq $expectedRaw) { continue }
                 $actual = [double]$range.$property
                 $expected = [double]$expectedRaw
             } catch { Fail "$LookId credits cannot verify nested style $($CharacterStyle.Name) $property." }
@@ -558,11 +578,17 @@ function Assert-CaptionBlock($Document, $Row, $Grouped, $Style, $ByLabel, [bool]
     if ($actual -ne $expected) { Fail "$id caption text differs from caption-data.tsv." }
     $paragraphCount = [int]$frame.ParentStory.Paragraphs.Count
     if ($paragraphCount -ne $expectedLines.Count) { Fail "$id credits have $paragraphCount fields, expected $($expectedLines.Count)." }
+    $fieldStyles = @{}; $styleProfiles = @{}
     for ($index = 0; $index -lt $paragraphCount; $index++) {
         $paragraph = $frame.ParentStory.Paragraphs.Item($index + 1)
         if ([string]$paragraph.AppliedParagraphStyle.Name -ne [string]$Style.Name) { Fail "$id credits do not use the CREDiTs paragraph style." }
         $expectedJustification = if ($RightAligned) { $RIGHT_ALIGN } else { $null }
-        Assert-CaptionTypography $paragraph $Style (Get-CreditsNestedStyle $Document $index $id) $id $index $expectedJustification
+        $field = $index % 4
+        if (-not $fieldStyles.ContainsKey($field)) {
+            $fieldStyles[$field] = Get-CreditsNestedStyle $Document $index $id
+            $styleProfiles[$field] = Get-CaptionStyleProfile $Style $fieldStyles[$field]
+        }
+        Assert-CaptionTypography $paragraph $Style $fieldStyles[$field] $id $index $expectedJustification $styleProfiles[$field]
     }
     return $actual
 }
@@ -570,10 +596,13 @@ function Assert-Captions($Document, $Registry, $Captions, $VisualCaptionCorrecti
     $grouped = Get-CaptionGroups $Captions
     $style = Get-CreditsParagraphStyle $Document
     $unique = @{}
+    # Membership/uniqueness is checked by Assert-Frames in the same native
+    # transaction. Keep one index for the full audit instead of 50 traversals.
+    $byLabel = New-LabelIndex $Document
     foreach ($row in $Registry) {
         $label = "LOOKBOOK_CREDITS|$([string]$row.look_id)"
         $rightAligned = $VisualCaptionCorrections.ContainsKey($label) -and [string]$VisualCaptionCorrections[$label].mode -eq 'RIGHT'
-        $actual = Assert-CaptionBlock $Document $row $grouped $style $null $rightAligned
+        $actual = Assert-CaptionBlock $Document $row $grouped $style $byLabel $rightAligned
         $unique[$actual] = $true
     }
     if ($Registry.Count -gt 1 -and $unique.Keys.Count -lt 2) { Fail 'All caption blocks are identical.' }
@@ -879,12 +908,54 @@ function Get-CompletedCaptionLookIds($Document, $Registry, $Captions, $ByLabel) 
     }
     return @($complete)
 }
-function Write-CaptionProgress($Control, $State, $Arm, [string]$MasterPath, $Document, $Registry, $Captions) {
-    $complete = @(Get-CompletedCaptionLookIds $Document $Registry $Captions (New-LabelIndex $Document))
+function Get-TrustedCaptionLookIds($Control, $State, $Arm, [string]$MasterPath, $Document, $Registry, $Captions) {
+    # A receipt can skip expensive COM typography reads ONLY for the exact
+    # saved bytes previously verified by this worker. A manual edit, changed
+    # source, old receipt, new arm or interrupted save triggers a full audit.
+    $path = Join-Path $Control 'progress\captions.json'
+    if ((Test-Path -LiteralPath $path -PathType Leaf) -and -not [bool]$Document.Modified) {
+        try {
+            $prior = Read-Json $path
+            $root = Split-Path -Parent $Control
+            $ids = @($prior.completed_looks)
+            $unique = @($ids | Sort-Object -Unique)
+            $allowed = @($Registry | ForEach-Object { [string]$_.look_id })
+            $unknown = @($ids | Where-Object { $_ -notin $allowed })
+            if ($prior.validation_policy -eq 'caption-batch-sha256-v1' -and $prior.schema -eq 1 -and
+                $prior.session_id -eq $State.session_id -and $prior.gate -eq 'captions' -and $prior.nonce -eq $Arm.nonce -and
+                [int]$prior.look_count -eq $Registry.Count -and [int]$prior.completed_count -eq $ids.Count -and
+                $unique.Count -eq $ids.Count -and $unknown.Count -eq 0 -and
+                (Same-Identity $prior.master (Master-Identity $MasterPath)) -and
+                $prior.registry_sha256 -eq (Get-FileSha256 (Join-Path $root ([string]$State.registry))) -and
+                $prior.captions_sha256 -eq (Get-FileSha256 (Join-Path $root ([string]$State.captions))) -and
+                $prior.master_sha256 -eq (Get-FileSha256 $MasterPath)) {
+                return $ids
+            }
+        } catch { } # A damaged/legacy receipt grants no trust.
+    }
+    return @(Get-CompletedCaptionLookIds $Document $Registry $Captions (New-LabelIndex $Document))
+}
+function Invalidate-CaptionReceipt($Control, $State, $Arm) {
+    $path = Join-Path $Control 'progress\captions.json'
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return }
+    $progress = Read-Json $path
+    if ($progress.session_id -ne $State.session_id -or $progress.nonce -ne $Arm.nonce -or $progress.gate -ne 'captions') { return }
+    # A final audit failure must not keep trusting a complete-looking receipt
+    # forever. Preserve recovery counts, but derive them from actual text again
+    # on the next attempt; never skip the audit or discard saved document bytes.
+    $progress | Add-Member NoteProperty validation_policy 'needs-full-audit' -Force
+    Write-Json $path $progress
+}
+function Write-CaptionProgress($Control, $State, $Arm, [string]$MasterPath, $Document, $Registry, $Captions, $CompletedLooks = $null) {
+    $complete = if ($null -eq $CompletedLooks) { @(Get-CompletedCaptionLookIds $Document $Registry $Captions (New-LabelIndex $Document)) } else { @($CompletedLooks) }
+    $root = Split-Path -Parent $Control
     $progress = [ordered]@{
         schema = 1; session_id = [string]$State.session_id; gate = 'captions'; nonce = [string]$Arm.nonce
         updated_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-        master = Master-Identity $MasterPath; completed_looks = $complete; completed_count = [int]$complete.Count; look_count = [int]$Registry.Count
+        master = Master-Identity $MasterPath; completed_looks = @($complete); completed_count = [int]@($complete).Count; look_count = [int]$Registry.Count
+        validation_policy = 'caption-batch-sha256-v1'; master_sha256 = Get-FileSha256 $MasterPath
+        registry_sha256 = Get-FileSha256 (Join-Path $root ([string]$State.registry))
+        captions_sha256 = Get-FileSha256 (Join-Path $root ([string]$State.captions))
     }
     Write-Json (Join-Path $Control 'progress\captions.json') $progress
     return $progress
@@ -899,11 +970,11 @@ function Write-CaptionRepairProgress($Control, $State, $Arm, [string]$MasterPath
     Write-Json (Join-Path $Control 'progress\caption-repair.json') $progress
     return $progress
 }
-function Apply-CaptionsBatch($Document, $Registry, $Captions, [int]$MaximumLooks) {
+function Apply-CaptionsBatch($Document, $Registry, $Captions, [int]$MaximumLooks, $CompletedLookIds = $null, [string]$ActivityControl = '') {
     $grouped = Get-CaptionGroups $Captions
     $style = Get-CreditsParagraphStyle $Document
     $byLabel = New-LabelIndex $Document
-    $completed = @(Get-CompletedCaptionLookIds $Document $Registry $Captions $byLabel)
+    $completed = if ($null -eq $CompletedLookIds) { @(Get-CompletedCaptionLookIds $Document $Registry $Captions $byLabel) } else { @($CompletedLookIds) }
     $pending = @($Registry | Where-Object { $completed -notcontains [string]$_.look_id })
     $batch = @($pending | Select-Object -First $MaximumLooks)
     try {
@@ -911,6 +982,7 @@ function Apply-CaptionsBatch($Document, $Registry, $Captions, [int]$MaximumLooks
         $findPreferences.FindWhat = ''
         foreach ($row in $batch) {
             $id = [string]$row.look_id
+            if ($ActivityControl) { Write-NativeActivity $ActivityControl 'captions' 'format-look' $id }
             if (-not $grouped.ContainsKey($id)) { Fail "$id has no caption data." }
             # The approved template uses one CREDiTs paragraph per field.  Write
             # tab-delimited source fields, then perform the required Find/Change
@@ -940,7 +1012,10 @@ function Apply-CaptionsBatch($Document, $Registry, $Captions, [int]$MaximumLooks
     } finally {
         try { if ($null -ne $findPreferences) { $findPreferences.FindWhat = '' } } catch {}
     }
-    foreach ($row in $batch) { [void](Assert-CaptionBlock $Document $row $grouped $style $byLabel) }
+    foreach ($row in $batch) {
+        if ($ActivityControl) { Write-NativeActivity $ActivityControl 'captions' 'verify-look' ([string]$row.look_id) }
+        [void](Assert-CaptionBlock $Document $row $grouped $style $byLabel)
+    }
     return $batch
 }
 function Get-GraphicBounds($Frame, [string]$Description) {
@@ -1638,6 +1713,7 @@ function Audit-CaptionRevisionScope([string]$ProjectPath) {
 function Invoke-Gate([string]$ProjectPath, [string]$GateName) {
     $projectFull = [System.IO.Path]::GetFullPath($ProjectPath)
     $control = Join-Path $projectFull 'control'
+    Write-NativeActivity $control $GateName 'start'
     $state = Read-Json (Join-Path $control 'lookbook-state.json')
     $arm = Read-Json (Join-Path $control "arms\$GateName.json")
     if ($arm.session_id -ne $state.session_id -or $arm.gate -ne $GateName) { Fail "Gate $GateName is not armed for this session." }
@@ -1651,6 +1727,7 @@ function Invoke-Gate([string]$ProjectPath, [string]$GateName) {
     Close-SavedAutomationMaster $app $masterPath "Gate $GateName"
     $doc = $null; $saved = $false
     try {
+        Write-NativeActivity $control $GateName 'open-master'
         $doc = Open-AutomationDocument $app $masterPath
         if (-not $doc.Saved) { Fail 'Master opened with unsaved/recovered state.' }
         $checkpointDirectory = Join-Path $control 'checkpoints'
@@ -1681,14 +1758,29 @@ function Invoke-Gate([string]$ProjectPath, [string]$GateName) {
             return
         }
         if ($GateName -eq 'captions') {
+            Write-NativeActivity $control $GateName 'verify-frames'
             Assert-Baseline -Document $doc -StructureEvidencePath (Join-Path $control 'evidence\structure.json') -AllowCreditExpansion $true; Assert-Frames $doc $registry
             # Credits are intentionally handled as small saved transactions.
             # The previous one-shot operation could stay in InDesign for an
             # hour with no progress or safe recovery point.
-            $changedRows = @(Apply-CaptionsBatch $doc $registry $captions $BatchSize)
+            $registryHash = Get-FileSha256 (Join-Path $projectFull ([string]$state.registry))
+            $captionsHash = Get-FileSha256 (Join-Path $projectFull ([string]$state.captions))
+            Write-NativeActivity $control $GateName 'check-saved-progress'
+            $completed = @(Get-TrustedCaptionLookIds $control $state $arm $masterPath $doc $registry $captions)
+            $changedRows = @(Apply-CaptionsBatch $doc $registry $captions $BatchSize $completed $control)
+            Write-NativeActivity $control $GateName 'save-master'
             $doc.Save() | Out-Null; $saved = $true
-            $progress = Write-CaptionProgress $control $state $arm $masterPath $doc $registry $captions
+            # Verify only this saved batch. Earlier blocks are backed by the
+            # exact master/input hashes; final PASS still audits every block.
+            Write-NativeActivity $control $GateName 'verify-saved-batch'
+            $grouped = Get-CaptionGroups $captions; $style = Get-CreditsParagraphStyle $doc; $byLabel = New-LabelIndex $doc
+            foreach ($row in $changedRows) { [void](Assert-CaptionBlock $doc $row $grouped $style $byLabel) }
+            if ($registryHash -ne (Get-FileSha256 (Join-Path $projectFull ([string]$state.registry))) -or
+                $captionsHash -ne (Get-FileSha256 (Join-Path $projectFull ([string]$state.captions)))) { Fail 'Caption inputs changed during the native transaction; no checkpoint is accepted.' }
+            $complete = @($completed) + @($changedRows | ForEach-Object { [string]$_.look_id })
+            $progress = Write-CaptionProgress $control $state $arm $masterPath $doc $registry $captions $complete
             if ([int]$progress.completed_count -eq [int]$Registry.Count) {
+                Write-NativeActivity $control $GateName 'final-caption-audit'
                 Assert-Captions $doc $registry $captions
                 Assert-Baseline -Document $doc -StructureEvidencePath (Join-Path $control 'evidence\structure.json') -AllowCreditExpansion $true
                 Write-CaptionGeometryEvidence $control $state $arm $masterPath $doc
@@ -1699,6 +1791,7 @@ function Invoke-Gate([string]$ProjectPath, [string]$GateName) {
                 $doc.Close($SAVE_NO); $doc = $null
                 Write-Output "COM_GATE_PENDING captions $($progress.completed_count)/$($progress.look_count) batch=$($changedRows.Count)"
             }
+            Write-NativeActivity $control $GateName 'closed'
             return
         }
         if ($GateName -eq 'release') {
@@ -1723,6 +1816,8 @@ function Invoke-Gate([string]$ProjectPath, [string]$GateName) {
         $doc.Close($SAVE_NO); $doc = $null
         Write-Output "COM_GATE_PASS $GateName"
     } catch {
+        try { Write-NativeActivity $control $GateName 'failed' } catch {}
+        if ($GateName -eq 'captions') { try { Invalidate-CaptionReceipt $control $state $arm } catch {} }
         try { $_ | Out-File -LiteralPath (Join-Path $control "progress\$GateName-last-error.txt") -Encoding utf8 -Force } catch {}
         if ($null -ne $doc) { try { $doc.Close($SAVE_NO) } catch {} }
         throw

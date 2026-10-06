@@ -110,14 +110,15 @@ def test_renderer_exposes_confirmed_card_and_large_catalogue_without_changing_ma
     index.parent.mkdir(parents=True, exist_ok=True)
     _write_tsv(index, [{"excel_sheet": "W", "excel_look_number": str(n), "excel_image": f"{n}.jpg"} for n in range(1, 75)])
     monkeypatch.setattr(builder, "render_pair", lambda *_: None)
+    monkeypatch.setattr(builder, "rank_candidates", lambda _root, _row, cards, *_: cards)
     monkeypatch.setattr(builder, "render_candidate_sheet", lambda _root, _cards, target, _page: target.parent.mkdir(parents=True, exist_ok=True))
     monkeypatch.setattr(builder, "digest", lambda *_: "test-hash")
     monkeypatch.setattr(sys, "argv", ["builder", str(tmp_path), "--looks", "LOOK_001", "--full-catalogue"])
     builder.main()
     saved = json.loads((tmp_path / "control/work/rematch-evidence/LOOK_001/manifest.json").read_text())
     assert "W:2" in saved["candidate_pool"]  # confirmed but visible for discovery
-    assert len(saved["candidate_pages"]) == 10
-    assert all(len(page["cards"]) <= 8 for page in saved["candidate_pages"])
+    assert len(saved["candidate_pages"]) == 19
+    assert all(len(page["cards"]) <= 4 for page in saved["candidate_pages"])
     assert _read_tsv(tmp_path / "control/work/caption-map.tsv") == rows
 
 

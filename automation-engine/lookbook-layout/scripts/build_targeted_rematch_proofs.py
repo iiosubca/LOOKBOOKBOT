@@ -155,6 +155,34 @@ def render_candidate_sheet(root: Path, cards: list[dict[str, str]], target: Path
         canvas.close()
 
 
+def rank_candidates(root: Path, row: dict[str, str], cards: list[dict[str, str]],
+                    hires: Path, missing_reference_dir: Path | None,
+                    features: dict[str, object]) -> list[dict[str, str]]:
+    """Order the FULL catalogue by pair evidence, never discard a card.
+
+    Scores affect search order only. They cannot confirm a card, filter by
+    W/M, or hide a visually correct candidate on a later page.
+    """
+    from auto_caption_map import appearance_signature, image_feature, outfit_search_distance
+
+    def feature(path: Path):
+        key = str(path)
+        if key not in features:
+            features[key] = image_feature(path, adaptive_background=True)
+        return features[key]
+
+    left = feature(_reference_photo(row, "left", hires, missing_reference_dir))
+    right = feature(_reference_photo(row, "right", hires, missing_reference_dir))
+    left_appearance, right_appearance = appearance_signature(left), appearance_signature(right)
+
+    def score(card):
+        value = feature(child(root, card["excel_image"]))
+        return outfit_search_distance(value, left, right, appearance_signature(value),
+                                      left_appearance, right_appearance)
+
+    return sorted(cards, key=score)
+
+
 def parse_looks(value: str, available: set[str]) -> list[str]:
     looks = [item.strip().upper() for item in value.split(",") if item.strip()]
     if not looks or len(set(looks)) != len(looks):
@@ -264,6 +292,7 @@ def main() -> None:
         fail(f"Missing reference-photo directory: {missing_reference_dir}")
     if not hires.is_dir():
         fail(f"Hires folder is missing: {hires}")
+    features: dict[str, object] = {}
     for look_id in looks:
         row = by_look[look_id]
         excluded = per_look_excluded.get(look_id, set()) | reserved
@@ -273,11 +302,16 @@ def main() -> None:
         ]
         if not candidates and not args.full_catalogue:
             fail(f"{look_id}: no untried, unreserved Excel candidate remains.")
+        if args.full_catalogue and candidates:
+            candidates = rank_candidates(root, row, candidates, hires, missing_reference_dir, features)
         folder = output / look_id
         pair_target = folder / "pdf-pair.jpg"
         render_pair(root, row, hires, pair_target, missing_reference_dir)
         pages: list[dict[str, object]] = []
-        page_size = 8 if args.full_catalogue else 16
+        # Two columns preserve readable clothing detail after model-side
+        # downscaling. Two pages per request now mean at most eight outfits,
+        # rather than sixteen small figures competing for visual attention.
+        page_size = 4 if args.full_catalogue else 16
         for page, offset in enumerate(range(0, len(candidates), page_size), start=1):
             target = folder / f"candidates-{page:02}.jpg"
             batch = candidates[offset : offset + page_size]
@@ -289,6 +323,7 @@ def main() -> None:
             })
         manifest = {
             "schema": 1,
+            "search_order": "image-pair-ranked-full-catalogue-v1",
             "look_id": look_id,
             "pdf_pair": str(pair_target.relative_to(root)).replace("\\", "/"),
             "pdf_pair_sha256": digest(pair_target),

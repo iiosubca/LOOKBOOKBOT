@@ -218,6 +218,7 @@ class LookbookController:
             checkpoint_before = _gate_checkpoint_signature(project, gate)
             self._wait_for_master(project)
             result = self.gate("apply", project, "--gate", gate, timeout=1800, check=False)
+            self.runner.log(f"InDesign: операция {gate} заняла {result.elapsed:.1f} с.")
             self._wait_for_master(project)
             if evidence_passed(project, gate):
                 return
@@ -275,12 +276,40 @@ class LookbookController:
                 )
             seen_checkpoints.add(checkpoint_after)
 
-    @staticmethod
-    def _wait_for_master(project: Path, timeout: int = 900) -> None:
+    def _wait_for_master(self, project: Path, timeout: int = 900) -> None:
         deadline = time.monotonic() + timeout
+        inspected = False
+        next_probe = time.monotonic()
+        reason = ""
         while any(project.glob("*.idlk")):
+            if not inspected and time.monotonic() >= next_probe:
+                # The preceding synchronous native call has returned (or this
+                # is a fresh resume). Probe once; the helper independently
+                # refuses active/orphaned workers and unsaved/visible documents.
+                inspected = True
+                master = _controlled_master(project)
+                before = _artifact_signature(master)
+                powershell = Path(os.environ.get("WINDIR", "C:/Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+                probe = self.runner.run([powershell, "-NoProfile", "-NonInteractive", "-File",
+                                         self.tools.engine_scripts / "recover_saved_master.ps1", "-Project", project],
+                                        timeout=30, check=False)
+                try:
+                    payload = json.loads(probe.stdout.strip())
+                except (ValueError, TypeError):
+                    payload = {}
+                if payload.get("status") == "closed":
+                    _assert_unchanged_master(master, before, "закрытия сохранённого документа")
+                    self.runner.log("Закрыт сохранённый INDD, оставшийся открытым внутри InDesign. Продолжаю с текущего checkpoint; несохранённые изменения не отбрасывались.")
+                elif payload.get("status") == "unsaved":
+                    raise CommandError("INDD содержит несохранённые изменения. Сохраните и закройте его в InDesign, затем нажмите «Продолжить». Автоматическое закрытие не выполнялось.")
+                elif payload.get("status") == "busy":
+                    inspected = False
+                    next_probe = time.monotonic() + 10
+                    reason = str(payload.get("reason", "Безопасность закрытия INDD не подтверждена."))
+                else:
+                    raise CommandError("Не удалось безопасно закрыть удерживаемый INDD. Сохраните и закройте документ в InDesign, затем нажмите «Продолжить». Блокировка не удалялась.")
             if time.monotonic() >= deadline:
-                raise CommandError("InDesign продолжает удерживать master (.idlk); второй процесс не запущен.")
+                raise CommandError("InDesign продолжает удерживать master (.idlk); второй процесс не запущен. Сохраните и закройте INDD, затем нажмите «Продолжить». " + reason)
             time.sleep(2)
 
     @staticmethod

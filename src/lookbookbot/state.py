@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import uuid
@@ -15,6 +16,36 @@ from .domain import BuildMode, ProjectRecord, ProviderKind, STAGES, StageStatus
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def credit_product_warning(root: Path, row: dict[str, Any]) -> str:
+    """Show styling warnings only from the exact current confirmed proof.
+
+    This is separate from editable operator notes and never confirms a row.
+    An old warning cannot follow a changed card or changed photograph.
+    """
+    look = str(row.get("look_id", ""))
+    if row.get("visual_status") != "CONFIRMED" or Path(look).name != look:
+        return ""
+    try:
+        root = root.resolve()
+        observation = root / "control/work/caption-map-observations" / f"{look}.json"
+        data = json.loads(observation.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or data.get("look_id") != look:
+            return ""
+        if any(str(data.get(key, "")) != str(row.get(key, "")) for key in
+               ("excel_sheet", "excel_look_number", "excel_image", "evidence_file")):
+            return ""
+        description = str(data.get("visual_identity_description", ""))
+        if "Проверить товары:" not in description:
+            return ""
+        proof = (root / str(row.get("evidence_file", ""))).resolve()
+        proof.relative_to(root)
+        if hashlib.sha256(proof.read_bytes()).hexdigest() != data.get("evidence_sha256"):
+            return ""
+        return description.split("Проверить товары:", 1)[1].strip()
+    except (OSError, ValueError, TypeError):
+        return ""
 
 
 class StateStore:

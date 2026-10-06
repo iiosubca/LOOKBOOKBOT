@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lookbookbot"
-version = "0.2.82"
+version = "0.2.86"
 description = "Evidence-gated Windows desktop application for TSUM lookbook production"
 requires-python = ">=3.11,<3.14"
 dependencies = [
@@ -17,6 +17,11 @@ dependencies = [
 dev = [
   "pytest>=8.3,<9",
   "pyinstaller>=6.11,<7",
+  "numpy>=2,<3",
+  "Pillow>=11,<13",
+  "pypdf>=5,<7",
+  "reportlab>=4,<5",
+  "openpyxl>=3.1,<4",
 ]
 
 [project.scripts]

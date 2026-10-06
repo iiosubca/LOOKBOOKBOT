@@ -581,6 +581,100 @@ def _quick_missing_looks(
     return final_assignment, missing_looks, final_diagnostics, descriptions
 
 
+def _file_sha256(path):
+    with path.open("rb") as source:
+        return hashlib.file_digest(source, "sha256").hexdigest()
+
+
+def restore_photo_recovery(project, reference, files, assignment, missing, prior_rows):
+    """Replay only hash-bound, exact-pair visual recoveries, never scores."""
+    receipt = project / "control/work/photo-recovery/accepted.json"
+    if not receipt.is_file():
+        return
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    if payload.get("reference_sha256") != _file_sha256(reference):
+        fail("Photo recovery belongs to a different reference PDF.")
+    indexed = {file.name: index for index, file in enumerate(files)}
+    previous = {row["look_id"]: row for row in (prior_rows or [])}
+    for look, entry in payload.get("assignments", {}).items():
+        row = previous.get(look)
+        if row is None:
+            fail("Recovered photo registry is missing; do not reconstruct it silently.")
+        proof = (project / entry.get("proof", "")).resolve()
+        try:
+            proof.relative_to((project / "control/work/photo-recovery").resolve())
+        except ValueError:
+            fail(f"{look}: recovered proof is outside the controlled evidence folder.")
+        if not proof.is_file() or _file_sha256(proof) != entry.get("proof_sha256"):
+            fail(f"{look}: exact photo recovery proof changed or is missing.")
+        for side, offset in (("left", 0), ("right", 1)):
+            filename = entry.get(side)
+            if not filename:
+                continue
+            if row[f"{side}_filename"] != filename or filename not in indexed:
+                fail(f"{look}: recovered photograph no longer agrees with the saved registry.")
+            index = indexed[filename]
+            if _file_sha256(files[index]) != entry[f"{side}_sha256"]:
+                fail(f"{look}: recovered source photograph changed; a fresh visual check is required.")
+            assignment[(int(look[5:]) - 1) * 2 + offset] = index
+        targets = [(int(look[5:]) - 1) * 2 + offset for offset in (0, 1)]
+        if all(target in assignment for target in targets):
+            missing.discard(int(look[5:]))
+    if len(set(assignment.values())) != len(assignment):
+        fail("Recovered source photograph is also assigned to another PDF slot.")
+
+
+def write_photo_recovery_queue(project, reference, registry, files, previews, pages, cost, assignment, missing):
+    """Readable exhaustive unused-photo search, separate from 'file absent'."""
+    folder = project / "control/work/photo-recovery"
+    folder.mkdir(parents=True, exist_ok=True)
+    unused = [index for index in range(len(files)) if index not in set(assignment.values())] if missing else []
+    candidates = {}
+    for index in unused:
+        label = f"P{index + 1:04}"
+        candidates[label] = {"filename": files[index].name, "sha256": _file_sha256(files[index])}
+    targets = []
+    for number in sorted(missing):
+        look = f"LOOK_{number:03}"
+        target_folder = folder / look
+        target_folder.mkdir(exist_ok=True)
+        pair = Image.new("RGB", (720, 570), "white")
+        draw = ImageDraw.Draw(pair)
+        for offset, image in enumerate(pages[number - 1]):
+            pair.paste(image, (offset * 360, 30))
+            draw.text((offset * 360 + 10, 10), "PDF LEFT" if offset == 0 else "PDF RIGHT", fill="black")
+        reference_pair = target_folder / "reference-pair.jpg"
+        pair.save(reference_pair, quality=95)
+        pair.close()
+        ranked = sorted(unused, key=lambda index: min(cost[(number - 1) * 2, index], cost[(number - 1) * 2 + 1, index]))
+        boards = []
+        for start in range(0, len(ranked), 4):
+            selected = ranked[start:start + 4]
+            board = Image.new("RGB", (720, 1140), "white")
+            draw = ImageDraw.Draw(board)
+            labels = []
+            for position, index in enumerate(selected):
+                x, y = (position % 2) * 360, (position // 2) * 570
+                label = f"P{index + 1:04}"
+                labels.append(label)
+                draw.text((x + 10, y + 10), label, fill="black")
+                board.paste(previews[index], (x, y + 30))
+            path = target_folder / f"candidates-{start // 4 + 1:02}.jpg"
+            board.save(path, quality=92)
+            board.close()
+            boards.append({"path": path.relative_to(project).as_posix(), "sha256": _file_sha256(path), "labels": labels})
+        target = {"look_id": look, "reference_pair": reference_pair.relative_to(project).as_posix(),
+                  "reference_pair_sha256": _file_sha256(reference_pair), "boards": boards}
+        for side, offset in (("left", 0), ("right", 1)):
+            index = assignment.get((number - 1) * 2 + offset)
+            if index is not None:
+                target[f"current_{side}"] = {"filename": files[index].name, "sha256": _file_sha256(files[index])}
+        targets.append(target)
+    payload = {"schema": 1, "reference_sha256": _file_sha256(reference),
+               "registry_sha256": _file_sha256(registry), "candidates": candidates, "targets": targets}
+    (folder / "manifest.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def build(
     project: Path,
     reference: Path,
@@ -590,6 +684,7 @@ def build(
     dry_run: bool,
     allow_missing: bool = False,
     photo_only: bool = False,
+    defer_review: bool = False,
 ) -> None:
     project = project.resolve()
     require_in_work(project, reference, "Reference PDF")
@@ -688,6 +783,9 @@ def build(
         assignment_by_target, missing_looks, diagnostics, problems = _quick_missing_looks(
             cost, files, len(pdf_features),
         )
+        restore_photo_recovery(project, reference, files, assignment_by_target, missing_looks, prior_rows)
+        problems = [problem for problem in problems if not problem.startswith("LOOK_") or
+                    int(problem[5:8]) in missing_looks]
     else:
         assignment = minimum_assignment(cost)
         diagnostics, problem_targets = _diagnose_assignment(
@@ -709,22 +807,25 @@ def build(
     for look_number in sorted(missing_looks):
         look_id = f"LOOK_{look_number:03}"
         for side, side_index in (("left", 0), ("right", 1)):
+            reference_target = page_images[look_number - 1][side_index]
+            reference_target.save(missing_reference_dir / f"{look_id}_{side.upper()}.jpg", "JPEG", quality=95, optimize=True)
+            if (look_number - 1) * 2 + side_index in assignment_by_target:
+                continue
             placeholder = hires / f"{PLACEHOLDER_PREFIX}{look_id}_{side.upper()}.jpg"
             placeholder_preview = _write_blank_placeholder(placeholder)
             placeholder_paths[(look_number, side)] = placeholder
             placeholder_previews[(look_number, side)] = placeholder_preview
-            reference_target = page_images[look_number - 1][side_index]
-            reference_target.save(missing_reference_dir / f"{look_id}_{side.upper()}.jpg", "JPEG", quality=95, optimize=True)
     if missing_looks:
         missing_manifest = {
             "schema": 1,
-            "mode": "photos" if photo_only else "quick",
+            "mode": "photos" if photo_only else ("pending_review" if defer_review else "quick"),
             "looks": [f"LOOK_{look:03}" for look in sorted(missing_looks)],
             "reference_dir": str(MISSING_REFERENCE_DIR).replace("\\", "/"),
             "placeholders": {
                 f"LOOK_{look:03}": {
-                    "left": placeholder_paths[(look, "left")].name,
-                    "right": placeholder_paths[(look, "right")].name,
+                    side: (files[assignment_by_target[(look - 1) * 2 + offset]].name
+                           if (look - 1) * 2 + offset in assignment_by_target else placeholder_paths[(look, side)].name)
+                    for side, offset in (("left", 0), ("right", 1))
                 }
                 for look in sorted(missing_looks)
             },
@@ -754,10 +855,12 @@ def build(
     contact_previews: list[Image.Image] = []
     for index, (left_target, right_target) in enumerate(page_images, start=1):
         look_missing = index in missing_looks
-        left_file = placeholder_paths[(index, "left")] if look_missing else files[assignment_by_target[(index - 1) * 2]]
-        right_file = placeholder_paths[(index, "right")] if look_missing else files[assignment_by_target[(index - 1) * 2 + 1]]
-        left_preview = placeholder_previews[(index, "left")] if look_missing else hire_previews[assignment_by_target[(index - 1) * 2]]
-        right_preview = placeholder_previews[(index, "right")] if look_missing else hire_previews[assignment_by_target[(index - 1) * 2 + 1]]
+        left_missing = (index - 1) * 2 not in assignment_by_target
+        right_missing = (index - 1) * 2 + 1 not in assignment_by_target
+        left_file = placeholder_paths[(index, "left")] if left_missing else files[assignment_by_target[(index - 1) * 2]]
+        right_file = placeholder_paths[(index, "right")] if right_missing else files[assignment_by_target[(index - 1) * 2 + 1]]
+        left_preview = placeholder_previews[(index, "left")] if left_missing else hire_previews[assignment_by_target[(index - 1) * 2]]
+        right_preview = placeholder_previews[(index, "right")] if right_missing else hire_previews[assignment_by_target[(index - 1) * 2 + 1]]
         card = draw_card(
             left_target,
             right_target,
@@ -795,7 +898,8 @@ def build(
         "registry": str(registry),
         "contacts": contacts,
         "problems": problems,
-        "quick_mode": bool(allow_missing and not photo_only),
+        "quick_mode": bool(allow_missing and not photo_only and not defer_review),
+        "photo_review_pending": bool(defer_review and missing_looks),
         "photo_only": bool(photo_only),
         "missing_looks": [f"LOOK_{look:03}" for look in sorted(missing_looks)],
         "missing_photo_reference_dir": str(MISSING_REFERENCE_DIR).replace("\\", "/") if missing_looks else "",
@@ -810,10 +914,13 @@ def build(
         )
     if not dry_run and prior_rows is None:
         write_registry(registry, rows)
+    if allow_missing and registry.is_file() and not dry_run:
+        write_photo_recovery_queue(project, reference, registry, files, hire_previews, page_images,
+                                   cost, assignment_by_target, missing_looks)
     state = "existing registry re-verified" if prior_rows is not None else "registry written"
     suffix = ""
     if missing_looks:
-        mode_label = "Режим только фотографий" if photo_only else "Быстрая сборка"
+        mode_label = "Режим только фотографий" if photo_only else ("Предварительный поиск фотографий" if defer_review else "Быстрая сборка")
         suffix_tail = "кредиты не сопоставляются." if photo_only else "кредиты будут сопоставлены по PDF-референсу."
         suffix = f" {mode_label}: пустые фото оставлены для " + ", ".join(f"LOOK_{look:03}" for look in sorted(missing_looks)) + f"; {suffix_tail}"
     print(f"PASS registry: {len(rows)} PDF-ordered looks, {len(used)} hires selected, {len(files) - len(used)} unused hires; {state}.{suffix}")
@@ -857,6 +964,7 @@ def main() -> None:
         help="Optional leading cover pages. Default: auto-detect 0 or 1 from visible photo placements.",
     )
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--defer-photo-review", action="store_true", help="Provisional photo search for a full build; unresolved slots still require visual recovery.")
     parser.add_argument(
         "--allow-missing",
         action="store_true",
@@ -877,7 +985,7 @@ def main() -> None:
     project = args.project.resolve()
     build(
         project, path_from(project, args.reference), project_hires(project, args.hires),
-        path_from(project, args.registry), args.cover_pages, args.dry_run, args.allow_missing, args.photo_only,
+        path_from(project, args.registry), args.cover_pages, args.dry_run, args.allow_missing, args.photo_only, args.defer_photo_review,
     )
 
 

@@ -302,8 +302,7 @@ def load_evidence(project: Path, state: dict[str, Any], gate: str) -> dict[str, 
             if "reference_pdf" not in state:
                 return None
             try:
-                manifest = validate_reference_order(project, state)
-                expected_confirmation_fingerprint = reference_order_confirmation_fingerprint(project, state)
+                manifest, expected_confirmation_fingerprint = _reference_order_snapshot(project, state)
             except (GateError, OSError):
                 return None
             if evidence.get("photos_only") is not True:
@@ -328,8 +327,7 @@ def load_evidence(project: Path, state: dict[str, Any], gate: str) -> dict[str, 
             "caption_provenance_sha256": state_artifact(project, state, "caption_provenance"),
         }
         try:
-            manifest = validate_reference_order(project, state)
-            expected_confirmation_fingerprint = reference_order_confirmation_fingerprint(project, state)
+            manifest, expected_confirmation_fingerprint = _reference_order_snapshot(project, state)
             manual = manual_caption_revision_audit(project, state)
             if manual is not None:
                 audit, _payload = manual
@@ -718,6 +716,15 @@ def reference_order_item_fingerprint(item: dict[str, Any]) -> str:
 
 def reference_order_confirmation_fingerprint(project: Path, state: dict[str, Any]) -> str:
     manifest = validate_reference_order_manifest(project, state)
+    return _reference_confirmation_fingerprint(project, state, manifest)
+
+
+def _reference_confirmation_fingerprint(project: Path, state: dict[str, Any], manifest: dict[str, Any]) -> str:
+    """Check every confirmation against the manifest just validated by this call.
+
+    No validation result is persisted or reused across commands. In particular,
+    each new apply still hashes the actual source photos and evidence images.
+    """
     rows = validate_registry(
         state_artifact(project, state, "registry"), int(state["look_count"]), state_artifact(project, state, "hires")
     )
@@ -806,9 +813,13 @@ def validate_reference_order_manifest(project: Path, state: dict[str, Any]) -> d
 
 
 def validate_reference_order(project: Path, state: dict[str, Any]) -> dict[str, Any]:
-    manifest = validate_reference_order_manifest(project, state)
-    reference_order_confirmation_fingerprint(project, state)
+    manifest, _fingerprint = _reference_order_snapshot(project, state)
     return manifest
+
+
+def _reference_order_snapshot(project: Path, state: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    manifest = validate_reference_order_manifest(project, state)
+    return manifest, _reference_confirmation_fingerprint(project, state, manifest)
 
 
 def validate_captions(path: Path, look_count: int) -> int:
@@ -2770,7 +2781,16 @@ def run_com_driver(arguments: list[str], timeout_seconds: int = 900) -> str:
                 print("RECOVERY: InDesign timed out while idle; restarted the automation instance and rerunning the same gate.")
                 time.sleep(4)
                 continue
-            fail(f"InDesign automation timed out after {timeout_seconds // 60} minutes. The last saved batch remains recoverable; the controller did not restart InDesign because a document or lock could not be ruled out.")
+            activity_note = ""
+            if project is not None:
+                activity_path = control_path(project) / "progress" / "native-activity.json"
+                if activity_path.is_file():
+                    try:
+                        activity = read_json(activity_path)
+                        activity_note = f" Last recorded native step: {activity.get('gate', '?')}/{activity.get('step', '?')} {activity.get('look_id', '')}."
+                    except GateError:
+                        pass
+            fail(f"InDesign automation timed out after {timeout_seconds // 60} minutes. The last saved batch remains recoverable; the controller did not restart InDesign because a document or lock could not be ruled out.{activity_note}")
         output = "\n".join(part.strip() for part in (completed.stdout, completed.stderr) if part.strip())
         if completed.returncode == 0:
             return output
@@ -2831,7 +2851,11 @@ def command_apply(args: argparse.Namespace) -> None:
         # every batch makes the next invocation unambiguous and resumable.
         before = progress(project, state, armed)
         before_count = int(before.get("completed_count", 0)) if before else 0
-        run_com_driver(["-Action", "ApplyGate", "-Project", str(project), "-Gate", gate, "-BatchSize", "4"], timeout_seconds=180)
+        # Opening, exact typography validation and saving belong to the same
+        # transaction. Three minutes can kill a healthy final validation pass.
+        # Keep a finite ceiling, but allow the full audit to finish; the native
+        # activity journal identifies a genuinely stalled step on failure.
+        run_com_driver(["-Action", "ApplyGate", "-Project", str(project), "-Gate", gate, "-BatchSize", "4"], timeout_seconds=900)
         if load_evidence(project, state, gate) is not None:
             print(f"PASS {gate}: {total} looks {batch_message}, saved, and verified in resumable batches.")
             return
@@ -5889,7 +5913,9 @@ def command_status(args: argparse.Namespace) -> None:
     passed = set(passed_gates(project, state))
     for gate in GATES:
         print(f"{'PASS' if gate in passed else 'LOCK'}  {gate}")
-    next_gate = current_gate(project, state)
+    # passed_gates already validated the full chain above. Repeating it here
+    # used to reread gigabytes of identical hires solely to print NEXT.
+    next_gate = GATES[len(passed)] if len(passed) < len(GATES) else None
     if mode == PHOTO_ONLY_BUILD_MODE and all(gate in passed for gate in ("map", "structure", "dates", "frames", "images")):
         next_gate = None
         print("MODE PHOTOS_ONLY: credit mapping, captions, visual review and PDF export are intentionally skipped.")

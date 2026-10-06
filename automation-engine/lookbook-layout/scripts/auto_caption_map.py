@@ -49,6 +49,8 @@ MISSING_PREFIX = "__lbb_missing_"
 DIRECT_PAIR_WEIGHT = 0.985
 BEST_VIEW_APPEARANCE_WEIGHT = 0.010
 PAIR_CONTEXT_WEIGHT = 0.005
+SEARCH_POLICY = "adaptive-outfit-appearance-v1"
+SEARCH_POLICY_PATH = "control/work/caption-search-policy.json"
 ALTERNATIVE_FIELDS = [
     "look_id", "excel_sheet", "excel_look_number", "excel_image",
     "left_filename", "right_filename", "evidence_file", "evidence_sha256",
@@ -87,7 +89,7 @@ def preview(image: Image.Image) -> Image.Image:
     return ImageOps.fit(oriented, THUMBNAIL, method=Image.Resampling.LANCZOS)
 
 
-def _feature_arrays(image: Image.Image) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _feature_arrays(image: Image.Image, *, adaptive_background: bool = False) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Build identity features while suppressing the shared studio background."""
     thumb = preview(image)
     rgb = np.asarray(thumb, dtype=np.float32) / 255.0
@@ -95,9 +97,21 @@ def _feature_arrays(image: Image.Image) -> tuple[np.ndarray, np.ndarray, np.ndar
     edge = np.zeros_like(grey)
     edge[1:, :] += np.abs(grey[1:, :] - grey[:-1, :])
     edge[:, 1:] += np.abs(grey[:, 1:] - grey[:, :-1])
-    spread = np.max(rgb, axis=2) - np.min(rgb, axis=2)
-    foreground = np.clip((0.94 - grey) / 0.24, 0.0, 1.0)
-    foreground = np.maximum(foreground, np.clip((spread - 0.055) / 0.18, 0.0, 1.0))
+    # Estimate this photograph's background instead of assuming a white
+    # studio wall. A grey wall otherwise gets counted as garment evidence
+    # across almost the entire image. This is a ranking aid, never an identity
+    # classifier: the vision worker must still inspect the actual outfit.
+    if adaptive_background:
+        border = np.concatenate((rgb[0], rgb[-1], rgb[:, 0], rgb[:, -1]))
+        background = np.median(border, axis=0)
+        separation = np.max(np.abs(rgb - background), axis=2)
+        foreground = np.clip((separation - 0.025) / 0.20, 0.0, 1.0)
+    else:
+        # Keep the legacy seed reproducible for already-created projects.
+        # Improved search ranking must not invalidate their approved maps.
+        spread = np.max(rgb, axis=2) - np.min(rgb, axis=2)
+        foreground = np.clip((0.94 - grey) / 0.24, 0.0, 1.0)
+        foreground = np.maximum(foreground, np.clip((spread - 0.055) / 0.18, 0.0, 1.0))
 
     # A global colour average cannot distinguish neighbouring looks with the
     # same white studio wall. Preserve where the garment colour occurs by
@@ -124,9 +138,9 @@ def _feature_arrays(image: Image.Image) -> tuple[np.ndarray, np.ndarray, np.ndar
     return rgb, edge, foreground, np.asarray(grid, dtype=np.float32), np.concatenate((histogram, profile))
 
 
-def image_feature(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def image_feature(path: Path, *, adaptive_background: bool = False) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     with Image.open(path) as source:
-        return _feature_arrays(source)
+        return _feature_arrays(source, adaptive_background=adaptive_background)
 
 
 def distance(
@@ -218,6 +232,19 @@ def pair_distance(
         + PAIR_CONTEXT_WEIGHT * context
     )
     return score, matched_side, left_score, right_score, context
+
+
+def outfit_search_distance(card, left, right, card_appearance, left_appearance, right_appearance):
+    """Pose-tolerant shortlist score, never a visual identity confirmation.
+
+    Direct pixels alone mostly reward similar framing. Foreground colour
+    distribution supplies a second independent view of garment appearance;
+    the closest member of the pair can anchor different catalogue takes.
+    """
+    direct = pair_distance(card, left, right, card_appearance, left_appearance, right_appearance)[0]
+    appearance = min(appearance_distance(card_appearance, left_appearance),
+                     appearance_distance(card_appearance, right_appearance))
+    return 0.5 * direct + 0.5 * appearance
 
 
 def minimum_assignment(cost: np.ndarray) -> list[int]:
@@ -361,6 +388,79 @@ def resolve(
     hires: Path,
     missing_reference_dir: Path | None = None,
 ) -> tuple[list[int], list[dict[str, object]], list[str]]:
+    """Reuse only the numeric proposal for exactly unchanged source bytes.
+
+    This is not an AI decision or a confirmation cache. Proof inspection,
+    operator-selected alternatives and all one-to-one guards still run.
+    """
+    signature = _resolution_signature(project, registry, cards, hires, missing_reference_dir)
+    cache = child(project, 'control/work/cache/caption-resolution.json')
+    if cache.is_file():
+        try:
+            record = json.loads(cache.read_text(encoding='utf-8'))
+            result = record['result']
+            assignment, diagnostics, issues = result
+            valid_assignment = (
+                isinstance(assignment, list) and len(assignment) == len(registry)
+                and all(type(value) is int and 0 <= value < len(cards) for value in assignment)
+                and len(set(assignment)) == len(assignment)
+            )
+            valid_diagnostics = (
+                isinstance(diagnostics, list) and len(diagnostics) == len(registry)
+                and all(isinstance(item, dict) and item.get('look_id') == row['look_id']
+                        and item.get('excel_sheet') == cards[value]['excel_sheet']
+                        and item.get('excel_look_number') == cards[value]['excel_look_number']
+                        for row, value, item in zip(registry, assignment, diagnostics))
+            ) if valid_assignment else False
+            if (record.get('signature') == signature and valid_assignment and valid_diagnostics
+                    and isinstance(issues, list) and all(isinstance(item, str) for item in issues)
+                    and record.get('result_sha256') == _resolution_result_hash(result)):
+                print('Numeric credit proposal restored for unchanged sources; visual proof verification is still required.')
+                return assignment, diagnostics, issues
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    result = _resolve_uncached(project, registry, cards, hires, missing_reference_dir)
+    if _resolution_signature(project, registry, cards, hires, missing_reference_dir) != signature:
+        fail('Caption matching sources changed during numerical resolution; no proposal is cached.')
+    write_json(cache, {'signature': signature, 'result': result, 'result_sha256': _resolution_result_hash(result)})
+    return result
+
+
+def _resolution_result_hash(result: object) -> str:
+    return hashlib.sha256(json.dumps(result, ensure_ascii=False, sort_keys=True).encode('utf-8')).hexdigest()
+
+
+def _resolution_signature(project, registry, cards, hires, missing_reference_dir) -> dict[str, object]:
+    # Rehash real pixels every call; no mtime-only or cross-project trust.
+    images = [child(project, card['excel_image']) for card in cards]
+    for row in registry:
+        images.extend(_caption_source(project, row, hires, missing_reference_dir, side) for side in ('left', 'right'))
+    policy = child(project, SEARCH_POLICY_PATH)
+    for image in images:
+        if not image.is_file():
+            fail(f'Caption matching source image is missing: {image}')
+    return {
+        'schema': 1, 'generator_sha256': digest(Path(__file__).resolve()),
+        'policy_sha256': digest(policy) if policy.is_file() else None,
+        'registry': registry, 'cards': cards,
+        'images': [{'path': str(path.resolve()), 'sha256': digest(path)} for path in images],
+    }
+
+
+def _resolve_uncached(
+    project: Path,
+    registry: list[dict[str, str]],
+    cards: list[dict[str, str]],
+    hires: Path,
+    missing_reference_dir: Path | None = None,
+) -> tuple[list[int], list[dict[str, object]], list[str]]:
+    policy_path = child(project, SEARCH_POLICY_PATH)
+    adaptive = False
+    if policy_path.is_file():
+        policy = json.loads(policy_path.read_text(encoding="utf-8"))
+        if policy.get("algorithm") != SEARCH_POLICY:
+            fail("Unsupported caption-search policy; do not silently reseed the saved map.")
+        adaptive = True
     if len(cards) < len(registry):
         fail(f"Excel has {len(cards)} visual cards but the PDF requires {len(registry)} looks.")
     card_features: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
@@ -368,7 +468,7 @@ def resolve(
         image = child(project, card["excel_image"])
         if not image.is_file():
             fail(f"Excel visual card is missing: {image}")
-        card_features.append(image_feature(image))
+        card_features.append(image_feature(image, adaptive_background=adaptive))
     pairs: list[
         tuple[
             tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
@@ -380,7 +480,8 @@ def resolve(
         right = _caption_source(project, row, hires, missing_reference_dir, "right")
         if not left.is_file() or not right.is_file():
             fail(f"{row['look_id']}: caption-mapping source pair is missing: {left}, {right}.")
-        pairs.append((image_feature(left), image_feature(right)))
+        pairs.append((image_feature(left, adaptive_background=adaptive),
+                      image_feature(right, adaptive_background=adaptive)))
     # Excel contains one representative frame per credit card.  Precompute a
     # compact appearance signature once per image so the assignment can use
     # both views of each PDF look without repeatedly decoding or analysing them.
@@ -401,6 +502,9 @@ def resolve(
                 pair_appearances[look_index][0],
                 pair_appearances[look_index][1],
             )
+            if adaptive:
+                score = outfit_search_distance(card_feature, left, right, card_appearances[card_index],
+                                               pair_appearances[look_index][0], pair_appearances[look_index][1])
             costs[look_index, card_index] = score
             side[look_index][card_index] = matched_side
     assignment = minimum_assignment(costs)
@@ -582,6 +686,16 @@ def main() -> None:
         if row["look_id"] != f"LOOK_{index:03}" or not row["left_filename"] or not row["right_filename"]:
             fail(f"Registry row {index} is incomplete.")
     missing_reference_dir = child(project, args.missing_reference_dir) if args.missing_reference_dir else None
+    # New projects get the improved seed. Existing projects with saved
+    # assignments remain on their original resolver, so their provenance and
+    # confirmations continue to validate after an application update.
+    default_map = child(project, "control/work/caption-map.tsv")
+    policy_path = child(project, SEARCH_POLICY_PATH)
+    if (args.mode in {"seed", "quick-seed", "quick-autonomous", "quick-fallback"}
+            and not policy_path.exists()):
+        saved = read_rows(default_map, MAP_FIELDS) if default_map.is_file() else []
+        if not any(row.get("excel_sheet") or row.get("excel_look_number") or row.get("excel_image") for row in saved):
+            write_json(policy_path, {"schema": 1, "algorithm": SEARCH_POLICY})
     assignment, diagnostics, issues = resolve(
         project, registry, cards, project_hires(project, args.hires), missing_reference_dir,
     )

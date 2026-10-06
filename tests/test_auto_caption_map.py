@@ -108,6 +108,9 @@ def test_a_similarity_proposal_is_never_a_visual_confirmation(monkeypatch, tmp_p
     auto_caption_map.main()
     rows = auto_caption_map.read_rows(tmp_path / "control/work/caption-map.tsv", auto_caption_map.MAP_FIELDS)
     assert rows[0]["visual_status"] == "PENDING"
+    import json
+    policy = json.loads((tmp_path / auto_caption_map.SEARCH_POLICY_PATH).read_text())
+    assert policy["algorithm"] == auto_caption_map.SEARCH_POLICY
 
 
 @pytest.mark.parametrize("alternative", [False, True])
@@ -134,4 +137,12 @@ def test_quick_resume_keeps_43_confirmations_and_only_9_pending(monkeypatch, tmp
     monkeypatch.setattr(sys, "argv", ["auto_caption_map.py", str(tmp_path), "--mode", "quick-autonomous"])
     auto_caption_map.main()
     assert target.read_bytes() == before
+    assert not (tmp_path / auto_caption_map.SEARCH_POLICY_PATH).exists()
     assert sum(x["visual_status"] == "CONFIRMED" for x in auto_caption_map.read_rows(target, auto_caption_map.MAP_FIELDS)) == 43
+
+
+def test_unknown_seed_policy_is_not_silently_replaced(tmp_path):
+    auto_caption_map.write_json(tmp_path / auto_caption_map.SEARCH_POLICY_PATH,
+                                {"algorithm": "unknown-future-policy"})
+    with pytest.raises(SystemExit, match="Unsupported caption-search policy"):
+        auto_caption_map.resolve(tmp_path, [], [], tmp_path / "hires")

@@ -11,7 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from .ai_policy import CREDIT_IDENTITY_POLICY, read_only_vision_prompt
+from .ai_policy import CREDIT_IDENTITY_POLICY, CREDIT_POLICY_MARKER, read_only_vision_prompt
+from .photo_recovery import recover_photos
 from .config import ToolPaths
 from .credit_notes import visual_observation_is_specific
 from .controller import CommandError, CommandRunner, LookbookController, evidence_passed, final_outputs_passed, read_json
@@ -304,6 +305,17 @@ class PipelineEngine:
             except (PipelineError, CommandError, ProviderError, OSError, ValueError) as error:
                 message = str(error)
                 status = StageStatus.REVIEW if isinstance(error, (ReviewRequired, ProviderLimitError)) else StageStatus.FAILED
+                if stage.key == "looks":
+                    try:
+                        saved = _read_tsv(project.project_dir / "control/work/look-register.tsv")
+                        if not saved or len({row["look_id"] for row in saved}) != len(saved):
+                            raise ValueError("Неполный реестр фотографий.")
+                        for row in saved:
+                            if _has_missing_reference(row):
+                                row.update(status="photos_unresolved", note="Точные фото пока не подтверждены; продолжение сохранено.")
+                        self.store.replace_looks(project.id, saved)
+                    except (OSError, ValueError, KeyError, csv.Error) as sync_error:
+                        self.log(f"Не обновляю список фотографий повреждённым реестром: {sync_error}")
                 if stage.key == "credits_map":
                     saved_map = project.project_dir / "control/work/caption-map.tsv"
                     if saved_map.is_file():
@@ -334,7 +346,7 @@ class PipelineEngine:
                     None,
                     "БЫСТРАЯ СБОРКА ЗАВЕРШЕНА: INDD сохранён после разметки кредитов. "
                     "Визуальная проверка, перемещение фото/кредитов и PDF не выполнялись. "
-                    "Теперь можно открыть INDD и внести ручные правки."
+                    "Теперь можно открыть INDD и внести ручные правки." + self._photo_warning(project)
                 )
             if mode == BuildMode.PHOTOS and stage.key == PHOTO_ONLY_STOP_GATE:
                 self._mark_mode_skipped(project, mode)
@@ -342,13 +354,18 @@ class PipelineEngine:
                     tuple(completed),
                     None,
                     "СБОРКА «ТОЛЬКО ФОТОГРАФИИ» ЗАВЕРШЕНА: INDD сохранён после расстановки фото. "
-                    "Сопоставление и запись кредитов, визуальная проверка и PDF не выполнялись.",
+                    "Сопоставление и запись кредитов, визуальная проверка и PDF не выполнялись." + self._photo_warning(project),
                 )
             if stage.key == stop_after:
                 return PipelineResult(tuple(completed), None, message)
             if not continue_after:
                 break
         return PipelineResult(tuple(completed), None, "Все доступные этапы завершены.")
+
+    def _photo_warning(self, project: ProjectRecord) -> str:
+        unresolved = [row["look_id"] for row in self.store.looks(project.id) if _has_missing_reference(row)]
+        return (" ВНИМАНИЕ: некоторые точные кадры не подтверждены и оставлены пустыми: " + ", ".join(unresolved) + "."
+                if unresolved else "")
 
     @staticmethod
     def _coerce_build_mode(value: BuildMode | str | None) -> BuildMode:
@@ -691,7 +708,7 @@ class PipelineEngine:
     def _run_stage(self, project: ProjectRecord, key: str, provider: ModelProvider) -> str:
         handlers = {
             "prepare": self._prepare,
-            "looks": self._looks,
+            "looks": lambda p: self._looks(p, provider),
             "credits_map": lambda p: self._credits_map(p, provider),
             "map": lambda p: self._map_gate(p, provider),
             "structure": lambda p: self._native(p, "structure"),
@@ -736,17 +753,27 @@ class PipelineEngine:
             "InDesign будет работать только с локальными копиями проекта."
         )
 
-    def _looks(self, project: ProjectRecord) -> str:
+    def _looks(self, project: ProjectRecord, provider: ModelProvider | None = None) -> str:
         self._require_prepared(project)
         registry = project.project_dir / "control" / "work" / "look-register.tsv"
         manual = {row["look_id"]: row for row in self.store.looks(project.id) if row.get("status") == "manual"}
-        if not registry.is_file() or not manual:
+        initialized = (project.project_dir / "control/lookbook-state.json").is_file()
+        if initialized and not registry.is_file():
+            raise PipelineError("У существующего INDD отсутствует сохранённый реестр фотографий; автоматически пересоздавать его небезопасно.")
+        if not initialized and (not registry.is_file() or not manual):
             registry_args: list[str | Path] = []
-            if project.build_mode in {BuildMode.QUICK, BuildMode.PHOTOS}:
-                registry_args.append("--allow-missing")
+            # Provisional blanks trigger an exact-shot second pass, not an
+            # automatic conclusion that source photographs are absent.
+            registry_args.append("--allow-missing")
+            if project.build_mode == BuildMode.FULL:
+                registry_args.append("--defer-photo-review")
             if project.build_mode == BuildMode.PHOTOS:
                 registry_args.append("--photo-only")
             self.controller.script("build_reference_registry.py", project.project_dir, *registry_args, timeout=1800)
+        if provider is not None and not initialized:
+            recover_photos(self._sol_for_problem(provider, "Спорные точные фотографии PDF → hi-res"),
+                           project.project_dir, self.controller, self.log, exclude_looks=set(manual),
+                           reserved_filenames={row[key] for row in manual.values() for key in ("left_filename", "right_filename")})
         rows = _read_tsv(registry)
         applied: list[dict[str, str]] = []
         for row in rows:
@@ -764,9 +791,20 @@ class PipelineEngine:
             audit.parent.mkdir(parents=True, exist_ok=True)
             audit.write_text(json.dumps({"overrides": applied}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         self.controller.script("create_look_registry.py", registry, "--validate-ready", timeout=120)
+        for row in rows:
+            if row["look_id"] in {item["look_id"] for item in applied}:
+                row["status"] = "manual"
+            if _has_missing_reference(row):
+                row.update(status="photos_unresolved", note="Не подтверждены точные кадры после дополнительного поиска; это не доказательство отсутствия hi-res.")
         self.store.replace_looks(project.id, rows)
+        blank = [row["look_id"] for row in rows if _has_missing_reference(row)]
+        if blank:
+            self.log("Фото не подтверждены после дополнительного поиска: " + ", ".join(blank) + ". Это не доказательство отсутствия hi-res; пустые места сохранены без подстановки других кадров.")
+            if project.build_mode == BuildMode.FULL:
+                raise ReviewRequired("Не подтверждены точные фотографии: " + ", ".join(blank))
         suffix = f" Применено ручных исправлений: {len(applied)}." if applied else ""
-        return f"Список построен по PDF-референсу: {len(rows)} луков. Пары доступны для ручной проверки.{suffix}"
+        warning = f" Не заполнены некоторые фотографии: {', '.join(blank)}." if blank else ""
+        return f"Список построен по PDF-референсу: {len(rows)} луков. Пары доступны для ручной проверки.{suffix}{warning}"
 
     def _credits_map(self, project: ProjectRecord, provider: ModelProvider) -> str:
         root = project.project_dir
@@ -999,10 +1037,16 @@ class PipelineEngine:
 
         manifest = root / "control" / "work" / "ui-overrides" / "targeted-credit-rematch.json"
         previous = self._load_rematch_manifest(manifest) if manifest.is_file() else {}
+        previous_requests = previous.get("operator_requests", {})
+        same_requests = (
+            all(previous_requests.get(look) == token for look, token in operator_requests.items())
+            and all(look in operator_requests or before_by_look.get(look, {}).get("visual_status") == "CONFIRMED"
+                    for look in previous_requests)
+        )
         resuming = (
             (set(previous.get("requested_looks", previous.get("target_looks", []))) == set(targets)
-             or (not operator_requests and set(targets) <= set(previous.get("target_looks", []))))
-            and previous.get("operator_requests", {}) == operator_requests
+             or (same_requests and set(targets) <= set(previous.get("target_looks", []))))
+            and same_requests
             and bool(previous.get("prior_assignments"))
         )
         if resuming:
@@ -1081,6 +1125,7 @@ class PipelineEngine:
                         for look_id in targets
                     },
                     "search_algorithm": "full-catalogue-v2",
+                    "credit_identity_policy": CREDIT_POLICY_MARKER,
                     "attempted_candidates": {},
                     "reserved_candidates": [],
                 },
@@ -1145,6 +1190,89 @@ class PipelineEngine:
         targets: list[str],
         manifest: Path,
     ) -> dict[str, tuple[str, str]]:
+        # A failure in one search must not discard independently proven
+        # replacements. Keep the progress separate from unverified choices.
+        proven: dict[str, tuple[str, str]] = {}
+        try:
+            return self._discover_credit_replacements(provider, root, targets, manifest, proven)
+        except (ProviderError, PipelineError, CommandError, OSError, ValueError) as error:
+            if proven:
+                try:
+                    self._save_independent_credit_replacements(
+                        provider, root, proven, manifest,
+                        verify_ordinary=not isinstance(error, ProviderLimitError),
+                    )
+                except (ProviderError, PipelineError, CommandError, OSError, ValueError) as save_error:
+                    self.log(f"Часть проверенных замен пока не сохранена: {save_error}")
+                    if isinstance(save_error, ProviderLimitError) and not isinstance(error, ProviderLimitError):
+                        raise save_error from error
+            raise
+
+    def _save_independent_credit_replacements(
+        self, provider: ModelProvider, root: Path, proven: dict[str, tuple[str, str]],
+        manifest: Path, *, verify_ordinary: bool,
+    ) -> None:
+        """Commit only closed swaps/free-card assignments, never partial chains."""
+        rows = _read_tsv(root / "control/work/caption-map.tsv")
+        by_look = {row["look_id"]: row for row in rows}
+        owners = {(row["excel_sheet"], row["excel_look_number"]): row["look_id"] for row in rows}
+        # Ambiguous double claims and their dependent chains stay pending.
+        counts: dict[tuple[str, str], int] = {}
+        for pair in proven.values():
+            counts[pair] = counts.get(pair, 0) + 1
+        ready = {look for look, pair in proven.items()
+                 if counts[pair] == 1 and by_look.get(look, {}).get("visual_status") == "PENDING"}
+        while True:
+            closed = {look for look in ready if owners.get(proven[look]) in ready
+                      or owners.get(proven[look]) is None}
+            if closed == ready:
+                break
+            ready = closed
+        if not ready:
+            return
+        selected = {look: proven[look] for look in sorted(ready)}
+        self.controller.script(
+            "auto_caption_map.py", root, "--mode", "select-alternatives", "--controller-batch",
+            "--assignments", ",".join(f"{look}={sheet}:{number}" for look, (sheet, number) in selected.items()),
+            timeout=1800,
+        )
+        self.controller.script(
+            "render_caption_mapping_evidence.py", root, "--map", "control/work/caption-map.tsv",
+            "--hires", "_MAT/hires", timeout=1800,
+        )
+        payload = self._load_rematch_manifest(manifest)
+        payload.setdefault("saved_replacements", {}).update({look: list(pair) for look, pair in selected.items()})
+        atomic_json(manifest, payload)
+        self.log("Независимые проверенные замены сохранены: " + ", ".join(selected))
+        if not verify_ordinary:
+            self.log("Лимит ИИ исчерпан: новые карточки сохранены, окончательное подтверждение продолжится после возобновления.")
+            return
+        ordinary = [row for row in _read_tsv(root / "control/work/caption-map.tsv") if row["look_id"] in ready]
+        failure = None
+        try:
+            decisions = self._inspect_codex_credit_evidence_parallel(provider, root, ordinary)
+        except (ProviderLimitError, ReviewRequired) as error:
+            decisions = getattr(error, "partial_decisions", {})
+            failure = error
+        accepted = [(look, _safe_confirmation_note(decision.note)) for look, decision in decisions.items()
+                    if decision.accepted and visual_observation_is_specific(decision.note)]
+        for batch in _row_batches(accepted, size=5):
+            self._confirm_credit_batch(root, batch)
+        saved = _read_tsv(root / "control/work/caption-map.tsv")
+        completed = [row["look_id"] for row in saved
+                     if row["look_id"] in ready and row["visual_status"] == "CONFIRMED"]
+        for project in self.store.list_projects():
+            if project.project_dir.resolve() == root.resolve():
+                self.store.replace_credits(project.id, saved)
+                self.store.clear_credit_rematches(project.id, completed)
+                break
+        if failure:
+            raise failure
+
+    def _discover_credit_replacements(
+        self, provider: ModelProvider, root: Path, targets: list[str], manifest: Path,
+        accepted: dict[str, tuple[str, str]],
+    ) -> dict[str, tuple[str, str]]:
         """Choose unique alternatives, then inspect their exact proof cards.
 
         Search the entire catalogue, not only unclaimed cards. Rejections
@@ -1155,8 +1283,18 @@ class PipelineEngine:
         """
         remaining = sorted(set(targets))
         active = set(targets)
-        accepted: dict[str, tuple[str, str]] = {}
         payload = self._load_rematch_manifest(manifest)
+        if payload.get("credit_identity_policy") != CREDIT_POLICY_MARKER:
+            # Archive pending targets' old-contract bans, not proven rows.
+            attempts = payload.setdefault("attempted_candidates", {})
+            migrated = {look: attempts.pop(look) for look in targets if look in attempts}
+            payload.setdefault("identity_policy_history", []).append({
+                "previous_policy": payload.get("credit_identity_policy", "same-person-legacy"),
+                "attempted_candidates": migrated,
+            })
+            payload["credit_identity_policy"] = CREDIT_POLICY_MARKER
+            atomic_json(manifest, payload)
+            self.log("Обновлены правила сопоставления одежды: прежние отказы для незавершённых луков проверю заново. Подтверждённые назначения сохранены.")
         if payload.get("search_algorithm") != "full-catalogue-v2":
             # Old logs include reservations and forced nearest choices, not
             # actual negative visual evidence. Keep an audit, not a permanent ban.
@@ -1185,7 +1323,14 @@ class PipelineEngine:
                 *rematch_args,
                 timeout=1800,
             )
-            choices = self._choose_codex_rematch_candidates(provider, root, remaining)
+            interruption = None
+            try:
+                choices = self._choose_codex_rematch_candidates(provider, root, remaining)
+            except ReviewRequired as error:
+                choices = getattr(error, "partial_choices", {})
+                if not choices:
+                    raise
+                interruption = error
             duplicate_pairs: dict[tuple[str, str], list[str]] = {}
             for look_id, pair in choices.items():
                 duplicate_pairs.setdefault(pair, []).append(look_id)
@@ -1199,13 +1344,20 @@ class PipelineEngine:
                     timeout=1800,
                 )
             alternative_rows = self._alternative_evidence_rows(root, choices)
-            decisions = self._inspect_codex_credit_evidence_parallel(provider, root, alternative_rows)
+            try:
+                decisions = self._inspect_codex_credit_evidence_parallel(provider, root, alternative_rows)
+            except (ProviderLimitError, ReviewRequired) as error:
+                decisions = getattr(error, "partial_decisions", {})
+                interruption = error
             rejected = [
                 look_id for look_id in choices
                 if not decisions.get(look_id) or not decisions[look_id].accepted
             ]
             if rejected:
-                self._append_rematch_attempts(manifest, {look_id: choices[look_id] for look_id in rejected})
+                self._append_rematch_attempts(manifest, {
+                    look_id: choices[look_id] for look_id in rejected
+                    if look_id in decisions and not decisions[look_id].accepted
+                })
             accepted_by_pair = {pair: look_id for look_id, pair in accepted.items()}
             displaced: list[str] = []
             current_rows = _read_tsv(root / "control/work/caption-map.tsv") if (root / "control/work/caption-map.tsv").is_file() else []
@@ -1238,6 +1390,8 @@ class PipelineEngine:
                         active.add(owner)
                         displaced.append(owner)
             remaining = sorted(set(rejected + displaced))
+            if interruption:
+                raise interruption
         self._write_rematch_reserved(manifest, [])
         return accepted
 
@@ -1350,7 +1504,9 @@ Allowed choices are {first}, {second}."""
                     unresolved[look_id] = str(error)
             if unresolved:
                 details = [f"{look_id}: {unresolved[look_id]}" for look_id in targets if look_id in unresolved]
-                raise ReviewRequired("Automatic alternative selection did not finish:\n" + "\n".join(details))
+                error = ReviewRequired("Automatic alternative selection did not finish:\n" + "\n".join(details))
+                error.partial_choices = choices.copy()
+                raise error
         return choices
 
     def _inspect_codex_rematch_candidate(
@@ -1418,9 +1574,9 @@ This is a closed candidate board. The only valid choices are: {allowed_labels}, 
 Printed card labels (or return NONE when none matches):
 {allowed_lines}
 
-Use a deliberate two-pass comparison. First identify the model and the complete outfit in both PDF photos; then compare every plausible Excel card by at least two distinctive cues: garment type and colour, silhouette, bag, shoes, accessories, pose or crop. Recheck the leading candidates against both PDF photos before choosing. Model presentation is a valid visible cue. Do not use card numbers, ordering, filenames or background as evidence. Select the one label whose card visibly matches the same look, not merely a similar studio image.
+Use a deliberate two-pass comparison. First identify the main garments and layering in both PDF photos; then compare every plausible Excel card by distinctive garment cut, texture, colour, closures and lower-body clothing. Recheck the leading candidates against both photos. A different person wearing the SAME distinctive outfit is a valid catalogue match. Do not use model identity, perceived gender, card numbers, ordering, filenames or background as a substitute for clothing evidence. Select the one label matching the same outfit, not merely similar-coloured clothes.
 
-Every required PDF look has a corresponding Excel card somewhere in the FULL catalogue, but not necessarily on THESE pages. If no shown card matches, return choice="NONE" and describe the reference outfit. Never select the closest wrong outfit, a different model presentation or a different garment colour. NONE causes the application to search the next pages, not to stop assembly.
+Every required PDF look has a corresponding Excel card somewhere in the FULL catalogue, but not necessarily on THESE pages. If no shown card matches the main garments, return choice="NONE" and describe the reference outfit. Never select the closest wrong outfit or a different garment colour. NONE causes the application to search the next pages, not to stop assembly.
 
 Reply with exactly one JSON object and no Markdown:
 {{"look_id":"{look_id}","matched":true,"choice":"W:12","note":"at least two concrete visible identity cues"}}
@@ -1451,7 +1607,10 @@ If no shown card matches, return matched=false, choice=NONE, and describe the re
                 try:
                     selected = _parse_codex_rematch_candidate(cached, look_id, candidates, allow_no_match=True)
                     checkpoint.save(cached)
-                    self.log(f"Сохранённый выбор кандидата восстановлен без запроса ИИ: {look_id}")
+                    if selected is None:
+                        self.log(f"{look_id}: сохранённый ответ — среди {len(candidates)} карточек этой страницы совпадения нет; без нового запроса ИИ.")
+                    else:
+                        self.log(f"{look_id}: восстановлен кандидат {selected[0]}:{selected[1]}; требуется проверка точной карточки, нового запроса ИИ не было.")
                     return selected
                 except (ProviderError, ValueError):
                     pass
@@ -1521,15 +1680,20 @@ If no shown card matches, return matched=false, choice=NONE, and describe the re
                 except CancelledError:
                     continue
                 except ProviderLimitError as error:
+                    decisions.update(getattr(error, "partial_decisions", {}))
                     quota_error = error
                     for queued in futures:
                         queued.cancel()
                 except (ProviderError, ValueError, OSError) as error:
+                    decisions.update(getattr(error, "partial_decisions", {}))
                     failures.append(f"{', '.join(row['look_id'] for row in batch)}: {error}")
         if quota_error:
+            quota_error.partial_decisions = decisions.copy()
             raise quota_error
         if failures:
-            raise ReviewRequired("Alternative proof verification did not finish:\n" + "\n".join(failures))
+            error = ReviewRequired("Alternative proof verification did not finish:\n" + "\n".join(failures))
+            error.partial_decisions = decisions.copy()
+            raise error
         return decisions
 
     @staticmethod
@@ -1910,13 +2074,14 @@ If no shown card matches, return matched=false, choice=NONE, and describe the re
                 continue
             if row.get("visual_status") == "CONFIRMED":
                 continue
-            proof = root / row["evidence_file"]
-            decision = provider.inspect_proof(
-                "На карточке слева Excel-look, далее две фотографии одного PDF-лука. Ответь только JSON "
-                "{\"match\":true/false,\"note\":\"минимум два конкретных видимых признака: одежда, цвет, сумка, обувь, поза\"}. "
-                "Фон и порядковый номер не являются доказательством.",
-                [proof],
-            )
+            # All providers use the same catalogue identity contract and
+            # cached rejection audit, not a weaker yes/no-only prompt.
+            try:
+                decision = self._inspect_codex_credit_batch(provider, root, [row])[str(row["look_id"])]
+            except ProviderLimitError:
+                if accepted:
+                    self._confirm_credit_batch_after_quota(root, accepted)
+                raise
             if decision.accepted:
                 accepted.append((row["look_id"], decision.note))
             else:
@@ -1982,10 +2147,12 @@ If no shown card matches, return matched=false, choice=NONE, and describe the re
                 except CancelledError:
                     continue
                 except ProviderLimitError as error:
+                    decisions.update(getattr(error, "partial_decisions", {}))
                     quota_error = error
                     for queued in futures:
                         queued.cancel()
                 except (ProviderError, ValueError, OSError) as error:
+                    decisions.update(getattr(error, "partial_decisions", {}))
                     failures.append((batch, f"{labels}: {error}"))
                 else:
                     self.log(f"Пакет кредитов просмотрен: {labels}")
@@ -2077,6 +2244,7 @@ If no shown card matches, return matched=false, choice=NONE, and describe the re
 
     def _inspect_codex_credit_batch(
         self, provider: ModelProvider, root: Path, rows: list[dict[str, str]], *, strict_notes: bool = False,
+        rejection_audit: bool = False,
     ) -> dict[str, VisionDecision]:
         expected = [str(row["look_id"]) for row in rows]
         cards = []
@@ -2093,13 +2261,24 @@ If no shown card matches, return matched=false, choice=NONE, and describe the re
 Тебе разрешено смотреть только эти proof-карточки:
 {chr(10).join(cards)}
 
-Каждая карточка состоит из Excel-лука СЛЕВА и двух фотографий PDF-лука В ЦЕНТРЕ И СПРАВА. Это могут быть разные кадры одного образа. Сначала независимо опиши Excel в excel_observation, затем обе фотографии PDF в reference_observation. Сравни модель, крой, материал, цвет и слои одежды, сумку, обувь и аксессуары. Запиши только доказанные противоречия идентичности образа в contradictions, а различия позы, видимости аксессуаров и способа держать сумку — в note. Разные модели, другой тип одежды или явно другой цвет означают accepted=false, даже если фон и поза похожи. Пустое или повреждённое фото не даёт основания для accepted=true. Подтверждай только при минимум трёх конкретных совпадающих признаках (в том числе отличительная основная одежда и ещё один признак одежды) и отсутствии противоречий. Нельзя использовать порядок, номера строк, W/M-метку, названия файлов или фон как доказательство.
+Каждая карточка состоит из Excel-лука СЛЕВА и двух фотографий требуемого лука В ЦЕНТРЕ И СПРАВА. Это каталог одежды, а не поиск одного и того же человека или кадра. Сначала независимо опиши одежду Excel в excel_observation, затем одежду на обеих фотографиях в reference_observation. Сравни отличительный крой, материал, цвет, воротник, застёжку, слои и нижнюю часть комплекта. Другая модель, волосы, очки, поза и складки сами по себе НЕ означают другую карточку. Подтверждай только при минимум трёх конкретных совпадающих признаках одежды, включая отличительную основную вещь и ещё один признак одежды. Явно другая основная одежда, фактура, цвет или нижняя часть комплекта означают accepted=false; запиши эти доказанные противоречия в contradictions. Пустое или повреждённое фото не даёт основания для accepted=true. При уверенном совпадении одежды реальные замены обуви или аксессуаров запиши отдельно в styling_differences для проверки товарных кредитов; они не отменяют найденную карточку. Не принимай изменение положения или складку сумки за замену товара. Нельзя использовать порядок, номера строк, W/M-метку, названия файлов или фон как доказательство.
 
 Ничего не записывай, не запускай команды, не меняй TSV и не открывай InDesign. Верни только JSON без Markdown:
-{{"decisions":[{{"look_id":"LOOK_001","excel_observation":"наблюдаемый образ Excel","reference_observation":"наблюдаемый образ PDF","contradictions":[],"accepted":true,"note":"не менее двух конкретных видимых признаков"}}]}}
+{{"decisions":[{{"look_id":"LOOK_001","excel_observation":"наблюдаемая одежда Excel","reference_observation":"наблюдаемая одежда на паре фото","contradictions":[],"styling_differences":[],"accepted":true,"note":"не менее двух конкретных видимых признаков"}}]}}
 
 В JSON должны быть ровно эти LOOK: {", ".join(expected)}. Если карточка не совпадает, верни accepted=false и укажи конкретную причину."""
         prompt += "\n" + CREDIT_IDENTITY_POLICY
+        if rejection_audit:
+            prompt += (
+                "\nLOOKBOOKBOT_CREDIT_REJECTION_AUDIT_V1\n"
+                "Это одна независимая перепроверка перед исключением карточки из поиска. "
+                "Не считай прежний отказ доказательством. Заново просмотри эти же изображения: "
+                "назови совпадающие конструктивные детали основной одежды и нижней части комплекта. "
+                "Если воротник, застёжка, фактура, силуэт и слои совпадают, не отвергай карточку "
+                "из-за другой модели, обуви, положения сумки или запахнутой полы пальто. "
+                "Реально другую основную одежду по-прежнему отвергай. "
+                "Не превращай неуверенность в accepted=true; не подгоняй ответ ради продолжения."
+            )
         note_contract = (
             "\nFor every accepted decision, write note as at least two explicit, visible labels with values: "
             "`garment=<item and colour>; bag=<item>` or `garment=<item>; shoes=<item>; accessory=<item>`. "
@@ -2118,9 +2297,10 @@ If no shown card matches, return matched=false, choice=NONE, and describe the re
                 restored = _parse_codex_batch_decisions(cached, expected, credit_notes=True)
                 checkpoint.save(cached)
                 getattr(self, "log", lambda _: None)("Сохранённая проверка восстановлена без запроса ИИ: " + ", ".join(expected))
-                return restored
             except (ProviderError, ValueError):
                 pass
+            else:
+                return self._audit_credit_rejections(provider, root, rows, restored, rejection_audit)
         try:
             if isinstance(provider, CodexProvider):
                 raw = provider.run_readonly_decision_vision(
@@ -2130,7 +2310,6 @@ If no shown card matches, return matched=false, choice=NONE, and describe the re
                 raw = _run_readonly_vision(provider, prompt + note_contract, root, attachments, timeout=600)
             result = _parse_codex_batch_decisions(raw, expected, credit_notes=True)
             checkpoint.save(raw)
-            return result
         except ProviderLimitError:
             raise
         except ProviderError as first_error:
@@ -2153,7 +2332,6 @@ If no shown card matches, return matched=false, choice=NONE, and describe the re
                     repaired = _run_readonly_vision(provider, repair_prompt, root, attachments, timeout=600)
                 result = _parse_codex_batch_decisions(repaired, expected, credit_notes=True)
                 checkpoint.save(repaired)
-                return result
             except ProviderLimitError:
                 raise
             except ProviderError as repair_error:
@@ -2161,6 +2339,37 @@ If no shown card matches, return matched=false, choice=NONE, and describe the re
                     "Не удалось получить корректный ответ автоматической сверки кредитов "
                     f"после повторной попытки: {repair_error}"
                 ) from first_error
+        return self._audit_credit_rejections(provider, root, rows, result, rejection_audit)
+
+    def _audit_credit_rejections(
+        self, provider: ModelProvider, root: Path, rows: list[dict[str, str]],
+        decisions: dict[str, VisionDecision], already_audited: bool,
+    ) -> dict[str, VisionDecision]:
+        """One bounded, independently cached check before banning a card.
+
+        Neither similarity scores nor text keyword filters can convert a
+        rejection into confirmation. Only a new positive pixel inspection can.
+        Quota/errors propagate, so uninspected cards are never banned.
+        """
+        rejected = [row for row in rows if not decisions[str(row["look_id"])].accepted]
+        log = getattr(self, "log", lambda _: None)
+        if rejected and not already_audited:
+            log("Перепроверяю одежду перед исключением карточки: " + ", ".join(str(row["look_id"]) for row in rejected))
+            try:
+                reviewed = self._inspect_codex_credit_batch(provider, root, rejected, rejection_audit=True)
+            except (ProviderError, ValueError, OSError) as error:
+                # Keep successful primary decisions even if the secondary
+                # audit hits quota. Unreviewed negative decisions are omitted.
+                error.partial_decisions = {
+                    **{look: item for look, item in decisions.items() if item.accepted},
+                    **getattr(error, "partial_decisions", {}),
+                }
+                raise
+            decisions = {**decisions, **reviewed}
+        for look, decision in decisions.items():
+            if decision.accepted and "Проверить товары:" in decision.note:
+                log(f"{look}: карточка одежды подтверждена. {decision.note}")
+        return decisions
 
     def _confirm_codex_reference_proofs_parallel(self, project: ProjectRecord, provider: CodexProvider) -> None:
         """Confirm PDF-reference evidence in parallel without concurrent controller writes."""
@@ -2962,6 +3171,9 @@ def _parse_codex_batch_decisions(
             raise ProviderError(f"{look_id}: contradictions должен быть списком.")
         if any(str(value).strip() for value in contradictions):
             accepted = False
+        styling = item.get("styling_differences", [])
+        if not isinstance(styling, list) or any(not isinstance(value, str) for value in styling):
+            raise ProviderError(f"{look_id}: styling_differences должен быть списком строк.")
         if accepted and ("excel_observation" in item or "reference_observation" in item):
             if not str(item.get("excel_observation", "")).strip() or not str(item.get("reference_observation", "")).strip():
                 raise ProviderError(f"{look_id}: для подтверждения нужны независимые наблюдения Excel и PDF.")
@@ -2978,6 +3190,10 @@ def _parse_codex_batch_decisions(
         note = _safe_confirmation_note(raw_note) if accepted else (
             raw_note or "Совпадение не подтверждено; требуется автоматический подбор другой карточки."
         )
+        if accepted and credit_notes and any(value.strip() for value in styling):
+            note = _safe_confirmation_note(
+                note + " Проверить товары: " + "; ".join(value.strip() for value in styling if value.strip())
+            )
         parsed[look_id] = VisionDecision(accepted=accepted, note=note, raw=text)
     if set(parsed) != expected:
         missing = ", ".join(sorted(expected - set(parsed)))

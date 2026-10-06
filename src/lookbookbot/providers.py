@@ -284,12 +284,26 @@ class CodexProvider(ModelProvider):
                     "excel_observation": {"type": "string"},
                     "reference_observation": {"type": "string"},
                     "contradictions": {"type": "array", "items": {"type": "string"}},
+                    "styling_differences": {"type": "array", "items": {"type": "string"}},
                 },
                 "required": ["look_id", "accepted", "note", "excel_observation",
-                             "reference_observation", "contradictions"],
+                             "reference_observation", "contradictions", "styling_differences"],
             }}}, "required": ["decisions"],
         }
         return self._run_vision(prompt, workspace, timeout=timeout, images=images, output_schema=schema)
+
+    def run_readonly_photo_pair_vision(self, prompt, workspace, *, images, look_id,
+                                      allowed_labels=(), verification=False, timeout=600):
+        properties = {"look_id": {"type": "string", "enum": [look_id]},
+                      "note": {"type": "string"}}
+        if verification:
+            properties["accepted"] = {"type": "boolean"}
+        else:
+            for side in ("left", "right"):
+                properties[side] = {"type": "string", "enum": list(allowed_labels) + ["NONE"]}
+        schema = {"type": "object", "additionalProperties": False,
+                  "properties": properties, "required": list(properties)}
+        return self._run_vision(prompt, workspace, images=images, timeout=timeout, output_schema=schema)
 
     def _run_agent(
         self,

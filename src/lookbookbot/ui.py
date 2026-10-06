@@ -68,7 +68,7 @@ from .secrets import (
     save_openai_api_key,
     save_openrouter_api_key,
 )
-from .state import StateStore
+from .state import StateStore, credit_product_warning
 from .visual_audit import load_visual_audit
 
 
@@ -1461,6 +1461,10 @@ class MainWindow(QMainWindow):
             values = [row["spread_order"], row["look_id"], row["pdf_spread"], row["left_filename"], row["right_filename"], row["status"], row["note"]]
             for column, value in enumerate(values):
                 item = QTableWidgetItem("" if value is None else str(value))
+                if column == 5 and row["status"] == "photos_unresolved":
+                    item.setText("ФОТО НЕ ПОДТВЕРЖДЕНЫ")
+                    item.setForeground(QColor("#fbbf24"))
+                    item.setToolTip(str(row["note"]))
                 if column in (0, 1, 2, 5):
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 self.looks_table.setItem(index, column, item)
@@ -1628,12 +1632,23 @@ class MainWindow(QMainWindow):
         for index, row in enumerate(rows):
             item = self.credits_table.item(index, 4)
             confirmed = str(row.get("visual_status", "")).upper() == "CONFIRMED"
+            item.setText("CONFIRMED" if confirmed else "ПОДБИРАЕТСЯ")
+            item.setToolTip("Визуально подтверждённое сопоставление." if confirmed else
+                            "Предварительный вариант, ещё не подтверждённый ИИ. Может быть заменён во время поиска; это не готовое назначение кредитов.")
             item.setForeground(QColor("#34d399") if confirmed else QColor("#fbbf24"))
             if row.get("needs_rematch"):
                 item.setForeground(QColor("#fbbf24"))
                 item.setToolTip("Отмечено для точечной повторной сверки. До нажатия кнопки карта не меняется.")
             if row.get("manual_override"):
                 item.setToolTip("Подтверждено вручную оператором; контроллер создаст новую proof-card перед применением в InDesign.")
+            warning = credit_product_warning(self.project.project_dir, row) if self.project else ""
+            note_item = self.credits_table.item(index, 5)
+            if note_item:
+                note_item.setToolTip("Проверить товары: " + warning if warning else "")
+            if confirmed and warning and not row.get("needs_rematch"):
+                item.setText("CONFIRMED*")
+                item.setForeground(QColor("#fbbf24"))
+                item.setToolTip("Комплект одежды подтверждён; сборка продолжится. Проверить товары: " + warning)
 
     def _preview_selected_credit(self) -> None:
         if not self.project or self.credits_table.currentRow() < 0:
