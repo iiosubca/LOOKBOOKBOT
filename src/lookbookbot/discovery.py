@@ -5,6 +5,7 @@ from pathlib import Path
 
 from .config import ToolPaths
 from .domain import SourceBundle
+from .excel_preparation import selected_prepared_workbook
 
 
 class SourceDiscoveryError(RuntimeError):
@@ -49,10 +50,18 @@ def _select_reference(files: list[Path]) -> Path:
 
 
 def _select_workbook(files: list[Path]) -> Path:
+    prepared = selected_prepared_workbook(files)
+    if prepared is not None:
+        return prepared
     if len(files) != 1:
         names = ", ".join(path.name for path in files) or "не найдено"
         raise SourceDiscoveryError(f"Нужен ровно один Excel-каталог. Найдено: {names}")
     return files[0]
+
+
+def candidate_workbooks(selected: Path) -> list[Path]:
+    """List Excel inputs independently of PDF/template availability."""
+    return _unique_files(_candidate_roots(selected), ("*.xlsx", "*.XLSX"))
 
 
 def _find_hires(roots: list[Path]) -> Path:

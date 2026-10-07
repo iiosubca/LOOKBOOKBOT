@@ -55,7 +55,8 @@ from .caption_editor import (
     write_caption_audit,
 )
 from .controller import read_json
-from .discovery import discover_sources, infer_output_root
+from .discovery import candidate_workbooks, discover_sources, infer_output_root
+from .excel_preparation import PreparationResult, prepare_workbook, selected_prepared_workbook
 from .domain import BuildMode, ProviderKind, STAGES, StageStatus, project_code
 from .pipeline import PipelineEngine, PipelineError, PipelineResult
 from .project_import import ExistingProjectError, open_existing_project
@@ -201,6 +202,23 @@ class CatalogSignals(QObject):
     failed = Signal(str)
 
 
+class ExcelPreparationWorker(QObject):
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, source: Path) -> None:
+        super().__init__()
+        self.source = source
+
+    def run(self) -> None:
+        try:
+            result = prepare_workbook(self.source)
+        except Exception as error:
+            self.failed.emit(str(error))
+        else:
+            self.finished.emit(result)
+
+
 class ImagePreview(QLabel):
     def __init__(self, placeholder: str) -> None:
         super().__init__(placeholder)
@@ -237,6 +255,11 @@ class MainWindow(QMainWindow):
         self.project = self.store.active_project()
         self.worker_thread: QThread | None = None
         self.worker: PipelineWorker | None = None
+        self.excel_thread: QThread | None = None
+        self.excel_worker: ExcelPreparationWorker | None = None
+        self._excel_result: PreparationResult | None = None
+        self._excel_error = ""
+        self._excel_source_root: Path | None = None
         self.codex_models: list[CodexModel] = self._cached_codex_models()
         self.codex_catalog_verified = False
         self._catalog_pending = False
@@ -314,7 +337,15 @@ class MainWindow(QMainWindow):
         self.source_edit.setPlaceholderText("Папка с PDF, Excel и hires")
         self.source_edit.setMinimumWidth(380)
         browse = QPushButton("Выбрать папку")
+        self.browse_sources_button = browse
         browse.clicked.connect(self._browse_sources)
+        self.prepare_excel_button = QPushButton("Подготовить Excel")
+        self.prepare_excel_button.setToolTip(
+            "Сохранить подготовленную копию Excel: Наименование / Бренд / Цена / Артикул. "
+            "Выбрать корректную цену, преобразовать её в число с ₽ и сохранить фото луков."
+            " Фотографии увеличиваются пропорционально в пределах своих ячеек."
+        )
+        self.prepare_excel_button.clicked.connect(self._prepare_excel)
         self.date_edit = QDateEdit(QDate.currentDate())
         self.date_edit.setCalendarPopup(True)
         self.date_edit.setDisplayFormat("dd.MM.yyyy")
@@ -346,9 +377,11 @@ class MainWindow(QMainWindow):
         test_provider = QPushButton("Проверить модель")
         test_provider.clicked.connect(self._test_provider)
         create = QPushButton("Создать / открыть проект")
+        self.create_project_button = create
         create.setObjectName("Primary")
         create.clicked.connect(self._save_project)
         existing = QPushButton("Открыть готовый проект")
+        self.open_existing_button = existing
         existing.clicked.connect(self._open_existing_project)
         # Source selection stays wide on its own row. The provider controls
         # and the project actions fit together on the second row.
@@ -359,6 +392,7 @@ class MainWindow(QMainWindow):
         source_row.addWidget(source_label)
         source_row.addWidget(self.source_edit, 1)
         source_row.addWidget(browse)
+        source_row.addWidget(self.prepare_excel_button)
         source_row.addSpacing(14)
         source_row.addWidget(QLabel("Дата"))
         source_row.addWidget(self.date_edit)
@@ -825,6 +859,69 @@ class MainWindow(QMainWindow):
         self.source_report.setPlainText("\n".join(("✓ " if report.bundle else "! ") + line for line in report.messages))
         return report.bundle is not None
 
+    def _prepare_excel(self) -> None:
+        if self.worker_thread is not None or self.excel_thread is not None:
+            return
+        source_text = self.source_edit.text().strip()
+        source_root = Path(source_text).expanduser().resolve() if source_text else None
+        files = candidate_workbooks(source_root) if source_root and source_root.is_dir() else []
+        selected = selected_prepared_workbook(files)
+        if selected is None and len(files) == 1:
+            selected = files[0]
+        if selected is None:
+            filename, _ = QFileDialog.getOpenFileName(
+                self, "Выберите Excel для подготовки", str(source_root or Path.home()), "Excel (*.xlsx)",
+            )
+            if not filename:
+                return
+            selected = Path(filename)
+        self._excel_source_root = source_root if selected in files else selected.parent
+        self._excel_result = None
+        self._excel_error = ""
+        self._begin_worker_ui(self.prepare_excel_button, "ПОДГОТОВКА EXCEL…")
+        self._excel_source_enabled = self.source_edit.isEnabled()
+        self.source_edit.setEnabled(False)
+        self._append_log(f"Подготовка Excel: {selected.name}")
+        self.excel_thread = QThread(self)
+        self.excel_worker = ExcelPreparationWorker(selected)
+        self.excel_worker.moveToThread(self.excel_thread)
+        self.excel_thread.started.connect(self.excel_worker.run)
+        self.excel_worker.finished.connect(self._excel_prepared)
+        self.excel_worker.failed.connect(self._excel_prepare_failed)
+        self.excel_worker.finished.connect(self.excel_thread.quit)
+        self.excel_worker.failed.connect(self.excel_thread.quit)
+        self.excel_thread.finished.connect(self.excel_worker.deleteLater)
+        self.excel_thread.finished.connect(self.excel_thread.deleteLater)
+        self.excel_thread.finished.connect(self._excel_prepare_finished)
+        self.excel_thread.start()
+
+    def _excel_prepared(self, result: PreparationResult) -> None:
+        self._excel_result = result
+
+    def _excel_prepare_failed(self, message: str) -> None:
+        self._excel_error = message
+
+    def _excel_prepare_finished(self) -> None:
+        self.excel_worker = None
+        self.excel_thread = None
+        self._restore_worker_ui()
+        self.source_edit.setEnabled(self._excel_source_enabled)
+        if self._excel_error:
+            self._append_log(f"Подготовка Excel остановлена: {self._excel_error}")
+            QMessageBox.warning(self, "Excel не подготовлен", self._excel_error)
+            return
+        result = self._excel_result
+        if result is None:
+            return
+        self.source_edit.setText(str(self._excel_source_root))
+        self.store.set_setting("last_source", str(self._excel_source_root))
+        self._inspect_sources(self._excel_source_root)
+        self._append_log(result.summary())
+        for sheet in result.sheets:
+            if sheet.removed_columns:
+                self._append_log(f"{sheet.name.strip()}: удалены столбцы {', '.join(sheet.removed_columns)}")
+        QMessageBox.information(self, "Excel подготовлен", result.summary() + f"\n\nФайл: {result.output}")
+
     def _save_project(self) -> None:
         source = Path(self.source_edit.text().strip()).expanduser()
         if not self._inspect_sources(source):
@@ -1162,6 +1259,8 @@ class MainWindow(QMainWindow):
     ) -> None:
         if self.project is None:
             return
+        if self.excel_thread is not None:
+            return
         if self.worker_thread is not None and self.worker_thread.isRunning():
             self._append_log("Операция уже выполняется; повторный запуск не создан.")
             return
@@ -1206,6 +1305,7 @@ class MainWindow(QMainWindow):
         for name in (
             "continue_button", "rematch_credits_button", "save_correction_button",
             "create_caption_revision_button", "export_correction_button",
+            "prepare_excel_button", "browse_sources_button", "create_project_button", "open_existing_button",
         ):
             control = getattr(self, name, None)
             if isinstance(control, QPushButton):
@@ -2021,6 +2121,9 @@ class MainWindow(QMainWindow):
             os.startfile(self.project.project_dir)  # type: ignore[attr-defined]
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        if self.excel_thread is not None:
+            event.ignore()
+            return
         if self.worker_thread and self.worker_thread.isRunning():
             answer = QMessageBox.question(
                 self, "Операция выполняется",

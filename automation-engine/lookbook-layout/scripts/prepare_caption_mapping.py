@@ -47,11 +47,25 @@ def image_look_number(sheet: object, image: object) -> str:
     start = int(anchor._from.row) + 1
     end = int(getattr(anchor, "to", anchor._from).row) + 1
     numbers: set[str] = set()
-    for row in range(max(1, start - 2), min(sheet.max_row, end + 2) + 1):
+    # Centered photographs can start several rows below the top of their
+    # merged cell. Resolve the actual owning look before the old tolerance.
+    for area in sheet.merged_cells.ranges:
+        if area.min_col == area.max_col == 2 and area.min_row <= end and start <= area.max_row:
+            value = sheet.cell(area.min_row, 2).value
+            text = str("" if value is None else value).strip()
+            if text.isdigit():
+                numbers.add(str(int(text)))
+    for row in range(max(1, start), min(sheet.max_row, end) + 1):
         value = sheet.cell(row, 2).value
         text = str("" if value is None else value).strip()
         if text.isdigit():
             numbers.add(str(int(text)))
+    if not numbers:
+        for row in range(max(1, start - 2), min(sheet.max_row, end + 2) + 1):
+            value = sheet.cell(row, 2).value
+            text = str("" if value is None else value).strip()
+            if text.isdigit():
+                numbers.add(str(int(text)))
     if len(numbers) != 1:
         raise ValueError(f"{sheet.title}: image anchored at rows {start}-{end} cannot be assigned to one Excel look number.")
     return next(iter(numbers))
